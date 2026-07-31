@@ -2,16 +2,20 @@
 Description=Sample Gardyn Pi host health every 5 minutes (T-473.2)
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-# Default accuracy is 1 minute, which would smear samples across the very
-# window an incident timeline needs to be read at. 10s keeps the cadence
-# tight enough to correlate against HA history and broker logs.
+# Absolute schedule rather than OnBootSec+OnUnitActiveSec. Two reasons:
+# samples land on :00/:05/:10 so they line up trivially with HA history and
+# broker logs, and the cadence does not depend on when the previous run
+# finished - so one slow or hung run cannot collapse the schedule.
+OnCalendar=*:0/5
 AccuracySec=10s
-# Deliberately NOT Persistent=true. Catch-up runs after downtime all execute
-# at boot, so they would stamp a burst of samples carrying post-recovery
-# state at times that look like the outage — the same trap that made the
-# 07-30 timer-stamp evidence readable only because these are run-time stamps.
+
+# NOW load-bearing, and it was NOT before: systemd.timer(5) states this
+# setting "only has an effect on timers configured with OnCalendar=", so on
+# the previous monotonic schedule it was an inert no-op that a comment
+# nonetheless credited with preventing catch-up bursts. With OnCalendar= it
+# genuinely matters: catch-up runs after downtime all execute at boot, which
+# would stamp a burst of post-recovery samples at times that read like the
+# outage - the opposite of what this sampler is for.
 Persistent=false
 
 [Install]

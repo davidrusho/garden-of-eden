@@ -7,11 +7,44 @@ Documentation=https://www.raspberrypi.com/documentation/computers/os.html
 
 [Service]
 Type=oneshot
-# Unprivileged: `gardyn` is in the `video` group, so vcgencmd works without
-# root, and /sys/class/thermal + /proc/net/wireless are world-readable.
+# Unprivileged: `gardyn` is in the `video` group (verified on the host), so
+# vcgencmd works without root, and /sys/class/thermal, /proc/net/wireless,
+# /proc/uptime and /proc/meminfo are all world-readable.
 User=gardyn
 ExecStart=/usr/bin/python3 /home/gardyn/garden-of-eden/bin/gardyn-health-log.py
 SyslogIdentifier=gardyn-health
+
+# A diagnostic must never become the outage it monitors. Without these, the
+# kernel's OOM killer scores by RSS and would reap the long-lived mqtt.py -
+# the grow-light and pump controller - in preference to this short-lived
+# sampler. That is backwards: this unit is the one that is safe to lose.
+OOMScoreAdjust=500
+MemoryMax=64M
+
+# Cut journald chatter. systemd logs "Starting"/"Deactivated"/"Finished" at
+# info for every tick, which is 3 entries of noise per 1 entry of signal -
+# ~60% of this unit's journal footprint, and `journalctl -t gardyn-health`
+# never shows them anyway. LogLevelMax also applies to PID 1's messages ABOUT
+# this unit, so raising the script's own priority above the cut is required:
+# without SyslogLevel, LogLevelMax=notice would drop the sample line too.
+SyslogLevel=notice
+LogLevelMax=notice
+
 # Bounded so a wedged binary cannot leave the unit running into the next tick.
+# Required explicitly: per systemd.service(5) the start timeout is DISABLED by
+# default for Type=oneshot.
 TimeoutStartSec=30
+TimeoutStopSec=10
 Nice=10
+IOSchedulingClass=idle
+
+# Read-only diagnostic; it needs no privileges, no write access and no network.
+# NOTE: ProtectHome= in ANY form breaks ExecStart, because the script lives
+# under /home/gardyn.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=

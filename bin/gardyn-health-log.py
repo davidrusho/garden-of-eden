@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Reviewed: 2026-07-31 against 7d82d25 (T-473.2)
 """Periodic host-health sample for the Gardyn Pi (T-473.2).
 
 Emits ONE logfmt line per run to stdout, which systemd captures into the
@@ -66,7 +67,17 @@ def parse_throttled(raw: str | None) -> dict:
     text = raw.strip()
     if not text:
         return {"raw": UNKNOWN, "error": "empty"}
-    value = text.split("=", 1)[1].strip() if "=" in text else text
+    text = text.splitlines()[0].strip()
+    if "=" in text:
+        value = text.split("=", 1)[1].strip()
+    else:
+        # Bare form is accepted, but ONLY with an explicit 0x prefix. Without
+        # this guard a decimal "50000" parses as 0x50000 and reports
+        # undervolt_since_boot + throttled_since_boot for an event that never
+        # happened - a false brownout is the worst possible false positive here.
+        if not text.lower().startswith("0x"):
+            return {"raw": UNKNOWN, "error": "not_hex"}
+        value = text
     try:
         bits = int(value, 16)
     except ValueError:
@@ -91,8 +102,12 @@ def parse_soc_temp(raw: str | None) -> float | None:
     if not text:
         return None
     try:
+        # int() is unbounded but the division is not: a 400-digit reading
+        # raises OverflowError, which `except ValueError` does NOT catch. That
+        # killed main() before print(), losing the throttle flags too - i.e. a
+        # junk temperature destroyed the sample this script exists to take.
         return int(text) / 1000.0
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 
@@ -120,7 +135,7 @@ def parse_proc_net_wireless(raw: str | None, iface: str = "wlan0") -> dict:
         # Fields: status link level noise ... Values carry a trailing "."
         # (e.g. "50.  -60.  -256") which int() rejects, so strip it.
         fields = rest.split()
-        if len(fields) < 4:
+        if len(fields) < 3:
             return {"present": True, "error": "short_row"}
 
         def num(tok):
@@ -129,13 +144,46 @@ def parse_proc_net_wireless(raw: str | None, iface: str = "wlan0") -> dict:
             except ValueError:
                 return None
 
-        return {
-            "present": True,
-            "link": num(fields[1]),
-            "level_dbm": num(fields[2]),
-            "noise": num(fields[3]),
-        }
+        link = num(fields[1])
+        if not link:
+            # Unassociated: cfg80211_wireless_stats() returns NULL and the row
+            # is printed as all-zeros by the nullstats fallback. Reporting
+            # level_dbm=0 here would read as a maximum-strength signal.
+            return {"present": True, "link": link, "level_dbm": None}
+        return {"present": True, "link": link, "level_dbm": num(fields[2])}
     return {"present": False}
+
+
+def parse_uptime(raw: str | None) -> float | None:
+    """Seconds from /proc/uptime.
+
+    The single most valuable field for the incident class this exists for: a
+    host that is alive-but-unreachable vs one that rebooted are indistinguish-
+    able afterwards without it, and it is also what makes the sticky throttle
+    bits interpretable (they are "since boot", so they mean nothing unless you
+    know whether a boot intervened).
+    """
+    if not raw:
+        return None
+    try:
+        return float(raw.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_mem_available_mb(raw: str | None) -> float | None:
+    """MemAvailable from /proc/meminfo, in MiB."""
+    if not raw:
+        return None
+    for line in raw.splitlines():
+        if line.startswith("MemAvailable:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1]) / 1024.0
+                except ValueError:
+                    return None
+    return None
 
 
 def parse_nmcli_state(raw: str | None) -> str:
@@ -143,7 +191,7 @@ def parse_nmcli_state(raw: str | None) -> str:
     if not raw:
         return UNKNOWN
     first = raw.strip().splitlines()[0].strip() if raw.strip() else ""
-    return first.split(":")[0] if first else UNKNOWN
+    return first.split(":")[0].strip() or UNKNOWN
 
 
 def _fmt(value) -> str:
@@ -157,7 +205,9 @@ def _fmt(value) -> str:
 
 
 def format_record(throttled: dict, temp_c: float | None, wireless: dict,
-                  nm_state: str) -> str:
+                  nm_state: str, uptime_s: float | None = None,
+                  mem_avail_mb: float | None = None,
+                  nm_error: str | None = None) -> str:
     """Render one logfmt line. Key order is stable so the output greps well."""
     parts = [
         ("nm_state", nm_state),
@@ -166,7 +216,11 @@ def format_record(throttled: dict, temp_c: float | None, wireless: dict,
         ("wlan_level_dbm", wireless.get("level_dbm")),
         ("soc_temp_c", None if temp_c is None else round(temp_c, 1)),
         ("throttled", throttled.get("raw", UNKNOWN)),
+        ("uptime_s", None if uptime_s is None else int(uptime_s)),
+        ("mem_avail_mb", None if mem_avail_mb is None else round(mem_avail_mb, 1)),
     ]
+    if nm_error:
+        parts.append(("nm_error", nm_error))
     # Only surface the throttle flags that are actually SET. A line of eight
     # false= pairs every 5 minutes buries the one sample that matters.
     for name in THROTTLED_BITS.values():
@@ -180,19 +234,32 @@ def format_record(throttled: dict, temp_c: float | None, wireless: dict,
     return " ".join(f"{k}={_fmt(v)}" for k, v in parts)
 
 
-def _run(cmd: list[str], timeout: float = 5.0) -> str | None:
-    """Run a command, returning stdout or None. Never raises.
+def _run(cmd: list[str], timeout: float = 5.0) -> tuple[str | None, str | None]:
+    """Run a command. Returns (stdout, failure_reason); exactly one is None.
 
-    A sampler that blocks forever on a wedged binary stops sampling, so every
-    call is bounded — which matters most precisely when the host is sick.
+    The reason is reported rather than collapsed, because "not installed",
+    "exited non-zero" and "timed out" call for completely different responses
+    and used to be indistinguishable in the log. The concrete case: if the
+    service user were not in the `video` group, vcgencmd exits non-zero with
+    "VCHI initialization failed" and every line would read exactly like one
+    from a host where vcgencmd was never installed.
+
+    Bounded so a wedged binary cannot stall the sampler - which matters most
+    precisely when the host is sick.
     """
     if not shutil.which(cmd[0]):
-        return None
+        return None, "not_installed"
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    return proc.stdout if proc.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except OSError as exc:
+        return None, f"oserror_{exc.errno}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        head = detail[0][:60].replace(" ", "_") if detail else ""
+        return None, f"exit_{proc.returncode}" + (f"_{head}" if head else "")
+    return proc.stdout, None
 
 
 def _read(path: str) -> str | None:
@@ -204,11 +271,22 @@ def _read(path: str) -> str | None:
 
 
 def main() -> int:
+    thr_out, thr_err = _run(["vcgencmd", "get_throttled"])
+    throttled = parse_throttled(thr_out)
+    if thr_out is None and thr_err:
+        # Keep WHY the reading is missing, not merely that it is.
+        throttled["error"] = thr_err
+
+    nm_out, nm_err = _run(["nmcli", "-t", "-f", "STATE", "general"])
+
     record = format_record(
-        throttled=parse_throttled(_run(["vcgencmd", "get_throttled"])),
+        throttled=throttled,
         temp_c=parse_soc_temp(_read("/sys/class/thermal/thermal_zone0/temp")),
         wireless=parse_proc_net_wireless(_read("/proc/net/wireless")),
-        nm_state=parse_nmcli_state(_run(["nmcli", "-t", "-f", "STATE", "general"])),
+        nm_state=parse_nmcli_state(nm_out),
+        uptime_s=parse_uptime(_read("/proc/uptime")),
+        mem_avail_mb=parse_mem_available_mb(_read("/proc/meminfo")),
+        nm_error=nm_err,
     )
     print(record, flush=True)
     return 0
