@@ -20,14 +20,21 @@ from app.sensors.temperature.temperature import temperature_sensor
 from app.sensors.humidity.humidity import humidity_sensor
 from app.sensors.distance.distance import Distance, MeasurementError
 
-# Configure logging
+# Configure logging.
+#
+# force=True is load-bearing. Importing anything from the `app` package pulls in
+# a chain that installs a root StreamHandler first, and basicConfig() is a no-op
+# once the root logger already has handlers — so without force= the FileHandler
+# below is never instantiated, gardyn.log stays 0 bytes, and the journal gets
+# logging.BASIC_FORMAT with no timestamps.
 logging.basicConfig(
     level=logging.WARNING,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("gardyn.log"),  # Log to a file
         logging.StreamHandler()  # Log to the console (stdout)
-    ]
+    ],
+    force=True,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,13 +44,34 @@ logger = logging.getLogger(__name__)
 # when this client stops answering keepalives (~1.5x KEEP_ALIVE_INTERVAL).
 STATUS_TOPIC = BASE_TOPIC + "/status"
 
+# Topics this client actually consumes, with the QoS to subscribe at.
+#
+# This replaces a BASE_TOPIC + "/#" wildcard. That wildcard made the broker echo
+# every JPEG this process publishes straight back to it: the two image topics
+# are ~0.7 MB per cycle in daylight and roughly double that at night (dark
+# sensor noise compresses badly at 1600x1200), which measured as essentially
+# 100% of inbound Wi-Fi on a single-antenna Zero W, with paho allocating the
+# whole frame on the network thread each time.
+#
+# Commands are QoS 1 so that, paired with the durable session below, the broker
+# queues them while this client is offline instead of discarding them. The
+# */get topics are QoS 0 request triggers — nothing in HA publishes to them
+# (they were declared via `command_topic` on sensor entities, which HA ignores),
+# but they stay subscribed so a manual mosquitto_pub still works.
+COMMAND_SUBSCRIPTIONS = [
+    (BASE_TOPIC + "/light/command", 1),
+    (BASE_TOPIC + "/light/brightness/set", 1),
+    (BASE_TOPIC + "/pump/command", 1),
+    (BASE_TOPIC + "/pump/speed/set", 1),
+    (BASE_TOPIC + "/water/low/cm/set", 1),
+    (BASE_TOPIC + "/water/level/get", 0),
+    (BASE_TOPIC + "/pcb/temperature/get", 0),
+    (BASE_TOPIC + "/temperature/get", 0),
+    (BASE_TOPIC + "/humidity/get", 0),
+]
+
 # set to INFO, for to capture mqtt messages at info-level messages.
 logger.setLevel(logging.WARNING)
-
-logger.debug("This is a debug message")
-logger.info("This is an info message")
-logger.warning("This is a warning message")
-logger.error("This is an error message")
 
 # Initialize devices
 pin_factory = PiGPIOFactory()
@@ -65,37 +93,54 @@ publish_frequency = sec_per_min * min_per_hr / 2
 button_pin = 13
 button = Button(button_pin, pin_factory=pin_factory, bounce_time=0.2, hold_time=2)  # hold_time = 2 seconds for long press detection
 
-# Variables to track the state of the light and pump
-light_state = False
-pump_state = False
+# Button press bookkeeping. Light/pump state is read from the hardware rather
+# than tracked in shadow variables — see toggle_light()/toggle_pump().
 double_press_time = 1  # Time to detect a double press (in seconds)
 press_count = 0
 double_press_timer = None
 
-# Button press callbacks
+# State publishing.
+#
+# All four state topics are retained. Without retain, HA has nothing to subscribe
+# to on restart and the entity sits at `unknown` until something changes it —
+# which is why the pump entity read `unknown` for its entire history, and why a
+# service restart left HA showing a stale "on" for a light that PWMLED had just
+# driven to 0. Retained state means HA gets the truth the moment it subscribes.
+def publish_light_state(client):
+    """Publish the light's ACTUAL duty cycle, not a shadow variable."""
+    duty = light.get_brightness()
+    client.publish(BASE_TOPIC + "/light/state", "ON" if duty > 0 else "OFF", retain=True)
+    client.publish(BASE_TOPIC + "/light/brightness/state", str(int(round(duty))), retain=True)
+
+def publish_pump_state(client):
+    """Publish the pump's ACTUAL duty cycle, not a shadow variable."""
+    duty = pump.get_speed()
+    client.publish(BASE_TOPIC + "/pump/state", "ON" if duty > 0 else "OFF", retain=True)
+    client.publish(BASE_TOPIC + "/pump/speed/state", str(int(round(duty))), retain=True)
+
+# Button press callbacks.
+#
+# These read hardware state rather than a shadow variable. light_state/pump_state
+# used to be module globals that only the button path updated, so after any HA
+# command the shadow was stale and the next button press just re-sent the state
+# the device was already in — the press appeared to do nothing.
 def toggle_light():
-    global light_state
-    light_state = not light_state
-    if light_state:
-        logger.info("Toggling Light ON")
-        light.set_duty_cycle(brightness)
-        client.publish(BASE_TOPIC + "/light/state", "ON")
-    else:
+    if light.get_brightness() > 0:
         logger.info("Toggling Light OFF")
         light.off()
-        client.publish(BASE_TOPIC + "/light/state", "OFF")
+    else:
+        logger.info("Toggling Light ON")
+        light.set_duty_cycle(brightness)
+    publish_light_state(client)
 
 def toggle_pump():
-    global pump_state
-    pump_state = not pump_state
-    if pump_state:
-        logger.info("Toggling Pump ON")
-        pump.set_speed(speed)
-        client.publish(BASE_TOPIC + "/pump/state", "ON")
-    else:
+    if pump.get_speed() > 0:
         logger.info("Toggling Pump OFF")
         pump.off()
-        client.publish(BASE_TOPIC + "/pump/state", "OFF")
+    else:
+        logger.info("Toggling Pump ON")
+        pump.set_speed(speed)
+    publish_pump_state(client)
 
 def handle_button_press():
     global press_count, double_press_timer
@@ -112,6 +157,16 @@ def handle_button_press():
             double_press_timer.cancel()
         handle_double_press()
         press_count = 0
+    else:
+        # press_count is written from two threads — this gpiozero callback and
+        # the Timer thread running handle_single_press — and every reset used to
+        # live inside the ==1 / ==2 branches. So a count of 3+ was an absorbing
+        # state: no branch matched, nothing reset it, no timer got armed, and
+        # every later press only incremented further, leaving the button dead
+        # until the service restarted. This else makes 3+ recoverable: swallow
+        # the extra press and rearm on the next one.
+        logger.info(f"Ignoring press {press_count} inside the double-press window")
+        press_count = 0
 
 def handle_single_press():
     global press_count
@@ -125,7 +180,7 @@ def handle_double_press():
 button.when_pressed = handle_button_press
 
 # helpers
-def flash_lights(times=3, delay=0.3):
+def _flash_lights_blocking(times=3, delay=0.3):
     original_brightness = light.get_brightness()  # Save the brightness (0–100 scale)
     was_on = original_brightness > 0  # If >0%, we consider it "on"
 
@@ -141,6 +196,18 @@ def flash_lights(times=3, delay=0.3):
         light.set_brightness(original_brightness)
     else:
         light.off()
+
+def flash_lights(times=3, delay=0.3):
+    """Run the flash on its own thread.
+
+    The only caller is the low-water abort inside on_message, which paho runs on
+    the network thread. Sleeping 2 * times * delay there (1.8s by default) stalls
+    all MQTT processing for the duration — including keepalive handling on a link
+    that has no headroom to spare.
+    """
+    threading.Thread(
+        target=_flash_lights_blocking, args=(times, delay), daemon=True
+    ).start()
 
 def safe_distance_measure():
     global distance_sensor
@@ -162,6 +229,14 @@ def publish_water_low_mode(client):
         mode = "Disabled"
     logger.info(f"Publishing water low mode: {mode}")
     client.publish(BASE_TOPIC + "/water/low/mode", mode, retain=True)
+
+
+def publish_water_low_threshold(client):
+    """Publish the threshold currently in effect, so HA and this process agree."""
+    if WATER_LOW_CM in (None, 0):
+        return
+    logger.info(f"Publishing water low threshold: {WATER_LOW_CM:.2f}cm")
+    client.publish(BASE_TOPIC + "/water/low/cm", f"{WATER_LOW_CM:.2f}", retain=True)
 
 
 def update_water_low_state(client):
@@ -219,6 +294,12 @@ def send_discovery_messages(client):
         "brightness_state_topic": BASE_TOPIC + "/light/brightness/state",
         "brightness_command_topic": BASE_TOPIC + "/light/brightness/set",
         "brightness_scale": 100,
+        # HA's `qos` applies to both what it subscribes at and what it publishes
+        # at. QoS 1 is what lets the broker hold a command for this client while
+        # it is briefly offline — but only in combination with the durable
+        # session set up in __main__; QoS 1 alone only guarantees delivery to the
+        # broker, which then has no subscriber to hand it to.
+        "qos": 1,
         "device": device_info
     }
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
@@ -230,7 +311,8 @@ def send_discovery_messages(client):
         "name": "Pump",
         "unique_id": IDENTIFIER + "_pump",
         "platform": "mqtt",
-	"device_class": "fan",
+        # `device_class: fan` was here; `light` has no device_class, so HA
+        # discarded it. Dropped rather than left as a false signal.
         "state_topic": BASE_TOPIC + "/pump/state",
         "command_topic": BASE_TOPIC + "/pump/command",
 
@@ -244,6 +326,7 @@ def send_discovery_messages(client):
 	# "speed_range_min": 1,
 	# "speed_range_max": 100,
         "icon": "mdi:water-pump",
+        "qos": 1,
         "device": device_info
     }
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
@@ -266,7 +349,9 @@ def send_discovery_messages(client):
         "name": "Temperature",
         "unique_id": IDENTIFIER + "_temperature",
         "state_topic": BASE_TOPIC + "/temperature",
-        "command_topic": BASE_TOPIC + "/temperature/get",
+        # `command_topic` was here. `sensor` is read-only, so HA discards it and
+        # never publishes to temperature/get — the on_message branch for that
+        # topic is reachable only from a manual mosquitto_pub.
         "unit_of_measurement": "°C",
         "device_class": "temperature",
         "device": device_info
@@ -279,7 +364,7 @@ def send_discovery_messages(client):
         "name": "Humidity",
         "unique_id": IDENTIFIER + "_humidity",
         "state_topic": BASE_TOPIC + "/humidity",
-        "command_topic": BASE_TOPIC + "/humidity/get",
+        # `command_topic` dropped — read-only domain, see Temperature above.
         "unit_of_measurement": "%",
         "device_class": "humidity",
         "device": device_info
@@ -294,7 +379,7 @@ def send_discovery_messages(client):
         "name": "Water Level",
         "unique_id": IDENTIFIER + "_water_level",
         "state_topic": BASE_TOPIC + "/water/level",
-        "command_topic": BASE_TOPIC + "/water/level/get",
+        # `command_topic` dropped — read-only domain, see Temperature above.
         "unit_of_measurement": "cm",
         "device_class": "distance",
         "device": device_info
@@ -327,6 +412,7 @@ def send_discovery_messages(client):
         "min": 0,
         "max": 15,
         "step": 0.5,
+        "qos": 1,
         "unit_of_measurement": "cm",
         "device_class": "distance",
         "device": device_info
@@ -380,22 +466,27 @@ def send_discovery_messages(client):
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    logger.info(f"Connected with result code {rc}")
-    client.subscribe(BASE_TOPIC + "/#")
-    # client.subscribe(BASE_TOPIC + "/light/brightness/set")
+    logger.warning(f"Connected with result code {rc}")
+    # Explicit topic list, not BASE_TOPIC + "/#" — see COMMAND_SUBSCRIPTIONS.
+    client.subscribe(COMMAND_SUBSCRIPTIONS)
     # Clear the retained "offline" the broker may have left from the last death.
     # Publish before discovery so HA never sees an entity announced unavailable.
     client.publish(STATUS_TOPIC, "online", qos=1, retain=True)
     send_discovery_messages(client)
     publish_water_low_mode(client)
+    # Publish the threshold this process is actually running with. It used to be
+    # published only from the water/low/cm/set handler, so a value set at runtime
+    # survived in the retained topic while the service reloaded WATER_LOW_CM from
+    # .env on restart — HA showed one number and the interlock used another.
+    publish_water_low_threshold(client)
+    # Announce real device state on every (re)connect. Retained, so HA gets it
+    # immediately on subscribe instead of sitting at `unknown`.
+    publish_light_state(client)
+    publish_pump_state(client)
+    start_publisher_threads(client)
 
 def on_message(client, userdata, msg):
     global brightness, speed, WATER_LOW_CM
-
-    # Handle binary payloads (like image topics) — skip decoding
-    if msg.topic.endswith("/image/upper_camera") or msg.topic.endswith("/image/lower_camera"):
-        logger.debug(f"Received binary image on topic {msg.topic}, skipping decode.")
-        return
 
     try:
         payload = msg.payload.decode("utf-8").strip()
@@ -420,29 +511,29 @@ def on_message(client, userdata, msg):
                     else:
                         client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
                 pump.set_speed(speed)
-                client.publish(BASE_TOPIC + "/pump/state", "ON")
+                publish_pump_state(client)
             elif payload.upper() == "OFF":
                 pump.off()
-                client.publish(BASE_TOPIC + "/pump/state", "OFF")
+                publish_pump_state(client)
 
         elif topic_suffix == "pump/speed/set" and payload.isdigit():
             speed = int(payload)
             pump.set_speed(speed)
-            client.publish(BASE_TOPIC + "/pump/speed/state", str(speed))
+            publish_pump_state(client)
 
         # === Light Logic ===
         elif topic_suffix == "light/command":
             if payload.upper() == "ON":
                 light.set_duty_cycle(brightness)
-                client.publish(BASE_TOPIC + "/light/state", "ON")
+                publish_light_state(client)
             elif payload.upper() == "OFF":
                 light.off()
-                client.publish(BASE_TOPIC + "/light/state", "OFF")
+                publish_light_state(client)
 
         elif topic_suffix == "light/brightness/set" and payload.isdigit():
             brightness = int(payload)
             light.set_duty_cycle(brightness)
-            client.publish(BASE_TOPIC + "/light/brightness/state", str(brightness))
+            publish_light_state(client)
 
         # === Water Level ===
         elif topic_suffix == "water/level/get":
@@ -453,7 +544,7 @@ def on_message(client, userdata, msg):
         elif topic_suffix == "water/low/cm/set":
             try:
                 WATER_LOW_CM = float(payload)
-                client.publish(BASE_TOPIC + "/water/low/cm", f"{WATER_LOW_CM:.2f}", retain=True)
+                publish_water_low_threshold(client)
                 publish_water_low_mode(client)
                 update_water_low_state(client)
             except ValueError:
@@ -544,36 +635,73 @@ def publish_images(client):
         sleep(IMAGE_INTERVAL_SECONDS)
 
 
+_publisher_threads_started = False
+_publisher_threads_lock = threading.Lock()
+
+def start_publisher_threads(client):
+    """Start the periodic publishers, once, after the first successful connect.
+
+    They used to start in __main__ ahead of a blocking connect(), which was safe
+    only because the socket already existed by then. Under connect_async the
+    connection is established by loop_forever(), so a thread's first publish
+    would race it and be dropped with MQTT_ERR_NO_CONN — and these loops sleep 30
+    minutes, so a lost first publish means an entity sits `unknown` for half an
+    hour. on_connect fires on every reconnect, hence the once-only guard.
+    """
+    global _publisher_threads_started
+    with _publisher_threads_lock:
+        if _publisher_threads_started:
+            return
+        _publisher_threads_started = True
+
+    for target in (publish_pcb_temperature, publish_temperature, publish_humidity,
+                   publish_water_level, publish_images):
+        threading.Thread(target=target, args=(client,), daemon=True).start()
+    logger.warning("Publisher threads started")
+
+
+def on_disconnect(client, userdata, flags, rc, properties=None):
+    """Make a drop visible. Nothing logged one before, on either side."""
+    if rc == 0:
+        logger.warning("Disconnected from broker cleanly")
+    else:
+        logger.error(f"Unexpectedly disconnected from broker (rc={rc}); paho will retry")
+
+
 if __name__ == "__main__":
-    logger.info(f"Connecting to {BROKER} on port {PORT} with keep alive {KEEP_ALIVE_INTERVAL}")
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    logger.warning(f"Connecting to {BROKER} on port {PORT} with keep alive {KEEP_ALIVE_INTERVAL}")
+    # A durable session (clean_session=False) is what makes a QoS 1 command
+    # survive a brief drop: the broker keeps this client's subscriptions and
+    # queues QoS 1+ messages for it while it is away, instead of discarding them
+    # silently. It requires a STABLE client_id — paho generates a random one
+    # otherwise, which would orphan a fresh session on every restart, and it
+    # refuses clean_session=False with an empty id.
+    #
+    # This is only safe because COMMAND_SUBSCRIPTIONS no longer contains the
+    # image topics. Under the old "/#" wildcard a durable session would have had
+    # the broker queueing megabytes of JPEG for every minute of downtime.
+    client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2,
+        client_id=IDENTIFIER,
+        clean_session=False,
+    )
     client.on_connect = on_connect
     client.on_message = on_message
+    client.on_disconnect = on_disconnect
     client.username_pw_set(USERNAME, PASSWORD)
     # Register the will BEFORE connecting — the broker records it at CONNECT
     # time, so a will_set() after connect() would never take effect.
     client.will_set(STATUS_TOPIC, "offline", qos=1, retain=True)
-    client.connect(BROKER, PORT, KEEP_ALIVE_INTERVAL)
+    # Back off on repeated failures instead of hammering a broker that is down.
+    client.reconnect_delay_set(min_delay=1, max_delay=60)
+    # connect_async + retry_first_connection is the pair that survives a broker
+    # that is not up yet. A bare connect() raises when the broker is unreachable,
+    # the exception propagates out of __main__, and the process exits — which,
+    # against systemd's default start-limit, burns through the restart budget in
+    # seconds and parks the unit in `failed` permanently. A router reboot that
+    # brought this Pi up before the broker used to leave the garden dark.
+    client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)
 
-    pcb_temp_thread = threading.Thread(target=publish_pcb_temperature, args=(client,))
-    pcb_temp_thread.daemon = True
-    pcb_temp_thread.start()
-
-    temperature_thread = threading.Thread(target=publish_temperature, args=(client,))
-    temperature_thread.daemon = True
-    temperature_thread.start()
-
-    humidity_thread = threading.Thread(target=publish_humidity, args=(client,))
-    humidity_thread.daemon = True
-    humidity_thread.start()
-
-    water_level_thread = threading.Thread(target=publish_water_level, args=(client,))
-    water_level_thread.daemon = True
-    water_level_thread.start()
-
-
-    publish_images_thread = threading.Thread(target=publish_images, args=(client,))
-    publish_images_thread.daemon = True
-    publish_images_thread.start()
-
-    client.loop_forever()
+    # The periodic publishers are started from on_connect, not here — see
+    # start_publisher_threads().
+    client.loop_forever(retry_first_connection=True)

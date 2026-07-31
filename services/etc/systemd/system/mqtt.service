@@ -1,13 +1,22 @@
 [Unit]
 Description=MQTT Service
 Requires=pigpiod.service
-After=network.target pigpiod.service
+Wants=network-online.target
+After=network-online.target pigpiod.service
+# Never give up restarting. systemd's default start limit (5 starts in 10s)
+# combined with the default RestartSec=100ms means a service that exits
+# immediately — as this one did when the broker was unreachable at boot —
+# burns the whole budget in under a second and parks the unit in `failed`
+# permanently. A router reboot that brought the Pi up before the broker used
+# to leave the garden with no controller until someone noticed.
+StartLimitIntervalSec=0
 
 [Service]
 User=gardyn
 WorkingDirectory=/home/gardyn/garden-of-eden
 ExecStart=/home/gardyn/garden-of-eden/venv/bin/python /home/gardyn/garden-of-eden/mqtt.py
 Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
