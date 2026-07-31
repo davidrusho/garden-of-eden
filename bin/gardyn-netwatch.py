@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Reviewed: 2026-07-31 against bf5680f (T-473.4)
 """Network watchdog for the Gardyn Pi (T-473.4).
 
 Emits ONE logfmt line per run to stdout, captured by systemd into the (now
