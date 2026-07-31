@@ -12,6 +12,7 @@ trustworthy-reading path is reachable here and nowhere else.
 """
 
 import json
+import logging
 import sys
 import os
 import types
@@ -54,9 +55,9 @@ def _install_stubs():
 
     # distance is the exception: point the package at its real directory so the
     # REAL driver loads (it imports nothing but gpiozero, which is stubbed
-    # above). Stubbing it would mean mqtt.py caught a fake SensorBusy that no
-    # real code path can raise - the interlock tests would then prove nothing
-    # about the exception the driver actually throws.
+    # above). Stubbing it would mean mqtt.py caught a fake MeasurementError
+    # that no real code path can raise - the interlock tests would then prove
+    # nothing about the exception the driver actually throws.
     mod(
         "app.sensors.distance",
         __path__=[os.path.join(_REPO_ROOT, "app", "sensors", "distance")],
@@ -80,17 +81,31 @@ def _install_stubs():
 _install_stubs()
 import mqtt as mqtt_mod  # noqa: E402
 from app.sensors.distance.distance import (  # noqa: E402
-    Distance, MeasurementError, SensorBusy,
+    Distance, MeasurementError,
 )
 
 _MeasurementError = MeasurementError
-_SensorBusy = SensorBusy
+
+
+class _ExceptionRecorder(logging.Handler):
+    """Collects log records that carry an exception, i.e. came from a catch-all."""
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        if record.exc_info:
+            self.records.append(record)
 
 
 class WaterTestBase(unittest.TestCase):
     def setUp(self):
         self.client = MagicMock()
         self.sensor = MagicMock()
+        # Non-zero by default: "the sampler has produced readings" is the
+        # normal state, and safe_distance_measure() short-circuits on 0.
+        self.sensor.sample_count.return_value = 9
         mqtt_mod.distance_sensor = self.sensor
         mqtt_mod.client = self.client
         mqtt_mod.pump = MagicMock()
@@ -99,12 +114,34 @@ class WaterTestBase(unittest.TestCase):
         # catch-all swallows - which would let these tests pass while the state
         # publish they are meant to exercise never runs.
         mqtt_mod.pump.get_speed.return_value = 0
+        mqtt_mod.light = MagicMock()
+        mqtt_mod.light.get_brightness.return_value = 0
         mqtt_mod.WATER_LOW_CM = 11.0
         mqtt_mod.WATER_VALID_MIN_CM = 3.0
         mqtt_mod.WATER_VALID_MAX_CM = 25.0
         # flash_lights spawns a thread; the interlock's decision is what matters.
         self._flash = patch.object(mqtt_mod, "flash_lights").start()
         self.addCleanup(patch.stopall)
+
+        # on_message and the publish loops wrap everything in a catch-all that
+        # logs and continues. In production that is right; in a test it means a
+        # TypeError from a badly-built mock gets PRINTED while every assertion
+        # still passes and the code under test never ran. That has already
+        # happened twice here. Records carrying exc_info come from those
+        # catch-alls; a plain logger.error (a refused threshold, say) does not.
+        self._swallowed = _ExceptionRecorder()
+        logging.getLogger("mqtt").addHandler(self._swallowed)
+        self.addCleanup(logging.getLogger("mqtt").removeHandler, self._swallowed)
+        self.addCleanup(self._assert_nothing_was_swallowed)
+
+    def _assert_nothing_was_swallowed(self):
+        if self._swallowed.records:
+            first = self._swallowed.records[0]
+            raise AssertionError(
+                "an exception was swallowed by a catch-all during this test - "
+                "the code under test may never have run: "
+                f"{first.getMessage()}"
+            )
 
     def published(self, topic):
         """Payloads published to `topic`, in order."""
@@ -120,50 +157,53 @@ class WaterTestBase(unittest.TestCase):
 
 class TestPlausibilityBand(WaterTestBase):
     def test_reading_inside_band_is_returned(self):
-        self.sensor.measure.return_value = 12.5
+        self.sensor.measure_once.return_value = 12.5
         self.assertEqual(mqtt_mod.safe_distance_measure(), 12.5)
 
     def test_latched_near_zero_reading_is_rejected(self):
         # The exact value this unit reported for days with no sensor attached.
-        self.sensor.measure.return_value = 0.09
+        self.sensor.measure_once.return_value = 0.09
         self.assertIsNone(mqtt_mod.safe_distance_measure())
 
     def test_out_of_range_reading_is_rejected(self):
         # Also observed on the same dead sensor. Note it is ABOVE the low-water
         # threshold, so a bare comparison would call it "water low" - the same
         # garbage produces opposite alarms depending only on where it latched.
-        self.sensor.measure.return_value = 83.0
+        self.sensor.measure_once.return_value = 83.0
         self.assertIsNone(mqtt_mod.safe_distance_measure())
 
     def test_zero_reading_is_rejected(self):
         # partial=True returns 0.0 from an empty queue rather than blocking.
-        self.sensor.measure.return_value = 0.0
+        self.sensor.measure_once.return_value = 0.0
         self.assertIsNone(mqtt_mod.safe_distance_measure())
 
     def test_band_edges_are_inclusive(self):
         for edge in (3.0, 25.0):
             with self.subTest(edge=edge):
-                self.sensor.measure.return_value = edge
+                self.sensor.measure_once.return_value = edge
                 self.assertEqual(mqtt_mod.safe_distance_measure(), edge)
 
     def test_just_outside_band_is_rejected(self):
         for value in (2.99, 25.01):
             with self.subTest(value=value):
-                self.sensor.measure.return_value = value
+                self.sensor.measure_once.return_value = value
                 self.assertIsNone(mqtt_mod.safe_distance_measure())
 
-    def test_busy_sensor_yields_no_reading(self):
-        self.sensor.measure.side_effect = _SensorBusy("busy")
+    def test_no_samples_yet_yields_no_reading_without_measuring(self):
+        # "Not ready" is distinct from "implausible": the sampler has produced
+        # nothing, so the 0.0 it would return means nothing at all.
+        self.sensor.sample_count.return_value = 0
         self.assertIsNone(mqtt_mod.safe_distance_measure())
+        self.sensor.measure_once.assert_not_called()
 
     def test_measurement_error_yields_no_reading(self):
-        self.sensor.measure.side_effect = _MeasurementError("boom")
+        self.sensor.measure_once.side_effect = _MeasurementError("boom")
         self.assertIsNone(mqtt_mod.safe_distance_measure())
 
 
 class TestFailClosedPublishing(WaterTestBase):
     def test_untrustworthy_reading_publishes_offline_and_nothing_else(self):
-        self.sensor.measure.return_value = 0.09
+        self.sensor.measure_once.return_value = 0.09
         self.assertIsNone(mqtt_mod.refresh_water_state(self.client))
         self.assertEqual(self.published("gardyn/water/status"), ["offline"])
         # The critical assertion: no level, and above all no "OFF" claiming the
@@ -172,23 +212,28 @@ class TestFailClosedPublishing(WaterTestBase):
         self.assertNotIn("gardyn/water/low/state", self.topics())
 
     def test_trustworthy_reading_above_threshold_reports_low(self):
-        self.sensor.measure.return_value = 20.0
+        self.sensor.measure_once.return_value = 20.0
         self.assertEqual(mqtt_mod.refresh_water_state(self.client), 20.0)
         self.assertEqual(self.published("gardyn/water/status"), ["online"])
         self.assertEqual(self.published("gardyn/water/level"), ["20.00"])
+        self.assertLess(
+            self.topics().index("gardyn/water/level"),
+            self.topics().index("gardyn/water/status"),
+            "trust must be asserted after the value it vouches for",
+        )
         self.assertEqual(self.published("gardyn/water/low/state"), ["ON"])
 
     def test_trustworthy_reading_below_threshold_reports_ok(self):
-        self.sensor.measure.return_value = 8.0
+        self.sensor.measure_once.return_value = 8.0
         self.assertEqual(mqtt_mod.refresh_water_state(self.client), 8.0)
         self.assertEqual(self.published("gardyn/water/status"), ["online"])
         self.assertEqual(self.published("gardyn/water/level"), ["8.00"])
         self.assertEqual(self.published("gardyn/water/low/state"), ["OFF"])
 
     def test_trust_topic_recovers_when_readings_become_valid(self):
-        self.sensor.measure.return_value = 0.09
+        self.sensor.measure_once.return_value = 0.09
         mqtt_mod.refresh_water_state(self.client)
-        self.sensor.measure.return_value = 9.0
+        self.sensor.measure_once.return_value = 9.0
         mqtt_mod.refresh_water_state(self.client)
         self.assertEqual(
             self.published("gardyn/water/status"), ["offline", "online"]
@@ -205,28 +250,28 @@ class TestFailClosedPublishing(WaterTestBase):
 
     def test_supplied_distance_avoids_a_second_measurement(self):
         mqtt_mod.update_water_low_state(self.client, 9.0)
-        self.sensor.measure.assert_not_called()
+        self.sensor.measure_once.assert_not_called()
 
 
 class TestPumpInterlock(WaterTestBase):
     def test_refuses_to_start_on_untrustworthy_reading(self):
-        self.sensor.measure.return_value = 0.09
+        self.sensor.measure_once.return_value = 0.09
         self.assertFalse(mqtt_mod.start_pump(100, self.client))
         mqtt_mod.pump.set_speed.assert_not_called()
 
     def test_refuses_to_start_when_water_is_low(self):
-        self.sensor.measure.return_value = 20.0
+        self.sensor.measure_once.return_value = 20.0
         self.assertFalse(mqtt_mod.start_pump(100, self.client))
         mqtt_mod.pump.set_speed.assert_not_called()
 
     def test_starts_when_water_is_present(self):
-        self.sensor.measure.return_value = 8.0
+        self.sensor.measure_once.return_value = 8.0
         self.assertTrue(mqtt_mod.start_pump(100, self.client))
         mqtt_mod.pump.set_speed.assert_called_once_with(100)
 
     def test_starts_unconditionally_when_checking_disabled(self):
         mqtt_mod.WATER_LOW_CM = None
-        self.sensor.measure.return_value = 0.09
+        self.sensor.measure_once.return_value = 0.09
         self.assertTrue(mqtt_mod.start_pump(100, self.client))
         mqtt_mod.pump.set_speed.assert_called_once_with(100)
 
@@ -237,45 +282,146 @@ class TestPumpInterlock(WaterTestBase):
         mqtt_mod.on_message(self.client, None, msg)
 
     def test_pump_command_on_path_is_interlocked(self):
-        self.sensor.measure.return_value = 0.09
+        self.sensor.measure_once.return_value = 0.09
         self._send("pump/command", "ON")
         mqtt_mod.pump.set_speed.assert_not_called()
 
     def test_pump_speed_set_path_is_interlocked(self):
         # This path had no water check at all before T-472.
-        self.sensor.measure.return_value = 0.09
+        self.sensor.measure_once.return_value = 0.09
         self._send("pump/speed/set", "80")
         mqtt_mod.pump.set_speed.assert_not_called()
 
     def test_pump_speed_set_still_starts_when_water_is_present(self):
-        self.sensor.measure.return_value = 8.0
+        self.sensor.measure_once.return_value = 8.0
         self._send("pump/speed/set", "80")
         mqtt_mod.pump.set_speed.assert_called_once_with(80)
 
     def test_pump_speed_zero_stops_without_measuring(self):
         self._send("pump/speed/set", "0")
         mqtt_mod.pump.off.assert_called_once()
-        self.sensor.measure.assert_not_called()
+        self.sensor.measure_once.assert_not_called()
 
     def test_button_double_press_path_is_interlocked(self):
         # The physical button also had no water check before T-472.
-        self.sensor.measure.return_value = 0.09
+        self.sensor.measure_once.return_value = 0.09
         mqtt_mod.pump.get_speed.return_value = 0
         mqtt_mod.toggle_pump()
         mqtt_mod.pump.set_speed.assert_not_called()
 
     def test_button_double_press_starts_when_water_is_present(self):
-        self.sensor.measure.return_value = 8.0
+        self.sensor.measure_once.return_value = 8.0
         mqtt_mod.pump.get_speed.return_value = 0
         mqtt_mod.toggle_pump()
         mqtt_mod.pump.set_speed.assert_called_once()
 
     def test_button_can_always_stop_a_running_pump(self):
         # Stopping must never be gated on a sensor reading.
-        self.sensor.measure.return_value = 0.09
+        self.sensor.measure_once.return_value = 0.09
         mqtt_mod.pump.get_speed.return_value = 50
         mqtt_mod.toggle_pump()
         mqtt_mod.pump.off.assert_called_once()
+
+
+class TestThresholdValidation(WaterTestBase):
+    """The threshold arrives from an MQTT topic any client can publish to."""
+
+    def _set_threshold(self, payload):
+        msg = MagicMock()
+        msg.topic = "gardyn/water/low/cm/set"
+        msg.payload = payload.encode()
+        mqtt_mod.on_message(self.client, None, msg)
+
+    def test_non_finite_threshold_is_refused(self):
+        # The sharp one: nan parses, is not in (None, 0) so the mode publishes
+        # "Enabled", and then `distance > nan` is False for EVERY reading - the
+        # alarm never fires and start_pump() starts the pump every time. A
+        # fail-open on a safety interlock.
+        for payload in ("nan", "inf", "-inf"):
+            with self.subTest(payload=payload):
+                mqtt_mod.WATER_LOW_CM = 11.0
+                self._set_threshold(payload)
+                self.assertEqual(mqtt_mod.WATER_LOW_CM, 11.0)
+
+    def test_non_finite_threshold_does_not_disarm_the_pump_interlock(self):
+        self._set_threshold("nan")
+        self.sensor.measure_once.return_value = 20.0  # water low
+        self.assertFalse(mqtt_mod.start_pump(100, self.client))
+        mqtt_mod.pump.set_speed.assert_not_called()
+
+    def test_threshold_outside_the_band_is_refused(self):
+        # Below the band minimum no valid reading can ever be under it, so the
+        # alarm pins on and the pump is refused forever; above the maximum it
+        # can never be reached and the alarm pins off. Both look configured.
+        for payload in ("1.0", "30.0"):
+            with self.subTest(payload=payload):
+                mqtt_mod.WATER_LOW_CM = 11.0
+                self._set_threshold(payload)
+                self.assertEqual(mqtt_mod.WATER_LOW_CM, 11.0)
+
+    def test_refused_threshold_is_re_asserted_to_ha(self):
+        self._set_threshold("nan")
+        self.assertEqual(self.published("gardyn/water/low/cm"), ["11.00"])
+
+    def test_valid_threshold_is_applied(self):
+        self.sensor.measure_once.return_value = 8.0
+        self._set_threshold("9.5")
+        self.assertEqual(mqtt_mod.WATER_LOW_CM, 9.5)
+        self.assertIn("9.50", self.published("gardyn/water/low/cm"))
+
+    def test_zero_disables_and_is_published_as_zero(self):
+        self.sensor.measure_once.return_value = 8.0
+        # Returning without publishing left the previous number retained, so
+        # HA's slider snapped back to a threshold the interlock was not using -
+        # and "disabled" is exactly when that matters, since it bypasses the
+        # pump interlock entirely.
+        self._set_threshold("0")
+        self.assertIsNone(mqtt_mod.WATER_LOW_CM)
+        self.assertIn("0.00", self.published("gardyn/water/low/cm"))
+        self.assertIn("Disabled", self.published("gardyn/water/low/mode"))
+
+    def test_unparseable_threshold_is_ignored(self):
+        self._set_threshold("banana")
+        self.assertEqual(mqtt_mod.WATER_LOW_CM, 11.0)
+
+
+class TestConnectSequencing(WaterTestBase):
+    def test_water_trust_is_retracted_before_the_device_is_announced_online(self):
+        # gardyn/water/status is retained and has no will, so a reading vouched
+        # for before the last death is still on the broker saying "trustworthy",
+        # alongside the retained level it vouched for. Announce the device
+        # online first and HA marks the water entities available showing that
+        # old level as current.
+        self.sensor.measure_once.return_value = 8.0
+        mqtt_mod._publisher_threads_started = True  # don't spawn real threads
+        mqtt_mod.on_connect(self.client, None, None, 0)
+        topics = self.topics()
+        first_water_status = topics.index("gardyn/water/status")
+        device_online = topics.index("gardyn/status")
+        self.assertLess(first_water_status, device_online)
+        self.assertEqual(self.published("gardyn/water/status")[0], "offline")
+
+    def test_connect_refreshes_the_water_state(self):
+        # The publish loop only fires every 30 minutes and its thread survives a
+        # reconnect, so without this a reconnect leaves the water entities on
+        # whatever the trust topic last said.
+        self.sensor.measure_once.return_value = 8.0
+        mqtt_mod._publisher_threads_started = True
+        mqtt_mod.on_connect(self.client, None, None, 0)
+        self.assertEqual(self.published("gardyn/water/status")[-1], "online")
+        self.assertIn("8.00", self.published("gardyn/water/level"))
+
+    def test_a_failing_water_refresh_does_not_block_the_publisher_threads(self):
+        # The swallowed-exception guard is the thing under test here, so opt out
+        # of it: this test asserts that on_connect DOES catch and continue.
+        self._swallowed.records.clear()
+        self.addCleanup(self._swallowed.records.clear)
+        mqtt_mod._publisher_threads_started = False
+        with patch.object(mqtt_mod, "refresh_water_state",
+                          side_effect=RuntimeError("sensor exploded")), \
+             patch.object(mqtt_mod, "start_publisher_threads") as start:
+            mqtt_mod.on_connect(self.client, None, None, 0)
+        start.assert_called_once()
 
 
 class TestDiscoveryAvailability(WaterTestBase):
@@ -302,6 +448,34 @@ class TestDiscoveryAvailability(WaterTestBase):
                 self.assertEqual(topics, ["gardyn/status", "gardyn/water/status"])
                 self.assertEqual(cfg["availability_mode"], "all")
 
+    def test_availability_payloads_are_stated_per_entry(self):
+        # HA reads payload_available from the PER-ENTRY dict for the list form
+        # and only falls back to the top-level keys for the availability_topic
+        # form. Top-level values here would be silently ignored - working today
+        # only because "online"/"offline" are the per-entry defaults.
+        for fragment in ("_water_level/config", "_water_low/config"):
+            with self.subTest(entity=fragment):
+                cfg = self._config(fragment)
+                self.assertNotIn("payload_available", cfg)
+                self.assertNotIn("payload_not_available", cfg)
+                for entry in cfg["availability"]:
+                    self.assertEqual(entry["payload_available"], "online")
+                    self.assertEqual(entry["payload_not_available"], "offline")
+
+    def test_water_level_expires_so_a_latched_value_cannot_look_current(self):
+        # The one staleness case the trust topic cannot catch: the process stays
+        # healthy while the SENSOR quietly stops changing. gpiozero keeps its
+        # last samples indefinitely, so a latched value still passes the band.
+        cfg = self._config("_water_level/config")
+        self.assertGreater(cfg["expire_after"], 2 * 1800)
+
+    def test_threshold_entity_range_reaches_the_top_of_the_band(self):
+        # Capped at 15 before, which put the whole 15-25 cm span out of reach -
+        # and on the PR #90 calibration that is where a threshold separating a
+        # full tank from an empty one belongs.
+        cfg = self._config("_water_low_cm/config")
+        self.assertEqual(cfg["max"], mqtt_mod.WATER_VALID_MAX_CM)
+
     def test_water_entities_do_not_also_set_availability_topic(self):
         # The MQTT integration docs: availability_topic "must not be used
         # together with availability". Both keys present is a config error, and
@@ -319,7 +493,7 @@ class TestDiscoveryAvailability(WaterTestBase):
 
 
 class TestDistanceDriver(unittest.TestCase):
-    """The driver-level half: the bounded read and the measurement lock."""
+    """Driver-level behaviour: the bounded read and the sample-count signal."""
 
     def _make(self):
         with patch("app.sensors.distance.distance.DistanceSensor") as sensor_cls, \
@@ -328,9 +502,12 @@ class TestDistanceDriver(unittest.TestCase):
         return d, sensor_cls
 
     def test_sensor_is_constructed_with_partial_true(self):
-        # Without partial=True, gpiozero's GPIOQueue.value waits on
-        # self.full.wait() with NO timeout, so a silent sensor hangs its reader
-        # forever - on the paho network thread that wedges all MQTT handling.
+        # Weak by necessity - gpiozero is stubbed here, so this asserts the
+        # kwarg is passed, not that the real queue stops blocking. It would
+        # still pass if gpiozero renamed the parameter. The behaviour it guards
+        # is verified against the pinned library source, not here: with
+        # partial=False, GPIOQueue.value waits on full.wait() with no timeout,
+        # and on the shared pigpio callback thread that self-deadlocks.
         _, sensor_cls = self._make()
         self.assertIs(sensor_cls.call_args.kwargs["partial"], True)
 
@@ -339,75 +516,148 @@ class TestDistanceDriver(unittest.TestCase):
         d.sensor.distance = 0.12
         self.assertAlmostEqual(d.measure_once(), 12.0, places=5)
 
-    def test_measure_once_raises_sensor_busy_when_locked(self):
-        d, _ = self._make()
-        d._lock.acquire()
-        try:
-            with self.assertRaises(SensorBusy):
-                d.measure_once()
-        finally:
-            d._lock.release()
-
-    def test_measure_raises_sensor_busy_when_locked(self):
-        d, _ = self._make()
-        d._lock.acquire()
-        try:
-            with self.assertRaises(SensorBusy):
-                d.measure()
-        finally:
-            d._lock.release()
-
-    def test_sensor_busy_is_a_measurement_error(self):
-        # mqtt.py orders `except SensorBusy` before `except MeasurementError`;
-        # callers that only catch the latter must still be covered.
-        self.assertTrue(issubclass(SensorBusy, MeasurementError))
-
-    def test_lock_is_released_after_a_successful_measure(self):
-        d, _ = self._make()
-        d.sensor.distance = 0.10
-        d.measure_once()
-        self.assertTrue(d._lock.acquire(blocking=False))
-        d._lock.release()
-
-    def test_lock_is_released_after_a_failed_measure(self):
+    def test_measure_once_raises_on_hardware_failure(self):
         d, _ = self._make()
         type(d.sensor).distance = property(
             lambda self: (_ for _ in ()).throw(RuntimeError("no echo"))
         )
         with self.assertRaises(MeasurementError):
             d.measure_once()
-        self.assertTrue(d._lock.acquire(blocking=False))
-        d._lock.release()
 
-    def test_measure_holds_the_lock_across_every_sample(self):
-        # The whole point of moving the lock up to measure(): another caller
-        # must not be able to fire a trigger pulse between two of our reads and
-        # have us average in its echo.
+    def test_sample_count_reports_queue_depth(self):
         d, _ = self._make()
-        seen = []
+        d.sensor._queue.queue = [0.1, 0.1, 0.1]
+        self.assertEqual(d.sample_count(), 3)
 
-        def peek(_self):
-            seen.append(d._lock.acquire(blocking=False))
-            return 0.10
+    def test_sample_count_is_zero_before_the_sampler_produces_anything(self):
+        # The state that matters: a sensor that has never echoed. gpiozero
+        # ignores its None readings, so the queue stays empty and .distance
+        # would hand back 0.0 - which reads as a FULL tank.
+        d, _ = self._make()
+        d.sensor._queue.queue = []
+        self.assertEqual(d.sample_count(), 0)
 
-        type(d.sensor).distance = property(peek)
-        d.measure()
-        self.assertEqual(len(seen), 10)
-        self.assertTrue(all(held is False for held in seen))
+    def test_sample_count_degrades_to_none_if_gpiozero_internals_move(self):
+        d, _ = self._make()
+        d.sensor = object()  # no _queue attribute at all
+        self.assertIsNone(d.sample_count())
+
+    def test_measure_samples_over_time_rather_than_back_to_back(self):
+        # measure()'s whole value is that it sleeps between reads. Ten
+        # back-to-back reads of an already-smoothed rolling median return the
+        # same number ten times and average nothing.
+        d, _ = self._make()
+        d.sensor.distance = 0.10
+        with patch("app.sensors.distance.distance.sleep") as slept:
+            d.measure(samples=4, interval=0.07)
+        self.assertEqual(slept.call_count, 3)  # n-1 gaps, no trailing sleep
+        self.assertEqual({c.args[0] for c in slept.call_args_list}, {0.07})
 
     def test_measure_returns_the_median_of_its_samples(self):
         d, _ = self._make()
         values = iter([0.10] * 5 + [0.20] * 5)
         type(d.sensor).distance = property(lambda _self: next(values))
-        self.assertAlmostEqual(d.measure(), 15.0, places=5)
+        with patch("app.sensors.distance.distance.sleep"):
+            self.assertAlmostEqual(d.measure(), 15.0, places=5)
+
+    def test_measure_survives_individual_sample_failures(self):
+        d, _ = self._make()
+        seq = iter([0.10, RuntimeError("no echo"), 0.10])
+        def nxt(_self):
+            v = next(seq)
+            if isinstance(v, Exception):
+                raise v
+            return v
+        type(d.sensor).distance = property(nxt)
+        with patch("app.sensors.distance.distance.sleep"):
+            self.assertAlmostEqual(d.measure(samples=3), 10.0, places=5)
 
     def test_measure_raises_when_no_sample_succeeds(self):
         d, _ = self._make()
         type(d.sensor).distance = property(
             lambda self: (_ for _ in ()).throw(RuntimeError("no echo"))
         )
-        with self.assertRaises(MeasurementError):
-            d.measure()
+        with patch("app.sensors.distance.distance.sleep"):
+            with self.assertRaises(MeasurementError):
+                d.measure()
+
+
+class TestBandConfigValidation(unittest.TestCase):
+    """config._load_water_band() is the only guard against a dead sensor
+    reading as a full reservoir. It must never accept a minimum of zero, and
+    must never raise - mqtt.service restarts forever on an import error."""
+
+    def _load(self, **env):
+        import importlib.util
+        # Load the real config module from disk under a private name, with a
+        # stubbed dotenv so load_dotenv() cannot pull in the developer's .env.
+        saved = sys.modules.get("dotenv")
+        sys.modules["dotenv"] = types.ModuleType("dotenv")
+        sys.modules["dotenv"].load_dotenv = lambda *a, **k: None
+        saved_env = {k: os.environ.get(k) for k in
+                     ("WATER_VALID_MIN_CM", "WATER_VALID_MAX_CM")}
+        try:
+            for k, v in env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            for k in saved_env:
+                if k not in env:
+                    os.environ.pop(k, None)
+            spec = importlib.util.spec_from_file_location(
+                "_cfg_under_test", os.path.join(_REPO_ROOT, "config.py")
+            )
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            return m.WATER_VALID_MIN_CM, m.WATER_VALID_MAX_CM
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            if saved is None:
+                sys.modules.pop("dotenv", None)
+            else:
+                sys.modules["dotenv"] = saved
+
+    def test_defaults_when_unset(self):
+        self.assertEqual(self._load(), (3.0, 25.0))
+
+    def test_valid_override_is_honoured(self):
+        self.assertEqual(
+            self._load(WATER_VALID_MIN_CM="4.5", WATER_VALID_MAX_CM="22.0"),
+            (4.5, 22.0),
+        )
+
+    def test_zero_minimum_is_refused(self):
+        # THE safety case. A minimum of 0 admits the 0.0 that a never-echoed
+        # sensor reports, and 0.0 is the full-tank end of the scale: dead sensor
+        # reads "tank full", pump runs dry.
+        self.assertEqual(self._load(WATER_VALID_MIN_CM="0"), (3.0, 25.0))
+
+    def test_negative_minimum_is_refused(self):
+        self.assertEqual(self._load(WATER_VALID_MIN_CM="-1"), (3.0, 25.0))
+
+    def test_inverted_band_is_refused(self):
+        # Would reject every reading, so the pump could never start again.
+        self.assertEqual(
+            self._load(WATER_VALID_MIN_CM="25", WATER_VALID_MAX_CM="3"),
+            (3.0, 25.0),
+        )
+
+    def test_non_finite_bound_is_refused(self):
+        self.assertEqual(self._load(WATER_VALID_MAX_CM="inf"), (3.0, 25.0))
+        self.assertEqual(self._load(WATER_VALID_MIN_CM="nan"), (3.0, 25.0))
+
+    def test_unparseable_value_falls_back_instead_of_raising(self):
+        # An exception here is not a loud failure - mqtt.service carries
+        # Restart=always with StartLimitIntervalSec=0, so it is a permanent
+        # crash loop that takes the lights and cameras down too.
+        for bad in ("", "3,0", "abc"):
+            with self.subTest(value=bad):
+                self.assertEqual(self._load(WATER_VALID_MIN_CM=bad), (3.0, 25.0))
 
 
 if __name__ == "__main__":

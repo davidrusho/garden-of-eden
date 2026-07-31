@@ -1,3 +1,7 @@
+# config.py
+#
+# Reviewed: 2026-07-31 against b0f8f92 (T-472)
+import math
 import os
 from dotenv import load_dotenv
 
@@ -44,8 +48,68 @@ WATER_LOW_CM = float(os.getenv("WATER_LOW_CM", 0)) or None
 #
 # Defaults from upstream PR #90: below 3 cm is a sensor error or overflow,
 # above 25 cm is out of range or empty.
-WATER_VALID_MIN_CM = float(os.getenv("WATER_VALID_MIN_CM", "3.0"))
-WATER_VALID_MAX_CM = float(os.getenv("WATER_VALID_MAX_CM", "25.0"))
+#
+# The MINIMUM is the safety-critical half and is validated below. A sensor that
+# has never echoed reads exactly 0.0 cm - gpiozero's queue stays empty and the
+# median of an empty queue is 0.0 - and 0.0 is the FULL-TANK end of the scale.
+# Nothing else in the system can tell that apart from a genuinely full
+# reservoir, so a minimum of 0 would turn a dead sensor into a permanent "tank
+# full" and let the pump run dry: the exact failure this band exists to prevent.
+#
+# The MAXIMUM must sit above the real empty-tank reading with margin, or a
+# genuinely empty reservoir is discarded as implausible and the low-water alarm
+# goes unavailable instead of firing. On the PR #90 calibration empty is ~23 cm
+# against a default max of 25, which is thin - re-measure on the real hardware
+# (T-299) rather than trusting these numbers.
+_WATER_BAND_DEFAULTS = (3.0, 25.0)
+
+
+def _load_water_band():
+    """Read the band from env, falling back to defaults on anything unsafe.
+
+    Deliberately does NOT raise. This module is imported by mqtt.py, whose
+    systemd unit carries Restart=always with StartLimitIntervalSec=0, so an
+    exception here is not a loud failure - it is a permanent 10-second crash
+    loop that takes the lights, the cameras and the pump down with it, and is
+    recoverable only over SSH. A bad band degrades to the safe default plus a
+    logged error instead.
+    """
+    import logging
+
+    raw_min = os.getenv("WATER_VALID_MIN_CM")
+    raw_max = os.getenv("WATER_VALID_MAX_CM")
+    default_min, default_max = _WATER_BAND_DEFAULTS
+
+    try:
+        low = float(raw_min) if raw_min not in (None, "") else default_min
+        high = float(raw_max) if raw_max not in (None, "") else default_max
+    except ValueError:
+        logging.getLogger(__name__).error(
+            "Unparseable water band (min=%r max=%r); using defaults %s-%s cm",
+            raw_min, raw_max, default_min, default_max,
+        )
+        return default_min, default_max
+
+    problems = []
+    if not (math.isfinite(low) and math.isfinite(high)):
+        problems.append("non-finite bound")
+    # > 0, not >= 0: a minimum of zero admits the 0.0 a dead sensor reports.
+    if low <= 0:
+        problems.append("minimum must be greater than zero")
+    if low >= high:
+        problems.append("minimum must be below maximum")
+
+    if problems:
+        logging.getLogger(__name__).error(
+            "Refusing unsafe water band %r-%r (%s); using defaults %s-%s cm",
+            raw_min, raw_max, "; ".join(problems), default_min, default_max,
+        )
+        return default_min, default_max
+
+    return low, high
+
+
+WATER_VALID_MIN_CM, WATER_VALID_MAX_CM = _load_water_band()
 
 UPPER_CAMERA_DEVICE = os.getenv("UPPER_CAMERA_DEVICE", "/dev/video0")
 LOWER_CAMERA_DEVICE = os.getenv("LOWER_CAMERA_DEVICE", "/dev/video2")

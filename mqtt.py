@@ -1,3 +1,7 @@
+# mqtt.py
+#
+# Reviewed: 2026-07-31 against b0f8f92 (T-472)
+import math
 import subprocess
 import threading
 from threading import Timer
@@ -18,7 +22,7 @@ from app.sensors.pump.pump import Pump
 from app.sensors.pcb_temp.pcb_temp import get_pcb_temperature
 from app.sensors.temperature.temperature import temperature_sensor
 from app.sensors.humidity.humidity import humidity_sensor
-from app.sensors.distance.distance import Distance, MeasurementError, SensorBusy
+from app.sensors.distance.distance import Distance, MeasurementError
 
 # Configure logging.
 #
@@ -245,11 +249,23 @@ def safe_distance_measure():
     fail, and unreachable regardless, since gpiozero never raises
     MeasurementError from this path in the first place.
     """
-    try:
-        distance = distance_sensor.measure()
-    except SensorBusy:
-        logger.info("Distance measure skipped: another read is in progress")
+    # measure_once(), not measure(). Reading `.distance` returns the median of
+    # gpiozero's own rolling nine-sample queue, so it is already smoothed;
+    # measure()'s repeat sampling only adds meaning if it sleeps between reads,
+    # and this runs on the paho network thread and on the pigpio callback
+    # thread, neither of which may be stalled for the best part of a second.
+    samples = distance_sensor.sample_count()
+    if samples == 0:
+        # Not the same thing as an implausible reading. gpiozero's sampler has
+        # produced nothing yet - the process just started, or the sensor has
+        # never echoed - and the 0.0 it would hand back is indistinguishable
+        # from a full tank. Report "no reading" without claiming to know
+        # anything, and let the caller decline to publish a verdict at all.
+        logger.info("Distance sampler has no readings yet")
         return None
+
+    try:
+        distance = distance_sensor.measure_once()
     except MeasurementError as e:
         logger.warning(f"Distance measure failed: {e}")
         return None
@@ -279,12 +295,45 @@ def publish_water_low_mode(client):
     client.publish(BASE_TOPIC + "/water/low/mode", mode, retain=True)
 
 
+def _threshold_is_acceptable(value):
+    """Whether a proposed low-water threshold may be applied.
+
+    Rejects the two shapes that silently disarm the interlock:
+
+    - Non-finite. float("nan") parses fine, is not in (None, 0) so the mode
+      publishes "Enabled", and then `distance > nan` is False for every reading
+      - so the alarm never fires AND start_pump() starts the pump every time.
+      A fail-OPEN on a safety interlock, reachable by any mosquitto_pub.
+    - Outside the plausibility band. A threshold below the band minimum can
+      never be exceeded by a valid reading, pinning the alarm on and refusing
+      the pump forever; one above the maximum can never be reached, pinning it
+      off. Both look like a working configuration.
+
+    Zero is allowed and means "disabled" - an explicit opt-out, surfaced by the
+    separate water/low/mode entity.
+
+    Note the isfinite() check is defence in depth rather than the sole barrier:
+    every comparison against nan is False, so the band test below rejects
+    non-finite values on its own. Deleting isfinite() does not change behaviour
+    today - it is kept so the intent survives anyone later loosening the band.
+    """
+    if not math.isfinite(value):
+        return False
+    if value == 0:
+        return True
+    return WATER_VALID_MIN_CM <= value <= WATER_VALID_MAX_CM
+
+
 def publish_water_low_threshold(client):
     """Publish the threshold currently in effect, so HA and this process agree."""
-    if WATER_LOW_CM in (None, 0):
-        return
-    logger.info(f"Publishing water low threshold: {WATER_LOW_CM:.2f}cm")
-    client.publish(BASE_TOPIC + "/water/low/cm", f"{WATER_LOW_CM:.2f}", retain=True)
+    # Publish 0 rather than returning when checking is disabled. Returning left
+    # the previous number retained, so HA's slider snapped back to it and
+    # displayed a threshold the interlock was not using - and the case where
+    # that matters most is precisely this one, since a disabled threshold means
+    # the pump interlock is bypassed entirely.
+    effective = 0.0 if WATER_LOW_CM in (None, 0) else WATER_LOW_CM
+    logger.info(f"Publishing water low threshold: {effective:.2f}cm")
+    client.publish(BASE_TOPIC + "/water/low/cm", f"{effective:.2f}", retain=True)
 
 
 _UNSET = object()
@@ -337,9 +386,9 @@ def refresh_water_state(client):
     Returns the trustworthy distance in cm, or None.
     """
     distance = safe_distance_measure()
-    publish_water_sensor_status(client, distance is not None)
 
     if distance is None:
+        publish_water_sensor_status(client, False)
         logger.warning(
             "Reservoir reading is not trustworthy - water entities marked unavailable"
         )
@@ -349,9 +398,16 @@ def refresh_water_state(client):
     # Retained, like the other state topics, so HA gets it on subscribe instead
     # of sitting at `unknown`. Safe to retain only because the retained trust
     # topic travels with it - a stale level cannot be read as current while
-    # water/status says offline.
-    client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}", retain=True)
+    # water/status says offline. The water_level discovery payload also carries
+    # expire_after, which bounds staleness at HA's end if this process stops
+    # refreshing without the trust topic ever flipping.
+    client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}", qos=1, retain=True)
     update_water_low_state(client, distance)
+    # Trust is asserted LAST, after the values it vouches for are on the wire.
+    # Published first, it would make the entities available for the gap before
+    # the new level lands, and what HA would show in that gap is the previous
+    # retained value - stale, and looking current.
+    publish_water_sensor_status(client, True)
     return distance
 
 
@@ -422,14 +478,28 @@ def send_discovery_messages(client):
     # docs are explicit that `availability_topic` "must not be used together with
     # `availability`". So these payloads take this dict INSTEAD of
     # availability_config, never merged with it.
+    #
+    # payload_available / payload_not_available go INSIDE each entry, not
+    # alongside. HA reads them from the per-entry dict for the list form and
+    # only falls back to the top-level keys for the availability_topic form, so
+    # top-level values here would be silently ignored - working today purely
+    # because "online"/"offline" happen to be the per-entry defaults. Stating
+    # them per entry means changing the shared payloads cannot quietly strand
+    # these two entities as permanently unavailable.
     water_availability_config = {
         "availability": [
-            {"topic": STATUS_TOPIC},
-            {"topic": WATER_STATUS_TOPIC},
+            {
+                "topic": STATUS_TOPIC,
+                "payload_available": "online",
+                "payload_not_available": "offline",
+            },
+            {
+                "topic": WATER_STATUS_TOPIC,
+                "payload_available": "online",
+                "payload_not_available": "offline",
+            },
         ],
         "availability_mode": "all",
-        "payload_available": "online",
-        "payload_not_available": "offline",
     }
 
     def publish_config(topic, payload, availability=None):
@@ -538,6 +608,13 @@ def send_discovery_messages(client):
         # `command_topic` dropped — read-only domain, see Temperature above.
         "unit_of_measurement": "cm",
         "device_class": "distance",
+        # Backstop for the one staleness case the trust topic cannot catch: the
+        # process stays healthy and MQTT keeps working while the SENSOR quietly
+        # stops changing. gpiozero's queue keeps its last samples indefinitely,
+        # so a latched value still passes the plausibility band and still gets
+        # vouched for. Slightly over twice the 30-minute publish cadence, so one
+        # missed cycle is tolerated and two are not.
+        "expire_after": 3900,
         "device": device_info
     }
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload, water_availability_config)
@@ -565,8 +642,13 @@ def send_discovery_messages(client):
         "platform": "mqtt",
         "state_topic": BASE_TOPIC + "/water/low/cm",
         "command_topic": BASE_TOPIC + "/water/low/cm/set",
+        # Range tracks the plausibility band, not an arbitrary ceiling. It used
+        # to stop at 15, which put the whole 15-25 cm span out of reach from HA
+        # - and on the PR #90 calibration (full ~10-12 cm, empty ~23 cm) that
+        # span is exactly where a threshold separating full from empty belongs.
+        # 0 stays reachable as the explicit "disabled" value.
         "min": 0,
-        "max": 15,
+        "max": WATER_VALID_MAX_CM,
         "step": 0.5,
         "qos": 1,
         "unit_of_measurement": "cm",
@@ -625,6 +707,16 @@ def on_connect(client, userdata, flags, rc, properties=None):
     logger.warning(f"Connected with result code {rc}")
     # Explicit topic list, not BASE_TOPIC + "/#" — see COMMAND_SUBSCRIPTIONS.
     client.subscribe(COMMAND_SUBSCRIPTIONS)
+    # Retract the water trust topic BEFORE announcing the device online.
+    #
+    # gardyn/water/status is retained and has no will attached, so a reading
+    # this process vouched for before it died is still sitting on the broker
+    # saying "trustworthy" - along with the retained level it vouched for. Come
+    # back up and announce gardyn/status online first, and both availability
+    # topics read online, so HA marks the water entities available and displays
+    # that old level as a current reading until the fresh one lands. Retracting
+    # first means trust has to be re-earned by an actual measurement.
+    publish_water_sensor_status(client, False)
     # Clear the retained "offline" the broker may have left from the last death.
     # Publish before discovery so HA never sees an entity announced unavailable.
     client.publish(STATUS_TOPIC, "online", qos=1, retain=True)
@@ -644,7 +736,14 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # guard in start_publisher_threads(), so without this a reconnect would leave
     # the water entities sitting on whatever the trust topic last said - for up
     # to half an hour, and across a restart, forever.
-    refresh_water_state(client)
+    # Guarded, and it must stay guarded: start_publisher_threads() is the next
+    # line, so anything escaping here would leave the temperature, humidity,
+    # PCB, camera and water loops permanently unstarted while gardyn/status sits
+    # at "online" and the device looks perfectly healthy.
+    try:
+        refresh_water_state(client)
+    except Exception as e:
+        logger.exception(f"Failed to refresh water state on connect: {e}")
     start_publisher_threads(client)
 
 def on_message(client, userdata, msg):
@@ -672,14 +771,28 @@ def on_message(client, userdata, msg):
                 publish_pump_state(client)
 
         elif topic_suffix == "pump/speed/set" and payload.isdigit():
-            speed = int(payload)
-            if speed == 0:
+            requested = int(payload)
+            if requested == 0:
+                # Stopping is never gated on a water reading.
+                speed = requested
                 pump.off()
+            elif pump.get_speed() > 0:
+                # Already running: this is a speed change, not a start, so it
+                # must not be refused. Refusing it meant that with water low the
+                # only reachable speed was 0 - the user could not turn the pump
+                # DOWN, which is the wrong direction for a safety interlock.
+                speed = requested
+                pump.set_speed(speed)
             else:
-                # Also an interlock path: this used to call pump.set_speed()
+                # A start. This path used to call pump.set_speed()
                 # unconditionally, so setting a speed would start a stopped pump
                 # with no water check whatsoever.
-                start_pump(speed, client)
+                if start_pump(requested, client):
+                    speed = requested
+                # On refusal `speed` is deliberately left alone: adopting it
+                # would leave the global disagreeing with what HA was just told,
+                # and a later bare `pump/command ON` would start at a speed the
+                # user never saw take effect.
             publish_pump_state(client)
 
         # === Light Logic ===
@@ -702,12 +815,24 @@ def on_message(client, userdata, msg):
 
         elif topic_suffix == "water/low/cm/set":
             try:
-                WATER_LOW_CM = float(payload)
-                publish_water_low_threshold(client)
-                publish_water_low_mode(client)
-                refresh_water_state(client)
+                candidate = float(payload)
             except ValueError:
                 logger.error(f"Invalid water low cm value: {payload}")
+            else:
+                if not _threshold_is_acceptable(candidate):
+                    logger.error(
+                        f"Rejecting water low threshold {payload!r} - "
+                        f"must be 0 (disabled) or within "
+                        f"{WATER_VALID_MIN_CM:.2f}-{WATER_VALID_MAX_CM:.2f}cm"
+                    )
+                    # Re-assert what we are actually running with, so HA's
+                    # number entity does not sit showing a value we rejected.
+                    publish_water_low_threshold(client)
+                else:
+                    WATER_LOW_CM = candidate or None
+                    publish_water_low_threshold(client)
+                    publish_water_low_mode(client)
+                    refresh_water_state(client)
 
         # === Sensor Data on Request ===
         elif topic_suffix == "pcb/temperature/get":
