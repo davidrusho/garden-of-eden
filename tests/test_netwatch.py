@@ -446,9 +446,30 @@ class TestTcpProbe(unittest.TestCase):
                                side_effect=ConnectionRefusedError()):
             self.assertIs(nw.tcp_probe(), True)
 
-    def test_unreachable_is_false(self):
+    def test_network_level_errors_are_a_real_no(self):
+        import errno as _errno
+        for err in (_errno.ENETUNREACH, _errno.EHOSTUNREACH, _errno.ETIMEDOUT,
+                    _errno.ENETDOWN):
+            with self.subTest(errno=err):
+                with mock.patch.object(nw.socket, "create_connection",
+                                       side_effect=OSError(err, "network")):
+                    self.assertIs(nw.tcp_probe(), False)
+
+    def test_local_resource_failures_are_could_not_measure(self):
+        """EMFILE/ENOMEM say nothing about reachability. Reading them as
+        'the LAN is down' is the same defect the tri-state in ping() closes —
+        and this probe matters more, because when wlan0 is down both ICMP
+        probes report don't-know and this one carries the whole decision."""
+        import errno as _errno
+        for err in (_errno.EMFILE, _errno.ENFILE, _errno.ENOMEM, _errno.EACCES):
+            with self.subTest(errno=err):
+                with mock.patch.object(nw.socket, "create_connection",
+                                       side_effect=OSError(err, "local")):
+                    self.assertIsNone(nw.tcp_probe())
+
+    def test_timeout_is_a_real_no(self):
         with mock.patch.object(nw.socket, "create_connection",
-                               side_effect=OSError(113, "no route")):
+                               side_effect=nw.socket.timeout()):
             self.assertIs(nw.tcp_probe(), False)
 
     def test_uses_the_broker_and_a_bounded_timeout(self):

@@ -79,6 +79,7 @@ exercised on a live host without rebooting it — is reachable from a test.
 """
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -335,16 +336,40 @@ def ping(target: str) -> bool | None:
     return False if proc.returncode == 1 else None
 
 
+# Errno values that are a genuine answer ABOUT THE NETWORK. Anything else from
+# socket.create_connection is a local failure — running out of file
+# descriptors or memory says nothing about reachability, and reading it as
+# "the LAN is down" is the same defect the tri-state in ping() exists to close.
+NETWORK_ERRNOS = frozenset({
+    errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN, errno.EHOSTDOWN,
+    errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED, errno.ENETRESET,
+})
+
+
 def tcp_probe(host: str = TCP_PROBE_HOST, port: int = TCP_PROBE_PORT) -> bool | None:
-    """True connected, False refused/unreachable/timed out, None could not try."""
+    """True connected, False a network-level no, None could not measure.
+
+    This probe carries more weight than it looks. When wlan0 is down there is
+    no route, so `ping` exits 2 and both ICMP probes report "don't know" —
+    measured in the T-473.4 drill. The decision to reconnect rested entirely
+    on this one, which is exactly why its own error classification has to be
+    as careful as ping's.
+    """
     try:
         with socket.create_connection((host, port), timeout=TCP_TIMEOUT_S):
             return True
-    except (socket.timeout, ConnectionRefusedError):
-        # Refused means something answered — the path is up, the port is shut.
+    except ConnectionRefusedError:
+        # Something answered: the path is up and the port is shut. That is a
+        # reachable network, which is the question being asked.
         return True
-    except OSError:
+    except socket.timeout:
         return False
+    except socket.gaierror:
+        # Name resolution — not applicable to a literal address, but it would
+        # be a local/DNS fault rather than evidence about the path.
+        return None
+    except OSError as exc:
+        return False if exc.errno in NETWORK_ERRNOS else None
 
 
 def reconnect() -> str:
