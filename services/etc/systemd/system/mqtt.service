@@ -5,8 +5,8 @@ After=network.target pigpiod.service
 
 [Service]
 User=gardyn
-WorkingDirectory=/home/gardyn/projects/garden-of-eden
-ExecStart=/home/gardyn/projects/garden-of-eden/venv/bin/python /home/gardyn/projects/garden-of-eden/mqtt.py
+WorkingDirectory=/home/gardyn/garden-of-eden
+ExecStart=/home/gardyn/garden-of-eden/venv/bin/python /home/gardyn/garden-of-eden/mqtt.py
 Restart=always
 
 [Install]

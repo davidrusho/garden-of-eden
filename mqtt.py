@@ -8,7 +8,7 @@ import json
 # import picamera
 # import cv2
 from time import sleep
-from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
+from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, UPPER_CAMERA_RESOLUTION, LOWER_CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
 
 from gpiozero import Button  # Import gpiozero Button
 from gpiozero.pins.pigpio import PiGPIOFactory
@@ -31,6 +31,11 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# Retained availability topic backing every entity's availability_config.
+# Published "online" on connect; the broker publishes "offline" from the LWT
+# when this client stops answering keepalives (~1.5x KEEP_ALIVE_INTERVAL).
+STATUS_TOPIC = BASE_TOPIC + "/status"
 
 # set to INFO, for to capture mqtt messages at info-level messages.
 logger.setLevel(logging.WARNING)
@@ -188,6 +193,21 @@ def send_discovery_messages(client):
         "sw_version": VERSION,
     }
 
+    # Availability / LWT. Every entity follows the retained STATUS_TOPIC, which
+    # the broker itself flips to "offline" when this service stops sending
+    # keepalives. Without it a dead Pi leaves HA showing the last known values
+    # forever, so a lost light command looks identical to a working one.
+    availability_config = {
+        "availability_topic": STATUS_TOPIC,
+        "payload_available": "online",
+        "payload_not_available": "offline",
+    }
+
+    def publish_config(topic, payload):
+        client.publish(
+            topic, json.dumps({**payload, **availability_config}), retain=True
+        )
+
     # Config for Light
     TEMP_CONFIG_TOPIC = "homeassistant/light/gardyn/"+IDENTIFIER+"_light/config"
     temp_config_payload = {
@@ -201,7 +221,7 @@ def send_discovery_messages(client):
         "brightness_scale": 100,
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
     #Config for Pump (as a light with speed control, for example)
     # todo: maybe use fan instead....
@@ -226,7 +246,7 @@ def send_discovery_messages(client):
         "icon": "mdi:water-pump",
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
     #Config for Temperature from PCB
     TEMP_CONFIG_TOPIC = "homeassistant/sensor/gardyn/"+IDENTIFIER+"_pcb_temp/config"
@@ -238,7 +258,7 @@ def send_discovery_messages(client):
         "device_class": "temperature",
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
     #Config for Temperature Sensor
     TEMP_CONFIG_TOPIC = "homeassistant/sensor/gardyn/"+IDENTIFIER+"_temperature/config"
@@ -251,7 +271,7 @@ def send_discovery_messages(client):
         "device_class": "temperature",
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
     #Config for Humidity Sensor
     TEMP_CONFIG_TOPIC = "homeassistant/sensor/gardyn/"+IDENTIFIER+"_humidity/config"
@@ -264,7 +284,7 @@ def send_discovery_messages(client):
         "device_class": "humidity",
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
 
     #Config for Water Level Sensor
@@ -279,7 +299,7 @@ def send_discovery_messages(client):
         "device_class": "distance",
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
     # Config for Water Low Binary Sensor
     TEMP_CONFIG_TOPIC = f"homeassistant/binary_sensor/gardyn/{IDENTIFIER}_water_low/config"
@@ -293,7 +313,7 @@ def send_discovery_messages(client):
         "payload_off": "OFF",
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
     # Config for Water Low Threshold (current value)
         # Config for Water Low CM Set Number
@@ -311,7 +331,7 @@ def send_discovery_messages(client):
         "device_class": "distance",
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
     # Config for Water Low Mode (Enabled/Disabled)
     TEMP_CONFIG_TOPIC = f"homeassistant/sensor/gardyn/{IDENTIFIER}_water_low_mode/config"
@@ -323,7 +343,7 @@ def send_discovery_messages(client):
         "icon": "mdi:toggle-switch",  # Optional: or use mdi:alert for dramatic effect
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
     # Discovery configuration for Camera A (image entity)
     TEMP_CONFIG_TOPIC = "homeassistant/image/gardyn/" + IDENTIFIER + "_upper_camera/config"
@@ -331,12 +351,16 @@ def send_discovery_messages(client):
         "name": "Upper Camera",
         "unique_id": IDENTIFIER + "_upper_camera",
         "image_topic": BASE_TOPIC + "/image/upper_camera",
-        "encoding": "b64",
+        # publish_images() sends raw JPEG bytes, so decoding must be OFF.
+        # "b64" is a valid value for image_encoding, NOT for encoding — setting
+        # it here makes HA try bytes.decode("b64") on arrival and raise
+        # "unknown encoding: b64", which drops every frame.
+        "encoding": "",
         "content_type": "image/jpeg",
         "object_id": IDENTIFIER + "_upper_camera",
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
     # Discovery configuration for Camera B (image entity)
     TEMP_CONFIG_TOPIC = "homeassistant/image/gardyn/" + IDENTIFIER + "_lower_camera/config"
@@ -344,17 +368,24 @@ def send_discovery_messages(client):
         "name": "Lower Camera",
         "unique_id": IDENTIFIER + "_lower_camera",
         "image_topic": BASE_TOPIC + "/image/lower_camera",
-        "encoding": "b64",
+        # publish_images() sends raw JPEG bytes, so decoding must be OFF.
+        # "b64" is a valid value for image_encoding, NOT for encoding — setting
+        # it here makes HA try bytes.decode("b64") on arrival and raise
+        # "unknown encoding: b64", which drops every frame.
+        "encoding": "",
         "content_type": "image/jpeg",
         "object_id": IDENTIFIER + "_lower_camera",
         "device": device_info
     }
-    client.publish(TEMP_CONFIG_TOPIC, json.dumps(temp_config_payload), retain=True)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
 def on_connect(client, userdata, flags, rc, properties=None):
     logger.info(f"Connected with result code {rc}")
     client.subscribe(BASE_TOPIC + "/#")
     # client.subscribe(BASE_TOPIC + "/light/brightness/set")
+    # Clear the retained "offline" the broker may have left from the last death.
+    # Publish before discovery so HA never sees an entity announced unavailable.
+    client.publish(STATUS_TOPIC, "online", qos=1, retain=True)
     send_discovery_messages(client)
     publish_water_low_mode(client)
 
@@ -482,40 +513,34 @@ def publish_water_level(client):
             client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}")
         sleep(30 * 60)
 
+def _capture_and_publish(client, label, device, resolution, image_path, topic):
+    """Capture one camera and publish it independently.
+
+    Each camera gets its own try/except so a failing camera (e.g. the lower
+    camera's intermittent USB error-32) never blocks the other's publish, and
+    its own resolution so the healthy upper camera can run at a higher setting
+    than the flaky lower one.
+    """
+    try:
+        subprocess.check_call([
+            'fswebcam', '-d', device, '-r', resolution,
+            '-S', '2', '-F', '2', '--no-banner', image_path
+        ])
+        with open(image_path, 'rb') as f:
+            client.publish(BASE_TOPIC + topic, payload=f.read(), qos=0, retain=False)
+        logger.info(f"Captured+published {label} camera ({device}) @ {resolution}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"{label} camera capture failed ({device}): {e}")
+    except Exception:
+        logger.exception(f"Unexpected error during {label} image capture/publish")
+
+
 def publish_images(client):
     while True:
-        try:
-            # Capture upper camera image
-            subprocess.check_call([
-                'fswebcam', '-d', UPPER_CAMERA_DEVICE, '-r', CAMERA_RESOLUTION,
-                '-S', '2', '-F', '2', '--no-banner', UPPER_IMAGE_PATH
-            ])
-            logger.info(f"Captured image from upper camera ({UPPER_CAMERA_DEVICE})")
-
-            # Capture lower camera image
-            subprocess.check_call([
-                'fswebcam', '-d', LOWER_CAMERA_DEVICE, '-r', CAMERA_RESOLUTION,
-                '-S', '2', '-F', '2', '--no-banner', LOWER_IMAGE_PATH
-            ])
-            logger.info(f"Captured image from lower camera ({LOWER_CAMERA_DEVICE})")
-
-            # Publish upper camera image
-            with open(UPPER_IMAGE_PATH, 'rb') as f:
-                upper_cam_jpeg_data = f.read()  # Read as raw binary
-                client.publish(BASE_TOPIC + "/image/upper_camera", payload=upper_cam_jpeg_data, qos=0, retain=False)
-                logger.info("Published image to /image/upper_camera")
-
-            # Publish lower camera image
-            with open(LOWER_IMAGE_PATH, 'rb') as f:
-                lower_cam_jpeg_data = f.read()  # Read as raw binary
-                client.publish(BASE_TOPIC + "/image/lower_camera", payload=lower_cam_jpeg_data, qos=0, retain=False)
-                logger.info("Published image to /image/lower_camera")
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Camera capture failed: {e}")
-        except Exception as e:
-            logger.exception("Unexpected error during image capture/publish")
-
+        _capture_and_publish(client, "upper", UPPER_CAMERA_DEVICE,
+                             UPPER_CAMERA_RESOLUTION, UPPER_IMAGE_PATH, "/image/upper_camera")
+        _capture_and_publish(client, "lower", LOWER_CAMERA_DEVICE,
+                             LOWER_CAMERA_RESOLUTION, LOWER_IMAGE_PATH, "/image/lower_camera")
         sleep(IMAGE_INTERVAL_SECONDS)
 
 
@@ -525,6 +550,9 @@ if __name__ == "__main__":
     client.on_connect = on_connect
     client.on_message = on_message
     client.username_pw_set(USERNAME, PASSWORD)
+    # Register the will BEFORE connecting — the broker records it at CONNECT
+    # time, so a will_set() after connect() would never take effect.
+    client.will_set(STATUS_TOPIC, "offline", qos=1, retain=True)
     client.connect(BROKER, PORT, KEEP_ALIVE_INTERVAL)
 
     pcb_temp_thread = threading.Thread(target=publish_pcb_temperature, args=(client,))
