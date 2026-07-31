@@ -1,0 +1,21 @@
+[Unit]
+Description=Check Gardyn Pi network reachability every 2 minutes (T-473.4)
+
+[Timer]
+# Absolute schedule, matching the health sampler: checks land on even minutes
+# so they line up with the 5-minute health samples and with broker logs, and
+# the cadence does not depend on when the previous run finished — one slow run
+# cannot collapse the schedule.
+OnCalendar=*:0/2
+AccuracySec=10s
+
+# Load-bearing. Catch-up runs after downtime all execute at boot, and this
+# unit's whole job is to react to unreachability: a burst of catch-up checks
+# firing seconds after boot, before Wi-Fi has associated, is a burst of false
+# failures aimed squarely at the escalation ladder. The MIN_UPTIME guard in
+# the script would stop them reaching a reboot, but they would still pile up
+# reconnect attempts against a radio that is merely still coming up.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

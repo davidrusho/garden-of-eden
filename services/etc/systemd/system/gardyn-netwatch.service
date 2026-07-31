@@ -1,0 +1,70 @@
+[Unit]
+Description=Gardyn Pi network watchdog (T-473.4)
+Documentation=https://networkmanager.dev/docs/api/latest/nmcli.html
+# No network dependency, for the same reason the health sampler has none: the
+# run that matters most is the one taken while the network is down, and
+# network-online.target would gate exactly that away.
+
+[Service]
+Type=oneshot
+# Root, and unavoidably so: this unit reactivates a NetworkManager connection
+# and may order a reboot. It is the one unit on this host that must be able to
+# do both, which is why the sandbox below is tighter than it looks necessary.
+User=root
+ExecStart=/usr/bin/python3 /home/gardyn/garden-of-eden/bin/gardyn-netwatch.py
+SyslogIdentifier=gardyn-netwatch
+
+# Cross-boot state lives here: /var/lib/gardyn-netwatch, created 0750 root.
+# It MUST survive a reboot — the consecutive-reboot cap is the guard that stops
+# this unit power-cycling the plants forever when the AP, not the Pi, is what
+# is broken, and a counter that resets at boot could never see a second one.
+StateDirectory=gardyn-netwatch
+StateDirectoryMode=0750
+
+# systemd logs "Starting"/"Finished" at info for every tick. At a 2-minute
+# cadence that is 720 lines of noise a day around ~720 lines of signal, and
+# `journalctl -t gardyn-netwatch` never shows them anyway. Raising the
+# script's own priority above the cut is required, or the record line is
+# dropped along with them.
+SyslogLevel=notice
+LogLevelMax=notice
+
+# Worst case: two pings at a 3s deadline, a 3s TCP probe, and a reconnect
+# NetworkManager is allowed 45s to finish (60s subprocess backstop) — about
+# 70s on this single-core ARMv6 host, where even `python3 -c pass` costs
+# 325ms. Kept under the 120s timer period together with TimeoutStopSec, so a
+# wedged run is killed and stopped before the next tick rather than colliding
+# with it. Required explicitly — per systemd.service(5) the start timeout is
+# DISABLED by default for Type=oneshot.
+TimeoutStartSec=90
+TimeoutStopSec=20
+
+# A watchdog must not become the outage. If memory is tight, this is safe to
+# lose and mqtt.py — the grow-light and pump controller — is not.
+#
+# OOMScoreAdjust is doing this alone. Do NOT add MemoryMax= back: the Pi
+# firmware puts `cgroup_disable=memory` on this kernel's command line, so the
+# root cgroup carries only `cpu io pids` and no descendant can enable a
+# controller the root does not have. `systemctl show` would report the
+# configured value regardless, which makes it a false green rather than a
+# missing feature. OOMScoreAdjust writes /proc/<pid>/oom_score_adj and is
+# unaffected.
+OOMScoreAdjust=500
+Nice=10
+
+# Hardening. ProtectSystem=strict, matching the sibling: StateDirectory= is
+# writable under strict without ReadWritePaths=, because per systemd.exec(5)
+# those options "imply BindPaths= for the specified paths" — systemd's own
+# systemd-timesyncd.service ships exactly this combination. Verified on the
+# host with a transient unit: the state write succeeds and a /var/lib write
+# outside the state directory is refused.
+#
+# ProtectHome is omitted entirely, in ANY form, because the script lives under
+# /home/gardyn and every variant of it breaks ExecStart.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes

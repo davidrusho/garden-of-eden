@@ -14,12 +14,20 @@ User=gardyn
 ExecStart=/usr/bin/python3 /home/gardyn/garden-of-eden/bin/gardyn-health-log.py
 SyslogIdentifier=gardyn-health
 
-# A diagnostic must never become the outage it monitors. Without these, the
+# A diagnostic must never become the outage it monitors. Without this, the
 # kernel's OOM killer scores by RSS and would reap the long-lived mqtt.py -
 # the grow-light and pump controller - in preference to this short-lived
 # sampler. That is backwards: this unit is the one that is safe to lose.
+#
+# MemoryMax=64M was removed 2026-07-31 (T-473.4 review): it was INERT, not
+# merely redundant. The Pi firmware puts `cgroup_disable=memory` on this
+# kernel's command line, so the root cgroup carries only `cpu io pids` and no
+# descendant can enable a controller the root lacks. `systemctl show` reported
+# MemoryMax=67108864 regardless - the configured value, not an enforced one -
+# which made it a false green. Do not add it back without first checking
+# /sys/fs/cgroup/cgroup.controllers. OOMScoreAdjust writes
+# /proc/<pid>/oom_score_adj and is unaffected, so it carries this alone.
 OOMScoreAdjust=500
-MemoryMax=64M
 
 # Cut journald chatter. systemd logs "Starting"/"Deactivated"/"Finished" at
 # info for every tick, which is 3 entries of noise per 1 entry of signal -
