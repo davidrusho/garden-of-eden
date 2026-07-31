@@ -1,0 +1,17 @@
+[Unit]
+Description=Gardyn Pi host-health sample (T-473.2)
+Documentation=https://www.raspberrypi.com/documentation/computers/os.html
+# No network dependency on purpose. The single most valuable sample is the one
+# taken while the network is DOWN, so requiring network-online would suppress
+# exactly the readings this exists to capture.
+
+[Service]
+Type=oneshot
+# Unprivileged: `gardyn` is in the `video` group, so vcgencmd works without
+# root, and /sys/class/thermal + /proc/net/wireless are world-readable.
+User=gardyn
+ExecStart=/usr/bin/python3 /home/gardyn/garden-of-eden/bin/gardyn-health-log.py
+SyslogIdentifier=gardyn-health
+# Bounded so a wedged binary cannot leave the unit running into the next tick.
+TimeoutStartSec=30
+Nice=10

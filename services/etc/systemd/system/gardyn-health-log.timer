@@ -1,0 +1,18 @@
+[Unit]
+Description=Sample Gardyn Pi host health every 5 minutes (T-473.2)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Default accuracy is 1 minute, which would smear samples across the very
+# window an incident timeline needs to be read at. 10s keeps the cadence
+# tight enough to correlate against HA history and broker logs.
+AccuracySec=10s
+# Deliberately NOT Persistent=true. Catch-up runs after downtime all execute
+# at boot, so they would stamp a burst of samples carrying post-recovery
+# state at times that look like the outage — the same trap that made the
+# 07-30 timer-stamp evidence readable only because these are run-time stamps.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
