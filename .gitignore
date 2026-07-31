@@ -6,3 +6,6 @@ venv/
 # If using Jython
 *.class
 .env
+
+# Runtime log written by mqtt.service; not an artifact.
+*.log

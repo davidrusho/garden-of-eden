@@ -20,7 +20,32 @@ PASSWORD = os.getenv("MQTT_PASSWORD")
 
 SENSOR_TYPE = os.getenv('SENSOR_TYPE')
 
+# Distance at which the reservoir counts as low. Set to 0 (or leave unset) to
+# disable low-water checking entirely, which also lifts the pump interlock.
+#
+# CAVEAT: on the calibration in upstream PR #90 a FULL tank reads ~10-12 cm and
+# a near-empty one ~23 cm (measured on a Gardyn 4.0), so a threshold of 11 sits
+# at the full-tank reading rather than near the empty end. Re-measure against
+# the real reservoir before trusting it - see T-472/T-299.
 WATER_LOW_CM = float(os.getenv("WATER_LOW_CM", 0)) or None
+
+# Plausibility band for the reservoir ultrasonic, in cm. A reading outside this
+# range is treated as NO READING rather than as a distance.
+#
+# This is the load-bearing safety control, not a smoothing nicety. gpiozero
+# returns None on a no-echo and the sensor is built with ignore={None}, so a
+# disconnected or silent sensor is not reported as an error - spurious edges on
+# the floating pin fill the averaging queue and the median latches somewhere
+# arbitrary. Observed on this unit: values ranging from 0.09 cm to ~83 cm over
+# three days with no hardware attached at all. Both ends of that range look
+# like a perfectly valid distance to a bare threshold comparison, so without a
+# band the low-water alert is a coin flip that reports either a false all-clear
+# or a false alarm depending on where the garbage happened to settle.
+#
+# Defaults from upstream PR #90: below 3 cm is a sensor error or overflow,
+# above 25 cm is out of range or empty.
+WATER_VALID_MIN_CM = float(os.getenv("WATER_VALID_MIN_CM", "3.0"))
+WATER_VALID_MAX_CM = float(os.getenv("WATER_VALID_MAX_CM", "25.0"))
 
 UPPER_CAMERA_DEVICE = os.getenv("UPPER_CAMERA_DEVICE", "/dev/video0")
 LOWER_CAMERA_DEVICE = os.getenv("LOWER_CAMERA_DEVICE", "/dev/video2")

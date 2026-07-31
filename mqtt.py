@@ -8,7 +8,7 @@ import json
 # import picamera
 # import cv2
 from time import sleep
-from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, UPPER_CAMERA_RESOLUTION, LOWER_CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
+from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, WATER_VALID_MIN_CM, WATER_VALID_MAX_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, UPPER_CAMERA_RESOLUTION, LOWER_CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
 
 from gpiozero import Button  # Import gpiozero Button
 from gpiozero.pins.pigpio import PiGPIOFactory
@@ -18,7 +18,7 @@ from app.sensors.pump.pump import Pump
 from app.sensors.pcb_temp.pcb_temp import get_pcb_temperature
 from app.sensors.temperature.temperature import temperature_sensor
 from app.sensors.humidity.humidity import humidity_sensor
-from app.sensors.distance.distance import Distance, MeasurementError
+from app.sensors.distance.distance import Distance, MeasurementError, SensorBusy
 
 # Configure logging.
 #
@@ -43,6 +43,16 @@ logger = logging.getLogger(__name__)
 # Published "online" on connect; the broker publishes "offline" from the LWT
 # when this client stops answering keepalives (~1.5x KEEP_ALIVE_INTERVAL).
 STATUS_TOPIC = BASE_TOPIC + "/status"
+
+# Retained trust topic for the reservoir ultrasonic specifically.
+#
+# STATUS_TOPIC answers "is this controller alive". It cannot answer "can the
+# reservoir reading be believed", and the two are independent: a perfectly
+# healthy controller reporting a fabricated distance is exactly the failure this
+# exists to make visible. The water entities carry BOTH topics in an
+# availability list, so they go unavailable if either the controller dies or the
+# reading stops being trustworthy.
+WATER_STATUS_TOPIC = BASE_TOPIC + "/water/status"
 
 # Topics this client actually consumes, with the QoS to subscribe at.
 #
@@ -139,7 +149,10 @@ def toggle_pump():
         pump.off()
     else:
         logger.info("Toggling Pump ON")
-        pump.set_speed(speed)
+        # Through start_pump() so the physical button inherits the low-water
+        # interlock. It used to call pump.set_speed() directly, which meant a
+        # double-press could run the pump dry no matter what the sensor said.
+        start_pump(speed, client)
     publish_pump_state(client)
 
 def handle_button_press():
@@ -210,17 +223,52 @@ def flash_lights(times=3, delay=0.3):
     ).start()
 
 def safe_distance_measure():
-    global distance_sensor
+    """Return a TRUSTWORTHY reservoir distance in cm, or None.
+
+    None means "no usable reading" and must never be treated as a safe one.
+    Every caller has to branch on it; this function will not substitute a
+    number, and it will not report a reading it cannot vouch for.
+
+    Two rejection paths, and the second is the one that matters:
+
+    - The measurement itself failed, or the device was busy.
+    - The measurement succeeded and is IMPLAUSIBLE. gpiozero returns None on a
+      no-echo and DistanceSensor ignores Nones, so a disconnected sensor does
+      not raise - spurious edges on the floating pin fill the averaging queue
+      and the median latches at an arbitrary value that looks like a real
+      distance. On this unit that value has been anywhere from 0.09 cm to
+      ~83 cm. Only the band separates that from a reading off real water.
+
+    The old recovery branch is gone. It rebuilt the global Distance without
+    closing the old one, and gpiozero reserves GPIO 19/26 per pin factory, so
+    the constructor could only ever raise GPIOPinInUse - it was guaranteed to
+    fail, and unreachable regardless, since gpiozero never raises
+    MeasurementError from this path in the first place.
+    """
     try:
-        return distance_sensor.measure_once()
+        distance = distance_sensor.measure()
+    except SensorBusy:
+        logger.info("Distance measure skipped: another read is in progress")
+        return None
     except MeasurementError as e:
-        logger.warning(f"Distance measure failed: {e}, trying recovery")
-        try:
-            distance_sensor = Distance(pin_factory=pin_factory)
-            return distance_sensor.measure_once()
-        except Exception as e2:
-            logger.error(f"Distance full recovery failed: {e2}")
-            return None
+        logger.warning(f"Distance measure failed: {e}")
+        return None
+
+    if not (WATER_VALID_MIN_CM <= distance <= WATER_VALID_MAX_CM):
+        logger.warning(
+            f"Discarding implausible water reading {distance:.2f}cm "
+            f"(outside {WATER_VALID_MIN_CM:.2f}-{WATER_VALID_MAX_CM:.2f}cm) - "
+            f"treating as NO reading, not as a safe one"
+        )
+        return None
+
+    return distance
+
+
+def publish_water_sensor_status(client, trustworthy):
+    """Publish whether the reservoir reading can currently be believed."""
+    payload = "online" if trustworthy else "offline"
+    client.publish(WATER_STATUS_TOPIC, payload, qos=1, retain=True)
 
 def publish_water_low_mode(client):
     if WATER_LOW_CM not in (None, 0):
@@ -239,22 +287,109 @@ def publish_water_low_threshold(client):
     client.publish(BASE_TOPIC + "/water/low/cm", f"{WATER_LOW_CM:.2f}", retain=True)
 
 
-def update_water_low_state(client):
-    if WATER_LOW_CM not in (None, 0):
-        distance = safe_distance_measure()
-        if distance is not None:
-            if distance > WATER_LOW_CM:
-                client.publish(BASE_TOPIC + "/water/low/state", "ON", retain=True)
-                logger.info(f"Updated water low state to ON (distance {distance:.2f}cm > {WATER_LOW_CM:.2f}cm)")
-            else:
-                client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
-                logger.info(f"Updated water low state to OFF (distance {distance:.2f}cm <= {WATER_LOW_CM:.2f}cm)")
-        else:
-            logger.warning("Could not update water low state because distance reading failed")
-    else:
-        # If checking is disabled, maybe set it to OFF by default
+_UNSET = object()
+
+
+def update_water_low_state(client, distance=_UNSET):
+    """Evaluate the low-water threshold and publish the binary sensor state.
+
+    Pass `distance` when the caller has already taken a trustworthy reading, so
+    one refresh cycle drives one physical measurement rather than two.
+
+    On an untrustworthy reading this publishes NOTHING. It deliberately does not
+    fall back to OFF: OFF means "the reservoir is fine", and asserting that on
+    the strength of a reading we just rejected is precisely the false all-clear
+    this whole change exists to remove. The entity is held unavailable through
+    WATER_STATUS_TOPIC instead, so HA shows unknown rather than a stale claim.
+    """
+    if WATER_LOW_CM in (None, 0):
+        # Explicitly opted out. The separate water/low/mode entity surfaces
+        # "Disabled", so OFF here is disclosed rather than misleading.
         client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
         logger.info("Water low checking disabled, setting water low state to OFF")
+        return
+
+    if distance is _UNSET:
+        distance = safe_distance_measure()
+
+    if distance is None:
+        logger.warning(
+            "Water low state NOT updated - no trustworthy reading. "
+            "Leaving the entity unavailable rather than asserting OFF."
+        )
+        return
+
+    if distance > WATER_LOW_CM:
+        client.publish(BASE_TOPIC + "/water/low/state", "ON", retain=True)
+        logger.info(f"Updated water low state to ON (distance {distance:.2f}cm > {WATER_LOW_CM:.2f}cm)")
+    else:
+        client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
+        logger.info(f"Updated water low state to OFF (distance {distance:.2f}cm <= {WATER_LOW_CM:.2f}cm)")
+
+
+def refresh_water_state(client):
+    """Take one reading and publish every topic derived from it, consistently.
+
+    Single owner of the read -> trust -> level -> threshold sequence, so the
+    trust topic, the level and the low-water state can never disagree about
+    which measurement they came from.
+
+    Returns the trustworthy distance in cm, or None.
+    """
+    distance = safe_distance_measure()
+    publish_water_sensor_status(client, distance is not None)
+
+    if distance is None:
+        logger.warning(
+            "Reservoir reading is not trustworthy - water entities marked unavailable"
+        )
+        return None
+
+    logger.info(f"Publishing Water Level: {distance:.2f}cm")
+    # Retained, like the other state topics, so HA gets it on subscribe instead
+    # of sitting at `unknown`. Safe to retain only because the retained trust
+    # topic travels with it - a stale level cannot be read as current while
+    # water/status says offline.
+    client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}", retain=True)
+    update_water_low_state(client, distance)
+    return distance
+
+
+def start_pump(target_speed, client):
+    """The only path that energises the pump. Fails CLOSED.
+
+    Upstream #83 asked for a safeguard that "should exist regardless of how it's
+    called" and was closed without it: the guard lived inside the pump/command
+    branch only, so pump/speed/set and the physical button's double-press both
+    started the pump with no water check at all. Every caller routes here now.
+
+    Refuses on an untrustworthy reading as well as on a genuinely low one. An
+    unknown water level is not a safe water level, and running a hydroponic pump
+    dry is the failure this interlock exists to prevent.
+
+    Returns True if the pump was started.
+    """
+    if WATER_LOW_CM in (None, 0):
+        pump.set_speed(target_speed)
+        return True
+
+    distance = refresh_water_state(client)
+
+    if distance is None:
+        logger.warning("Refusing to start pump: no trustworthy reservoir reading")
+        flash_lights()
+        return False
+
+    if distance > WATER_LOW_CM:
+        logger.warning(
+            f"Refusing to start pump: water too low "
+            f"({distance:.2f}cm > {WATER_LOW_CM:.2f}cm)"
+        )
+        flash_lights()
+        return False
+
+    pump.set_speed(target_speed)
+    return True
 
 # https://www.home-assistant.io/integrations/mqtt/#discovery-messages
 #  Note: homeassistant/<component>/[<node_id>/]<object_id>/config.
@@ -278,9 +413,30 @@ def send_discovery_messages(client):
         "payload_not_available": "offline",
     }
 
-    def publish_config(topic, payload):
+    # Water entities answer to two conditions, not one: the controller must be
+    # alive AND the reservoir reading must be believable. HA expresses that as an
+    # `availability` LIST with mode "all" — "payload_available must be received
+    # on all configured availability topics before the entity is marked online".
+    #
+    # It has to be a list rather than an extra key, because the MQTT integration
+    # docs are explicit that `availability_topic` "must not be used together with
+    # `availability`". So these payloads take this dict INSTEAD of
+    # availability_config, never merged with it.
+    water_availability_config = {
+        "availability": [
+            {"topic": STATUS_TOPIC},
+            {"topic": WATER_STATUS_TOPIC},
+        ],
+        "availability_mode": "all",
+        "payload_available": "online",
+        "payload_not_available": "offline",
+    }
+
+    def publish_config(topic, payload, availability=None):
         client.publish(
-            topic, json.dumps({**payload, **availability_config}), retain=True
+            topic,
+            json.dumps({**payload, **(availability or availability_config)}),
+            retain=True,
         )
 
     # Config for Light
@@ -384,7 +540,7 @@ def send_discovery_messages(client):
         "device_class": "distance",
         "device": device_info
     }
-    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload, water_availability_config)
 
     # Config for Water Low Binary Sensor
     TEMP_CONFIG_TOPIC = f"homeassistant/binary_sensor/gardyn/{IDENTIFIER}_water_low/config"
@@ -398,7 +554,7 @@ def send_discovery_messages(client):
         "payload_off": "OFF",
         "device": device_info
     }
-    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
+    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload, water_availability_config)
 
     # Config for Water Low Threshold (current value)
         # Config for Water Low CM Set Number
@@ -483,6 +639,12 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # immediately on subscribe instead of sitting at `unknown`.
     publish_light_state(client)
     publish_pump_state(client)
+    # Re-read the reservoir on every (re)connect. The publish loop only fires
+    # every 30 minutes and its thread survives a reconnect behind the once-only
+    # guard in start_publisher_threads(), so without this a reconnect would leave
+    # the water entities sitting on whatever the trust topic last said - for up
+    # to half an hour, and across a restart, forever.
+    refresh_water_state(client)
     start_publisher_threads(client)
 
 def on_message(client, userdata, msg):
@@ -501,16 +663,9 @@ def on_message(client, userdata, msg):
         # === Pump Logic ===
         if topic_suffix == "pump/command":
             if payload.upper() == "ON":
-                if WATER_LOW_CM not in (None, 0):
-                    distance = safe_distance_measure()
-                    if distance is not None and distance > WATER_LOW_CM:
-                        logger.warning(f"Water too low ({distance:.2f}cm > {WATER_LOW_CM:.2f}cm), aborting pump")
-                        flash_lights()
-                        client.publish(BASE_TOPIC + "/water/low/state", "ON", retain=True)
-                        return
-                    else:
-                        client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
-                pump.set_speed(speed)
+                # The interlock now lives in start_pump(), which also publishes
+                # the water topics from the same reading it decided on.
+                start_pump(speed, client)
                 publish_pump_state(client)
             elif payload.upper() == "OFF":
                 pump.off()
@@ -518,7 +673,13 @@ def on_message(client, userdata, msg):
 
         elif topic_suffix == "pump/speed/set" and payload.isdigit():
             speed = int(payload)
-            pump.set_speed(speed)
+            if speed == 0:
+                pump.off()
+            else:
+                # Also an interlock path: this used to call pump.set_speed()
+                # unconditionally, so setting a speed would start a stopped pump
+                # with no water check whatsoever.
+                start_pump(speed, client)
             publish_pump_state(client)
 
         # === Light Logic ===
@@ -537,16 +698,14 @@ def on_message(client, userdata, msg):
 
         # === Water Level ===
         elif topic_suffix == "water/level/get":
-            distance = safe_distance_measure()
-            if distance is not None:
-                client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}")
+            refresh_water_state(client)
 
         elif topic_suffix == "water/low/cm/set":
             try:
                 WATER_LOW_CM = float(payload)
                 publish_water_low_threshold(client)
                 publish_water_low_mode(client)
-                update_water_low_state(client)
+                refresh_water_state(client)
             except ValueError:
                 logger.error(f"Invalid water low cm value: {payload}")
 
@@ -598,10 +757,15 @@ def publish_humidity(client):
 
 def publish_water_level(client):
     while True:
-        distance = safe_distance_measure()
-        if distance is not None:
-            logger.info(f"Publishing Water Level: {distance:.2f}cm")
-            client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}")
+        try:
+            # refresh_water_state() also re-evaluates the low-water threshold.
+            # It used to publish only the level, so update_water_low_state() had
+            # exactly one caller - the water/low/cm/set handler - and the binary
+            # sensor reflected whatever the last threshold edit happened to see,
+            # sometimes days earlier. That is upstream issue #86.
+            refresh_water_state(client)
+        except Exception as e:
+            logger.exception(f"Failed to refresh water state: {e}")
         sleep(30 * 60)
 
 def _capture_and_publish(client, label, device, resolution, image_path, topic):
