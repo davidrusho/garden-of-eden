@@ -233,15 +233,26 @@ mosquitto_pub -t "gardyn/pump/command" -m "ON" -u gardyn -P "somepassword"
 mosquitto_pub -t "gardyn/pump/command" -m "OFF" -u gardyn -P "somepassword"
 ```
 
+The pump still answers these and is still gated by the low-water interlock, but
+it no longer has a Home Assistant entity — the Gardyn's own pump was replaced by
+a third-party unit on a separate smart plug, so the GPIO header drives nothing.
+Nothing is published back, so `gardyn/pump/state` will stay silent.
+
 Sensors:
+
+The reservoir can still be probed, but its reading goes to the log rather than
+to a topic: the water entities were retired when the fitted DYP-A01A's 28 cm
+dead zone turned out to cover the whole plausibility band (see Water Level
+Sensor below). So watch the service, not `gardyn/water/level`, which is now
+actively cleared and never republished.
 
 Open two terminals on the gardyn pi, in one run:
 
-`mosquitto_sub -t "gardyn/water/level" -u gardyn -P "somepassword"`
+`journalctl -u mqtt -f`
 
 In the second gardyn pi terminal, run:
 
-`mosquitto_pub -t "gardyn/water/level/get" -m ""-r  -u gardyn -P "somepassword"`
+`mosquitto_pub -t "gardyn/water/level/get" -m "" -u gardyn -P "somepassword"`
 
 ```
 

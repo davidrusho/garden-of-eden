@@ -1,5 +1,6 @@
 # mqtt.py
 #
+# Reviewed: 2026-08-01 against 3181aac (T-475, T-478)
 # Reviewed: 2026-07-31 against b0f8f92 (T-472)
 import math
 import subprocess
@@ -12,7 +13,7 @@ import json
 # import picamera
 # import cv2
 from time import sleep
-from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, WATER_VALID_MIN_CM, WATER_VALID_MAX_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, UPPER_CAMERA_RESOLUTION, LOWER_CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
+from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, WATER_VALID_MIN_CM, WATER_VALID_MAX_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, UPPER_CAMERA_RESOLUTION, LOWER_CAMERA_RESOLUTION, UPPER_CAMERA_JPEG_QUALITY, LOWER_CAMERA_JPEG_QUALITY, IMAGE_INTERVAL_SECONDS
 
 from gpiozero import Button  # Import gpiozero Button
 from gpiozero.pins.pigpio import PiGPIOFactory
@@ -20,8 +21,6 @@ from gpiozero.pins.pigpio import PiGPIOFactory
 from app.sensors.light.light import Light
 from app.sensors.pump.pump import Pump
 from app.sensors.pcb_temp.pcb_temp import get_pcb_temperature
-from app.sensors.temperature.temperature import temperature_sensor
-from app.sensors.humidity.humidity import humidity_sensor
 from app.sensors.distance.distance import Distance, MeasurementError
 
 # Configure logging.
@@ -54,15 +53,70 @@ logger = logging.getLogger(__name__)
 # when this client stops answering keepalives (~1.5x KEEP_ALIVE_INTERVAL).
 STATUS_TOPIC = BASE_TOPIC + "/status"
 
-# Retained trust topic for the reservoir ultrasonic specifically.
+# Retired hardware (T-475).
 #
-# STATUS_TOPIC answers "is this controller alive". It cannot answer "can the
-# reservoir reading be believed", and the two are independent: a perfectly
-# healthy controller reporting a fabricated distance is exactly the failure this
-# exists to make visible. The water entities carry BOTH topics in an
-# availability list, so they go unavailable if either the controller dies or the
-# reading stops being trustworthy.
-WATER_STATUS_TOPIC = BASE_TOPIC + "/water/status"
+# Seven entities are permanently non-functional by HARDWARE fact, not by
+# software gap, and are withdrawn from Home Assistant rather than left to sit
+# `unavailable` forever:
+#
+#   pump                  the Gardyn's own pump was physically replaced by a
+#                         third-party unit on a smart plug that is not on the
+#                         network; the GPIO header drives nothing.
+#   water_level           the fitted DYP-A01A has a 28 cm datasheet dead zone
+#   water_low             ("objects closer than 28cm range as 28cm") against a
+#   water_low_cm          shallow reservoir, and the whole 3-25 cm plausibility
+#   water_low_mode        band sits inside it. A perfectly healthy unit would
+#                         report a constant 28 cm, be discarded as implausible,
+#                         and leave these unavailable forever. No replacement
+#                         sensor is coming.
+#   temperature           no AHTx0 at 0x38 and no AM2320 at 0x5C on either I2C
+#   humidity              bus (T-299); ambient is covered by Zigbee (T-300).
+#
+# The INTERLOCK IS NOT RETIRED. safe_distance_measure(), the plausibility band,
+# _threshold_is_acceptable() and start_pump()'s fail-closed refusal all survive
+# unchanged - what goes away is their MQTT surface, not their decisions. A pump
+# that refused to start on an untrustworthy reading still refuses.
+#
+# Discovery configs are retained by publish_config(), so deleting the blocks
+# that emit them is not enough on its own: the broker keeps serving the last one
+# it saw. An empty retained payload is how MQTT deletes a retained message and
+# how HA removes a discovered entity, which is what clear_retired_entities()
+# below publishes on every connect.
+RETIRED_DISCOVERY_TOPICS = [
+    f"homeassistant/light/gardyn/{IDENTIFIER}_pump/config",
+    f"homeassistant/sensor/gardyn/{IDENTIFIER}_water_level/config",
+    f"homeassistant/binary_sensor/gardyn/{IDENTIFIER}_water_low/config",
+    f"homeassistant/number/gardyn/{IDENTIFIER}_water_low_cm/config",
+    f"homeassistant/sensor/gardyn/{IDENTIFIER}_water_low_mode/config",
+    f"homeassistant/sensor/gardyn/{IDENTIFIER}_temperature/config",
+    f"homeassistant/sensor/gardyn/{IDENTIFIER}_humidity/config",
+]
+
+# The state topics those entities were fed from, and the reason clearing
+# discovery alone is not enough.
+#
+# Every topic here was published with retain=True, so each still has a live
+# retained message on the broker naming a value HA would replay to any new
+# subscriber. Removing only the discovery blocks would leave seven retained
+# payloads behind describing hardware that does not exist.
+#
+# gardyn/temperature and gardyn/humidity are deliberately ABSENT: their
+# publishers never passed retain=True (paho defaults to False), so there is no
+# retained message to delete - only their discovery configs need clearing.
+# Confirmed against the source and against the full history of mqtt.py.
+RETIRED_STATE_TOPICS = [
+    BASE_TOPIC + "/pump/state",
+    BASE_TOPIC + "/pump/speed/state",
+    BASE_TOPIC + "/water/level",
+    BASE_TOPIC + "/water/low/state",
+    BASE_TOPIC + "/water/low/cm",
+    BASE_TOPIC + "/water/low/mode",
+    # The reservoir trust topic. It backed the water entities' availability
+    # list; with those entities gone nothing subscribes to it, and it is
+    # retained with no will attached, so left alone it would sit on the broker
+    # asserting a verdict about a sensor nobody reads.
+    BASE_TOPIC + "/water/status",
+]
 
 # Topics this client actually consumes, with the QoS to subscribe at.
 #
@@ -78,6 +132,37 @@ WATER_STATUS_TOPIC = BASE_TOPIC + "/water/status"
 # */get topics are QoS 0 request triggers — nothing in HA publishes to them
 # (they were declared via `command_topic` on sensor entities, which HA ignores),
 # but they stay subscribed so a manual mosquitto_pub still works.
+#
+# The pump and water command topics stay subscribed even though T-475 withdrew
+# their HA entities, and that is a deliberate call rather than an oversight:
+#
+#   pump/command, pump/speed/set   the only remaining way to exercise the pump
+#                                  GPIO and, with it, start_pump()'s low-water
+#                                  interlock. Dropping them would leave the
+#                                  interlock reachable solely from the physical
+#                                  button's double-press.
+#   water/low/cm/set               the only way to change the threshold the
+#                                  interlock compares against without editing
+#                                  .env and restarting, and the only caller of
+#                                  _threshold_is_acceptable(). Dropping it
+#                                  would make that validation dead code.
+#   water/level/get                a read-only probe of the ultrasonic that does
+#                                  not energise anything. Its answer now goes to
+#                                  the log rather than to a topic.
+#
+# temperature/get and humidity/get are dropped from this list. temperature_sensor
+# and humidity_sensor are None on this unit, so those handlers could only ever
+# raise AttributeError into on_message's catch-all - a subscription whose sole
+# effect was a logged traceback.
+#
+# Note what removing them from this list does NOT do. The session is durable
+# (clean_session=False with a stable client_id), so the broker still holds the
+# subscriptions it was given on earlier connects; subscribe() only ever adds,
+# and nothing here calls unsubscribe(). Those two topics therefore keep being
+# delivered until the session is reset. That is harmless - the handlers are
+# gone, so the elif chain falls through and the message is ignored, which is
+# strictly better than the AttributeError it used to raise - but this list
+# describes the CLIENT's intent, not the broker's state.
 COMMAND_SUBSCRIPTIONS = [
     (BASE_TOPIC + "/light/command", 1),
     (BASE_TOPIC + "/light/brightness/set", 1),
@@ -86,8 +171,6 @@ COMMAND_SUBSCRIPTIONS = [
     (BASE_TOPIC + "/water/low/cm/set", 1),
     (BASE_TOPIC + "/water/level/get", 0),
     (BASE_TOPIC + "/pcb/temperature/get", 0),
-    (BASE_TOPIC + "/temperature/get", 0),
-    (BASE_TOPIC + "/humidity/get", 0),
 ]
 
 # INFO, so a command can be ATTRIBUTED. The previous line here set WARNING
@@ -138,22 +221,59 @@ double_press_timer = None
 
 # State publishing.
 #
-# All four state topics are retained. Without retain, HA has nothing to subscribe
-# to on restart and the entity sits at `unknown` until something changes it —
-# which is why the pump entity read `unknown` for its entire history, and why a
-# service restart left HA showing a stale "on" for a light that PWMLED had just
-# driven to 0. Retained state means HA gets the truth the moment it subscribes.
+# Both light state topics are retained. Without retain, HA has nothing to
+# subscribe to on restart and the entity sits at `unknown` until something
+# changes it — which is why a service restart left HA showing a stale "on" for a
+# light that PWMLED had just driven to 0. Retained state means HA gets the truth
+# the moment it subscribes.
+#
+# The pump pair used to live here and is gone (T-475). Its retained values are
+# actively withdrawn by clear_retired_entities() rather than merely no longer
+# written: a retained message outlives the code that wrote it.
 def publish_light_state(client):
     """Publish the light's ACTUAL duty cycle, not a shadow variable."""
     duty = light.get_brightness()
     client.publish(BASE_TOPIC + "/light/state", "ON" if duty > 0 else "OFF", retain=True)
     client.publish(BASE_TOPIC + "/light/brightness/state", str(int(round(duty))), retain=True)
 
-def publish_pump_state(client):
-    """Publish the pump's ACTUAL duty cycle, not a shadow variable."""
-    duty = pump.get_speed()
-    client.publish(BASE_TOPIC + "/pump/state", "ON" if duty > 0 else "OFF", retain=True)
-    client.publish(BASE_TOPIC + "/pump/speed/state", str(int(round(duty))), retain=True)
+
+def clear_retired_entities(client):
+    """Withdraw the entities T-475 retired, and the state behind them.
+
+    An EMPTY payload published with retain=True is how MQTT deletes a retained
+    message, and how HA's discovery removes an entity it previously created. So
+    this both un-announces the entity and takes the value it was showing off the
+    broker.
+
+    Idempotent by construction: clearing an already-clear topic is a no-op, so
+    this runs on every connect rather than needing a one-shot migration. That
+    matters because send_discovery_messages() also runs on every connect and
+    this client reconnects roughly 25 times a day - a manual mosquitto_pub sweep
+    would be undone within seconds, whereas doing it here is ordered correctly
+    against discovery and survives any future rebuild of the Pi.
+
+    MUST be called BEFORE send_discovery_messages(). Ordering is what makes it
+    safe to clear by prefix-adjacent topics: nothing here overlaps a surviving
+    entity, but running it afterwards would still be a coin-flip against
+    whatever HA happened to process first.
+    """
+    for topic in RETIRED_DISCOVERY_TOPICS + RETIRED_STATE_TOPICS:
+        # retain=True is load-bearing and is the whole point. A clear published
+        # WITHOUT it deletes nothing: the broker forwards the empty payload to
+        # current subscribers and keeps serving the old retained message to
+        # every later one, so HA re-creates the entity on its next restart and
+        # the clear looks like it worked.
+        client.publish(topic, "", retain=True)
+    # INFO, not WARNING. This fires on every connect - roughly 25 times a day,
+    # forever - for what is a no-op after the first one. The logging policy at
+    # the top of this file is a deliberate trade that demoted the periodic
+    # publishers to debug so ~576 camera lines a day could not bury four
+    # meaningful light events; a WARNING here would spend that budget again.
+    logger.info(
+        f"Cleared {len(RETIRED_DISCOVERY_TOPICS)} retired discovery configs "
+        f"and {len(RETIRED_STATE_TOPICS)} retained state topics"
+    )
+
 
 # Button press callbacks.
 #
@@ -180,7 +300,6 @@ def toggle_pump():
         # interlock. It used to call pump.set_speed() directly, which meant a
         # double-press could run the pump dry no matter what the sensor said.
         start_pump(speed, client)
-    publish_pump_state(client)
 
 def handle_button_press():
     global press_count, double_press_timer
@@ -304,18 +423,13 @@ def safe_distance_measure():
     return distance
 
 
-def publish_water_sensor_status(client, trustworthy):
-    """Publish whether the reservoir reading can currently be believed."""
-    payload = "online" if trustworthy else "offline"
-    client.publish(WATER_STATUS_TOPIC, payload, qos=1, retain=True)
-
-def publish_water_low_mode(client):
-    if WATER_LOW_CM not in (None, 0):
-        mode = "Enabled"
-    else:
-        mode = "Disabled"
-    logger.debug(f"Publishing water low mode: {mode}")
-    client.publish(BASE_TOPIC + "/water/low/mode", mode, retain=True)
+# publish_water_sensor_status() and publish_water_low_mode() stood here and are
+# gone with the entities they fed (T-475). Both were pure publishers - a
+# trustworthiness verdict and an Enabled/Disabled string on the wire - so
+# removing them took no decision with them. The trustworthiness EVALUATION they
+# reported on is safe_distance_measure() above, which is untouched, and the
+# enabled/disabled test is `WATER_LOW_CM in (None, 0)`, which start_pump() makes
+# for itself.
 
 
 def _threshold_is_acceptable(value):
@@ -332,8 +446,10 @@ def _threshold_is_acceptable(value):
       the pump forever; one above the maximum can never be reached, pinning it
       off. Both look like a working configuration.
 
-    Zero is allowed and means "disabled" - an explicit opt-out, surfaced by the
-    separate water/low/mode entity.
+    Zero is allowed and means "disabled" - an explicit opt-out. It used to be
+    surfaced by a separate water/low/mode entity; with that entity retired
+    (T-475) the opt-out is visible only in the log, but the VALIDATION below is
+    unchanged, and it is the validation that keeps the interlock armed.
 
     Note the isfinite() check is defence in depth rather than the sole barrier:
     every comparison against nan is False, so the band test below rejects
@@ -347,91 +463,27 @@ def _threshold_is_acceptable(value):
     return WATER_VALID_MIN_CM <= value <= WATER_VALID_MAX_CM
 
 
-def publish_water_low_threshold(client):
-    """Publish the threshold currently in effect, so HA and this process agree."""
-    # Publish 0 rather than returning when checking is disabled. Returning left
-    # the previous number retained, so HA's slider snapped back to it and
-    # displayed a threshold the interlock was not using - and the case where
-    # that matters most is precisely this one, since a disabled threshold means
-    # the pump interlock is bypassed entirely.
-    effective = 0.0 if WATER_LOW_CM in (None, 0) else WATER_LOW_CM
-    logger.debug(f"Publishing water low threshold: {effective:.2f}cm")
-    client.publish(BASE_TOPIC + "/water/low/cm", f"{effective:.2f}", retain=True)
-
-
-_UNSET = object()
-
-
-def update_water_low_state(client, distance=_UNSET):
-    """Evaluate the low-water threshold and publish the binary sensor state.
-
-    Pass `distance` when the caller has already taken a trustworthy reading, so
-    one refresh cycle drives one physical measurement rather than two.
-
-    On an untrustworthy reading this publishes NOTHING. It deliberately does not
-    fall back to OFF: OFF means "the reservoir is fine", and asserting that on
-    the strength of a reading we just rejected is precisely the false all-clear
-    this whole change exists to remove. The entity is held unavailable through
-    WATER_STATUS_TOPIC instead, so HA shows unknown rather than a stale claim.
-    """
-    if WATER_LOW_CM in (None, 0):
-        # Explicitly opted out. The separate water/low/mode entity surfaces
-        # "Disabled", so OFF here is disclosed rather than misleading.
-        client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
-        logger.info("Water low checking disabled, setting water low state to OFF")
-        return
-
-    if distance is _UNSET:
-        distance = safe_distance_measure()
-
-    if distance is None:
-        logger.warning(
-            "Water low state NOT updated - no trustworthy reading. "
-            "Leaving the entity unavailable rather than asserting OFF."
-        )
-        return
-
-    if distance > WATER_LOW_CM:
-        client.publish(BASE_TOPIC + "/water/low/state", "ON", retain=True)
-        logger.info(f"Updated water low state to ON (distance {distance:.2f}cm > {WATER_LOW_CM:.2f}cm)")
-    else:
-        client.publish(BASE_TOPIC + "/water/low/state", "OFF", retain=True)
-        logger.info(f"Updated water low state to OFF (distance {distance:.2f}cm <= {WATER_LOW_CM:.2f}cm)")
-
-
-def refresh_water_state(client):
-    """Take one reading and publish every topic derived from it, consistently.
-
-    Single owner of the read -> trust -> level -> threshold sequence, so the
-    trust topic, the level and the low-water state can never disagree about
-    which measurement they came from.
-
-    Returns the trustworthy distance in cm, or None.
-    """
-    distance = safe_distance_measure()
-
-    if distance is None:
-        publish_water_sensor_status(client, False)
-        logger.warning(
-            "Reservoir reading is not trustworthy - water entities marked unavailable"
-        )
-        return None
-
-    logger.debug(f"Publishing Water Level: {distance:.2f}cm")
-    # Retained, like the other state topics, so HA gets it on subscribe instead
-    # of sitting at `unknown`. Safe to retain only because the retained trust
-    # topic travels with it - a stale level cannot be read as current while
-    # water/status says offline. The water_level discovery payload also carries
-    # expire_after, which bounds staleness at HA's end if this process stops
-    # refreshing without the trust topic ever flipping.
-    client.publish(BASE_TOPIC + "/water/level", f"{distance:.2f}", qos=1, retain=True)
-    update_water_low_state(client, distance)
-    # Trust is asserted LAST, after the values it vouches for are on the wire.
-    # Published first, it would make the entities available for the gap before
-    # the new level lands, and what HA would show in that gap is the previous
-    # retained value - stale, and looking current.
-    publish_water_sensor_status(client, True)
-    return distance
+# publish_water_low_threshold(), update_water_low_state() and
+# refresh_water_state() stood here and are gone (T-475).
+#
+# All three existed to drive entities that no longer exist, and none of them
+# owned a decision that start_pump() does not make for itself:
+#
+#   publish_water_low_threshold   echoed WATER_LOW_CM to HA's number entity.
+#                                 Pure output. The value it echoed is still
+#                                 what the interlock compares against.
+#   update_water_low_state        published ON/OFF from `distance > WATER_LOW_CM`
+#                                 and from `WATER_LOW_CM in (None, 0)`. Both
+#                                 tests are made verbatim in start_pump() below,
+#                                 so the comparison survives; only the binary
+#                                 sensor it fed is gone.
+#   refresh_water_state           measured, published trust/level/low-state, and
+#                                 returned safe_distance_measure()'s value
+#                                 unmodified. start_pump() was the only caller
+#                                 whose behaviour depended on that return, and
+#                                 it now calls safe_distance_measure() directly
+#                                 - an exact substitution, since refresh never
+#                                 altered the number or the None.
 
 
 def start_pump(target_speed, client):
@@ -447,12 +499,21 @@ def start_pump(target_speed, client):
     dry is the failure this interlock exists to prevent.
 
     Returns True if the pump was started.
+
+    T-475 retired every MQTT entity this function used to publish through, and
+    changed NOTHING about what it decides. The only edit is the line that
+    obtains the reading: refresh_water_state() measured and then published, and
+    returned safe_distance_measure()'s result unchanged, so calling
+    safe_distance_measure() directly is an exact substitution. `client` is now
+    unused and is kept anyway - the signature is what every caller and every
+    interlock test already speaks, and churning it would obscure the one thing
+    this change has to prove, which is that the refusals are untouched.
     """
     if WATER_LOW_CM in (None, 0):
         pump.set_speed(target_speed)
         return True
 
-    distance = refresh_water_state(client)
+    distance = safe_distance_measure()
 
     if distance is None:
         logger.warning("Refusing to start pump: no trustworthy reservoir reading")
@@ -492,43 +553,19 @@ def send_discovery_messages(client):
         "payload_not_available": "offline",
     }
 
-    # Water entities answer to two conditions, not one: the controller must be
-    # alive AND the reservoir reading must be believable. HA expresses that as an
-    # `availability` LIST with mode "all" — "payload_available must be received
-    # on all configured availability topics before the entity is marked online".
-    #
-    # It has to be a list rather than an extra key, because the MQTT integration
-    # docs are explicit that `availability_topic` "must not be used together with
-    # `availability`". So these payloads take this dict INSTEAD of
-    # availability_config, never merged with it.
-    #
-    # payload_available / payload_not_available go INSIDE each entry, not
-    # alongside. HA reads them from the per-entry dict for the list form and
-    # only falls back to the top-level keys for the availability_topic form, so
-    # top-level values here would be silently ignored - working today purely
-    # because "online"/"offline" happen to be the per-entry defaults. Stating
-    # them per entry means changing the shared payloads cannot quietly strand
-    # these two entities as permanently unavailable.
-    water_availability_config = {
-        "availability": [
-            {
-                "topic": STATUS_TOPIC,
-                "payload_available": "online",
-                "payload_not_available": "offline",
-            },
-            {
-                "topic": WATER_STATUS_TOPIC,
-                "payload_available": "online",
-                "payload_not_available": "offline",
-            },
-        ],
-        "availability_mode": "all",
-    }
+    # A two-topic `availability` LIST stood here, holding the water entities to
+    # both the controller's liveness and the reservoir reading's
+    # trustworthiness. It went with those entities (T-475), and with it the
+    # `availability` override parameter on publish_config() — every surviving
+    # entity answers to STATUS_TOPIC alone. Anything reintroducing a compound
+    # availability must re-read the MQTT integration docs first: the list form
+    # and `availability_topic` "must not be used together", and the per-entry
+    # payload keys do not fall back to the top-level ones.
 
-    def publish_config(topic, payload, availability=None):
+    def publish_config(topic, payload):
         client.publish(
             topic,
-            json.dumps({**payload, **(availability or availability_config)}),
+            json.dumps({**payload, **availability_config}),
             retain=True,
         )
 
@@ -553,32 +590,9 @@ def send_discovery_messages(client):
     }
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
-    #Config for Pump (as a light with speed control, for example)
-    # todo: maybe use fan instead....
-    TEMP_CONFIG_TOPIC = "homeassistant/light/gardyn/"+IDENTIFIER+"_pump/config"
-    temp_config_payload = {
-        "name": "Pump",
-        "unique_id": IDENTIFIER + "_pump",
-        "platform": "mqtt",
-        # `device_class: fan` was here; `light` has no device_class, so HA
-        # discarded it. Dropped rather than left as a false signal.
-        "state_topic": BASE_TOPIC + "/pump/state",
-        "command_topic": BASE_TOPIC + "/pump/command",
-
-        "brightness_state_topic": BASE_TOPIC + "/pump/speed/state",
-        "brightness_command_topic": BASE_TOPIC + "/pump/speed/set",
-        "brightness_scale": 100,
-
-        # if using fan....
-	# "percentage_state_topic": BASE_TOPIC + "/pump/speed/state",
-	# "percentage_command_topic": BASE_TOPIC + "/pump/speed/set",
-	# "speed_range_min": 1,
-	# "speed_range_max": 100,
-        "icon": "mdi:water-pump",
-        "qos": 1,
-        "device": device_info
-    }
-    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
+    # The Pump discovery block stood here (T-475). Retiring it is what removes
+    # light.gardyn_pump from HA; RETIRED_DISCOVERY_TOPICS is what removes the
+    # copy the broker retained.
 
     #Config for Temperature from PCB
     TEMP_CONFIG_TOPIC = "homeassistant/sensor/gardyn/"+IDENTIFIER+"_pcb_temp/config"
@@ -592,105 +606,23 @@ def send_discovery_messages(client):
     }
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
-    #Config for Temperature Sensor
-    TEMP_CONFIG_TOPIC = "homeassistant/sensor/gardyn/"+IDENTIFIER+"_temperature/config"
-    temp_config_payload = {
-        "name": "Temperature",
-        "unique_id": IDENTIFIER + "_temperature",
-        "state_topic": BASE_TOPIC + "/temperature",
-        # `command_topic` was here. `sensor` is read-only, so HA discards it and
-        # never publishes to temperature/get — the on_message branch for that
-        # topic is reachable only from a manual mosquitto_pub.
-        "unit_of_measurement": "°C",
-        "device_class": "temperature",
-        "device": device_info
-    }
-    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
-
-    #Config for Humidity Sensor
-    TEMP_CONFIG_TOPIC = "homeassistant/sensor/gardyn/"+IDENTIFIER+"_humidity/config"
-    temp_config_payload = {
-        "name": "Humidity",
-        "unique_id": IDENTIFIER + "_humidity",
-        "state_topic": BASE_TOPIC + "/humidity",
-        # `command_topic` dropped — read-only domain, see Temperature above.
-        "unit_of_measurement": "%",
-        "device_class": "humidity",
-        "device": device_info
-    }
-    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
-
-
-    #Config for Water Level Sensor
-    TEMP_CONFIG_TOPIC = "homeassistant/sensor/gardyn/"+IDENTIFIER+"_water_level/config"
-
-    temp_config_payload = {
-        "name": "Water Level",
-        "unique_id": IDENTIFIER + "_water_level",
-        "state_topic": BASE_TOPIC + "/water/level",
-        # `command_topic` dropped — read-only domain, see Temperature above.
-        "unit_of_measurement": "cm",
-        "device_class": "distance",
-        # Backstop for the one staleness case the trust topic cannot catch: the
-        # process stays healthy and MQTT keeps working while the SENSOR quietly
-        # stops changing. gpiozero's queue keeps its last samples indefinitely,
-        # so a latched value still passes the plausibility band and still gets
-        # vouched for. Slightly over twice the 30-minute publish cadence, so one
-        # missed cycle is tolerated and two are not.
-        "expire_after": 3900,
-        "device": device_info
-    }
-    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload, water_availability_config)
-
-    # Config for Water Low Binary Sensor
-    TEMP_CONFIG_TOPIC = f"homeassistant/binary_sensor/gardyn/{IDENTIFIER}_water_low/config"
-    temp_config_payload = {
-        "name": "Water Low",
-        "unique_id": IDENTIFIER + "_water_low",
-        "platform": "mqtt",
-        "state_topic": BASE_TOPIC + "/water/low/state",
-        "device_class": "problem",
-        "payload_on": "ON",
-        "payload_off": "OFF",
-        "device": device_info
-    }
-    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload, water_availability_config)
-
-    # Config for Water Low Threshold (current value)
-        # Config for Water Low CM Set Number
-    TEMP_CONFIG_TOPIC = f"homeassistant/number/gardyn/{IDENTIFIER}_water_low_cm/config"
-    temp_config_payload = {
-        "name": "Set Water Low Threshold",
-        "unique_id": IDENTIFIER + "_water_low_cm",
-        "platform": "mqtt",
-        "state_topic": BASE_TOPIC + "/water/low/cm",
-        "command_topic": BASE_TOPIC + "/water/low/cm/set",
-        # Range tracks the plausibility band, not an arbitrary ceiling. It used
-        # to stop at 15, which put the whole 15-25 cm span out of reach from HA
-        # - and on the PR #90 calibration (full ~10-12 cm, empty ~23 cm) that
-        # span is exactly where a threshold separating full from empty belongs.
-        # 0 stays reachable as the explicit "disabled" value.
-        "min": 0,
-        "max": WATER_VALID_MAX_CM,
-        "step": 0.5,
-        "qos": 1,
-        "unit_of_measurement": "cm",
-        "device_class": "distance",
-        "device": device_info
-    }
-    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
-
-    # Config for Water Low Mode (Enabled/Disabled)
-    TEMP_CONFIG_TOPIC = f"homeassistant/sensor/gardyn/{IDENTIFIER}_water_low_mode/config"
-    temp_config_payload = {
-        "name": "Water Low Mode",
-        "unique_id": IDENTIFIER + "_water_low_mode",
-        "platform": "mqtt",
-        "state_topic": BASE_TOPIC + "/water/low/mode",
-        "icon": "mdi:toggle-switch",  # Optional: or use mdi:alert for dramatic effect
-        "device": device_info
-    }
-    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
+    # The Temperature, Humidity, Water Level, Water Low, Set Water Low Threshold
+    # and Water Low Mode discovery blocks stood here (T-475).
+    #
+    # Temperature and Humidity announced sensors with no silicon behind them:
+    # there is no AHTx0 at 0x38 and no AM2320 at 0x5C on either I2C bus (T-299),
+    # so temperature_sensor and humidity_sensor were None and every publish
+    # raised. Ambient is covered by a Zigbee sensor instead (T-300).
+    #
+    # The four water entities were unrecoverable for a subtler reason worth
+    # keeping written down, because the code looked healthy: the fitted
+    # DYP-A01A has a 28 cm dead zone, its datasheet is explicit that "objects
+    # closer than 28cm range as 28cm", and the whole 3-25 cm plausibility band
+    # lies inside it. A working sensor would report a constant 28 cm,
+    # safe_distance_measure() would correctly discard it as implausible, and the
+    # entities would sit unavailable forever. The band is not the bug and must
+    # not be widened to "fix" this - 28 cm against a shallow reservoir carries
+    # no information about the water at all.
 
     # Discovery configuration for Camera A (image entity)
     TEMP_CONFIG_TOPIC = "homeassistant/image/gardyn/" + IDENTIFIER + "_upper_camera/config"
@@ -730,43 +662,32 @@ def on_connect(client, userdata, flags, rc, properties=None):
     logger.warning(f"Connected with result code {rc}")
     # Explicit topic list, not BASE_TOPIC + "/#" — see COMMAND_SUBSCRIPTIONS.
     client.subscribe(COMMAND_SUBSCRIPTIONS)
-    # Retract the water trust topic BEFORE announcing the device online.
+    # FIRST, and before anything is announced. Retiring an entity is a delete,
+    # and a delete that arrives after the announcement races it: HA would see
+    # the surviving device's discovery and the retired entities' clears in
+    # whatever order it happened to process them. Clearing first means the only
+    # discovery HA can act on is the current one.
     #
-    # gardyn/water/status is retained and has no will attached, so a reading
-    # this process vouched for before it died is still sitting on the broker
-    # saying "trustworthy" - along with the retained level it vouched for. Come
-    # back up and announce gardyn/status online first, and both availability
-    # topics read online, so HA marks the water entities available and displays
-    # that old level as a current reading until the fresh one lands. Retracting
-    # first means trust has to be re-earned by an actual measurement.
-    publish_water_sensor_status(client, False)
+    # This runs on EVERY connect rather than as a one-shot migration, which is
+    # the point. send_discovery_messages() also runs on every connect and this
+    # client reconnects roughly 25 times a day, so a manual sweep against the
+    # broker would be undone within seconds by the next reconnect.
+    clear_retired_entities(client)
     # Clear the retained "offline" the broker may have left from the last death.
     # Publish before discovery so HA never sees an entity announced unavailable.
     client.publish(STATUS_TOPIC, "online", qos=1, retain=True)
     send_discovery_messages(client)
-    publish_water_low_mode(client)
-    # Publish the threshold this process is actually running with. It used to be
-    # published only from the water/low/cm/set handler, so a value set at runtime
-    # survived in the retained topic while the service reloaded WATER_LOW_CM from
-    # .env on restart — HA showed one number and the interlock used another.
-    publish_water_low_threshold(client)
     # Announce real device state on every (re)connect. Retained, so HA gets it
     # immediately on subscribe instead of sitting at `unknown`.
     publish_light_state(client)
-    publish_pump_state(client)
-    # Re-read the reservoir on every (re)connect. The publish loop only fires
-    # every 30 minutes and its thread survives a reconnect behind the once-only
-    # guard in start_publisher_threads(), so without this a reconnect would leave
-    # the water entities sitting on whatever the trust topic last said - for up
-    # to half an hour, and across a restart, forever.
-    # Guarded, and it must stay guarded: start_publisher_threads() is the next
-    # line, so anything escaping here would leave the temperature, humidity,
-    # PCB, camera and water loops permanently unstarted while gardyn/status sits
-    # at "online" and the device looks perfectly healthy.
-    try:
-        refresh_water_state(client)
-    except Exception as e:
-        logger.exception(f"Failed to refresh water state on connect: {e}")
+    # A water-state refresh stood here, wrapped in a try/except so a sensor
+    # explosion could not leave the publisher threads unstarted (T-475 removed
+    # it with the entities it refreshed). Nothing between the subscribe and the
+    # line below touches hardware any more, so there is no longer a call to
+    # guard — but note the hazard if one is ever added back: start_publisher_
+    # threads() is the last statement, and an exception escaping above it leaves
+    # the PCB and camera loops permanently unstarted while gardyn/status sits at
+    # "online" and the device looks perfectly healthy.
     start_publisher_threads(client)
 
 def on_message(client, userdata, msg):
@@ -785,13 +706,13 @@ def on_message(client, userdata, msg):
         # === Pump Logic ===
         if topic_suffix == "pump/command":
             if payload.upper() == "ON":
-                # The interlock now lives in start_pump(), which also publishes
-                # the water topics from the same reading it decided on.
+                # The interlock lives in start_pump(). The pump entity is
+                # retired (T-475) so there is no state to publish back, but the
+                # command path itself is kept: it is how the interlock is
+                # exercised, and it is still gated by it.
                 start_pump(speed, client)
-                publish_pump_state(client)
             elif payload.upper() == "OFF":
                 pump.off()
-                publish_pump_state(client)
 
         elif topic_suffix == "pump/speed/set" and payload.isdigit():
             requested = int(payload)
@@ -816,7 +737,6 @@ def on_message(client, userdata, msg):
                 # would leave the global disagreeing with what HA was just told,
                 # and a later bare `pump/command ON` would start at a speed the
                 # user never saw take effect.
-            publish_pump_state(client)
 
         # === Light Logic ===
         elif topic_suffix == "light/command":
@@ -834,7 +754,15 @@ def on_message(client, userdata, msg):
 
         # === Water Level ===
         elif topic_suffix == "water/level/get":
-            refresh_water_state(client)
+            # Read-only probe of the ultrasonic. Nothing subscribes to a water
+            # topic any more (T-475), so the answer goes to the log - which is
+            # the only place it can go, and is enough for the one question this
+            # is still good for: what does the sensor currently say.
+            distance = safe_distance_measure()
+            if distance is None:
+                logger.info("Reservoir probe: no trustworthy reading")
+            else:
+                logger.info(f"Reservoir probe: {distance:.2f}cm")
 
         elif topic_suffix == "water/low/cm/set":
             try:
@@ -842,33 +770,32 @@ def on_message(client, userdata, msg):
             except ValueError:
                 logger.error(f"Invalid water low cm value: {payload}")
             else:
+                # The validation is UNCHANGED and stays load-bearing: this is
+                # the runtime path by which the pump interlock's threshold can
+                # be moved, and _threshold_is_acceptable() is what stops a nan
+                # or an out-of-band value silently disarming it. Only the
+                # echo-back to HA's number entity is gone with the entity.
                 if not _threshold_is_acceptable(candidate):
                     logger.error(
                         f"Rejecting water low threshold {payload!r} - "
                         f"must be 0 (disabled) or within "
                         f"{WATER_VALID_MIN_CM:.2f}-{WATER_VALID_MAX_CM:.2f}cm"
                     )
-                    # Re-assert what we are actually running with, so HA's
-                    # number entity does not sit showing a value we rejected.
-                    publish_water_low_threshold(client)
                 else:
                     WATER_LOW_CM = candidate or None
-                    publish_water_low_threshold(client)
-                    publish_water_low_mode(client)
-                    refresh_water_state(client)
+                    logger.info(
+                        f"Water low threshold now "
+                        f"{'disabled' if WATER_LOW_CM is None else f'{WATER_LOW_CM:.2f}cm'}"
+                    )
 
         # === Sensor Data on Request ===
         elif topic_suffix == "pcb/temperature/get":
             pcb_temp = get_pcb_temperature()
             client.publish(BASE_TOPIC + "/pcb/temperature", f"{pcb_temp:.2f}")
 
-        elif topic_suffix == "temperature/get":
-            temperature = temperature_sensor.read()
-            client.publish(BASE_TOPIC + "/temperature", f"{temperature:.2f}")
-
-        elif topic_suffix == "humidity/get":
-            humidity = humidity_sensor.read()
-            client.publish(BASE_TOPIC + "/humidity", f"{humidity:.2f}")
+        # temperature/get and humidity/get stood here (T-475). Both read a
+        # sensor object that is None on this unit, so both could only raise
+        # AttributeError into the catch-all below.
 
     except Exception as e:
         logger.exception(f"Error handling message on topic {msg.topic}: {e}")
@@ -883,50 +810,45 @@ def publish_pcb_temperature(client):
             logger.error(f"Failed to read or publish PCB temperature: {e}")
         sleep(30*60)  # Publish frequency, every x seconds
 
-def publish_temperature(client):
-    while True:
-        try:
-            temperature = temperature_sensor.read()
-            logger.debug(f"Publishing Temperature: {temperature:.2f}°C")
-            client.publish(BASE_TOPIC + "/temperature", f"{temperature:.2f}")
-        except Exception as e:
-            logger.error(f"Failed to read or publish ambient temperature: {e}")
-        sleep(30*60)  # Publish frequency, every x seconds
+# publish_temperature(), publish_humidity() and publish_water_level() stood here
+# and are gone (T-475). Each was a 30-minute loop feeding a retired entity:
+#
+#   temperature/humidity   read a None sensor, so every cycle logged
+#                          "'NoneType' object has no attribute 'read'" and
+#                          published nothing. This is the half of the change
+#                          that matters most for the water topics: leaving a
+#                          publisher running would have re-populated the
+#                          retained topics that clear_retired_entities() just
+#                          cleared, on the next cycle, silently.
+#   water level            re-measured and republished the reservoir. The
+#                          measurement path itself (safe_distance_measure) is
+#                          untouched and is still called by start_pump() and by
+#                          the water/level/get probe.
 
-def publish_humidity(client):
-    while True:
-        try:
-            humidity = humidity_sensor.read()
-            logger.debug(f"Publishing Humidity: {humidity:.2f}%")
-            client.publish(BASE_TOPIC + "/humidity", f"{humidity:.2f}")
-        except Exception as e:
-            logger.error(f"Failed to read or publish ambient humidity: {e}")
-        sleep(30*60)  # Publish frequency, every x seconds
 
-def publish_water_level(client):
-    while True:
-        try:
-            # refresh_water_state() also re-evaluates the low-water threshold.
-            # It used to publish only the level, so update_water_low_state() had
-            # exactly one caller - the water/low/cm/set handler - and the binary
-            # sensor reflected whatever the last threshold edit happened to see,
-            # sometimes days earlier. That is upstream issue #86.
-            refresh_water_state(client)
-        except Exception as e:
-            logger.exception(f"Failed to refresh water state: {e}")
-        sleep(30 * 60)
-
-def _capture_and_publish(client, label, device, resolution, image_path, topic):
+def _capture_and_publish(client, label, device, resolution, quality, image_path, topic):
     """Capture one camera and publish it independently.
 
     Each camera gets its own try/except so a failing camera (e.g. the lower
     camera's intermittent USB error-32) never blocks the other's publish, and
-    its own resolution so the healthy upper camera can run at a higher setting
-    than the flaky lower one.
+    its own resolution and quality so the healthy upper camera can run at a
+    different setting from the flaky lower one.
+
+    --jpeg is passed EXPLICITLY and is not optional (T-478). Omitting it does
+    not select a sane default: fswebcam's documented default factor is -1
+    ("automatic"), it holds that in a `char`, and plain `char` is UNSIGNED on
+    ARM - so on this Pi -1 becomes 255, libgd's use-the-default branch is never
+    taken, and libjpeg clamps 255 to maximum quality. The frames name the bug
+    themselves, carrying `quality = 255` in their own JPEG comment. That cost
+    ~748 KB per five-minute cycle against ~169 KB at 85, on a host where this
+    burst is the only sustained TX load.
+
+    Passing quality as an argument rather than reading a module global mirrors
+    `resolution` and is what lets the two cameras differ.
     """
     try:
         subprocess.check_call([
-            'fswebcam', '-d', device, '-r', resolution,
+            'fswebcam', '-d', device, '-r', resolution, '--jpeg', str(quality),
             '-S', '2', '-F', '2', '--no-banner', image_path
         ])
         with open(image_path, 'rb') as f:
@@ -941,9 +863,11 @@ def _capture_and_publish(client, label, device, resolution, image_path, topic):
 def publish_images(client):
     while True:
         _capture_and_publish(client, "upper", UPPER_CAMERA_DEVICE,
-                             UPPER_CAMERA_RESOLUTION, UPPER_IMAGE_PATH, "/image/upper_camera")
+                             UPPER_CAMERA_RESOLUTION, UPPER_CAMERA_JPEG_QUALITY,
+                             UPPER_IMAGE_PATH, "/image/upper_camera")
         _capture_and_publish(client, "lower", LOWER_CAMERA_DEVICE,
-                             LOWER_CAMERA_RESOLUTION, LOWER_IMAGE_PATH, "/image/lower_camera")
+                             LOWER_CAMERA_RESOLUTION, LOWER_CAMERA_JPEG_QUALITY,
+                             LOWER_IMAGE_PATH, "/image/lower_camera")
         sleep(IMAGE_INTERVAL_SECONDS)
 
 
@@ -966,8 +890,7 @@ def start_publisher_threads(client):
             return
         _publisher_threads_started = True
 
-    for target in (publish_pcb_temperature, publish_temperature, publish_humidity,
-                   publish_water_level, publish_images):
+    for target in (publish_pcb_temperature, publish_images):
         threading.Thread(target=target, args=(client,), daemon=True).start()
     logger.warning("Publisher threads started")
 

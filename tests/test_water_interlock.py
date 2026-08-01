@@ -6,9 +6,19 @@ import time, so the hardware and broker modules are stubbed in sys.modules
 before it is imported.
 
 Why this file exists at all: the reservoir ultrasonic on the unit these tests
-were written for is physically disconnected, so a live system can only ever
+were written for cannot produce a usable reading, so a live system can only ever
 exercise the untrustworthy branch. Every threshold comparison and every
-trustworthy-reading path is reachable here and nowhere else.
+trustworthy-reading path is reachable here and nowhere else. T-475 made that
+permanent rather than temporary - the fitted DYP-A01A's 28 cm dead zone covers
+the entire plausibility band - which raises this file from useful to the only
+place the interlock is ever exercised at all.
+
+T-475 withdrew the seven MQTT entities that were dead by hardware fact, and
+that removed the PUBLISHING these tests used to observe. The classes that
+scored a publisher are gone with it; TestPumpInterlock is deliberately
+UNCHANGED, and its passing unmodified is the evidence that retiring the
+entities did not retire the decisions. The withdrawal itself is scored by
+tests/test_retired_entities.py.
 """
 
 import json
@@ -74,7 +84,12 @@ def _install_stubs():
         UPPER_CAMERA_DEVICE="/dev/video0", LOWER_CAMERA_DEVICE="/dev/video2",
         UPPER_IMAGE_PATH="/tmp/u.jpg", LOWER_IMAGE_PATH="/tmp/l.jpg",
         CAMERA_RESOLUTION="640x480", UPPER_CAMERA_RESOLUTION="640x480",
-        LOWER_CAMERA_RESOLUTION="640x480", IMAGE_INTERVAL_SECONDS=3600,
+        LOWER_CAMERA_RESOLUTION="640x480",
+        # Distinct per camera on purpose: a stub that gave both the same number
+        # could not tell "each camera got its own quality" apart from "one
+        # value was used twice".
+        UPPER_CAMERA_JPEG_QUALITY=85, LOWER_CAMERA_JPEG_QUALITY=70,
+        IMAGE_INTERVAL_SECONDS=3600,
     )
 
 
@@ -109,10 +124,12 @@ class WaterTestBase(unittest.TestCase):
         mqtt_mod.distance_sensor = self.sensor
         mqtt_mod.client = self.client
         mqtt_mod.pump = MagicMock()
-        # Real number, not a bare Mock: publish_pump_state() compares get_speed()
-        # against 0, and a Mock there raises a TypeError that on_message's
-        # catch-all swallows - which would let these tests pass while the state
-        # publish they are meant to exercise never runs.
+        # Real number, not a bare Mock. on_message's pump/speed/set branch and
+        # toggle_pump() both compare get_speed() against 0, and a Mock there
+        # raises a TypeError that the catch-all swallows - which would let
+        # these tests pass while the code they exercise never runs. (The
+        # original reason named publish_pump_state(), which T-475 deleted; the
+        # two remaining comparisons keep the requirement alive.)
         mqtt_mod.pump.get_speed.return_value = 0
         mqtt_mod.light = MagicMock()
         mqtt_mod.light.get_brightness.return_value = 0
@@ -201,56 +218,21 @@ class TestPlausibilityBand(WaterTestBase):
         self.assertIsNone(mqtt_mod.safe_distance_measure())
 
 
-class TestFailClosedPublishing(WaterTestBase):
-    def test_untrustworthy_reading_publishes_offline_and_nothing_else(self):
-        self.sensor.measure_once.return_value = 0.09
-        self.assertIsNone(mqtt_mod.refresh_water_state(self.client))
-        self.assertEqual(self.published("gardyn/water/status"), ["offline"])
-        # The critical assertion: no level, and above all no "OFF" claiming the
-        # reservoir is fine on the strength of a reading we just rejected.
-        self.assertNotIn("gardyn/water/level", self.topics())
-        self.assertNotIn("gardyn/water/low/state", self.topics())
-
-    def test_trustworthy_reading_above_threshold_reports_low(self):
-        self.sensor.measure_once.return_value = 20.0
-        self.assertEqual(mqtt_mod.refresh_water_state(self.client), 20.0)
-        self.assertEqual(self.published("gardyn/water/status"), ["online"])
-        self.assertEqual(self.published("gardyn/water/level"), ["20.00"])
-        self.assertLess(
-            self.topics().index("gardyn/water/level"),
-            self.topics().index("gardyn/water/status"),
-            "trust must be asserted after the value it vouches for",
-        )
-        self.assertEqual(self.published("gardyn/water/low/state"), ["ON"])
-
-    def test_trustworthy_reading_below_threshold_reports_ok(self):
-        self.sensor.measure_once.return_value = 8.0
-        self.assertEqual(mqtt_mod.refresh_water_state(self.client), 8.0)
-        self.assertEqual(self.published("gardyn/water/status"), ["online"])
-        self.assertEqual(self.published("gardyn/water/level"), ["8.00"])
-        self.assertEqual(self.published("gardyn/water/low/state"), ["OFF"])
-
-    def test_trust_topic_recovers_when_readings_become_valid(self):
-        self.sensor.measure_once.return_value = 0.09
-        mqtt_mod.refresh_water_state(self.client)
-        self.sensor.measure_once.return_value = 9.0
-        mqtt_mod.refresh_water_state(self.client)
-        self.assertEqual(
-            self.published("gardyn/water/status"), ["offline", "online"]
-        )
-
-    def test_update_water_low_state_never_falls_back_to_off(self):
-        mqtt_mod.update_water_low_state(self.client, None)
-        self.assertNotIn("gardyn/water/low/state", self.topics())
-
-    def test_disabled_checking_publishes_off_explicitly(self):
-        mqtt_mod.WATER_LOW_CM = None
-        mqtt_mod.update_water_low_state(self.client)
-        self.assertEqual(self.published("gardyn/water/low/state"), ["OFF"])
-
-    def test_supplied_distance_avoids_a_second_measurement(self):
-        mqtt_mod.update_water_low_state(self.client, 9.0)
-        self.sensor.measure_once.assert_not_called()
+# TestFailClosedPublishing stood here (T-475).
+#
+# All seven of its tests scored refresh_water_state() and
+# update_water_low_state(): that an untrustworthy reading published "offline"
+# and no level, that a trustworthy one published level then trust in that
+# order, that the binary sensor never fell back to OFF. Every one of those
+# functions published to a topic behind an entity that no longer exists, and
+# all three functions were deleted with the entities.
+#
+# This is a deletion because the BEHAVIOUR was deliberately removed, not
+# because the tests started failing. The invariant underneath them - that an
+# unreadable reservoir is never treated as a safe one - was never a property of
+# the publishing. It is a property of safe_distance_measure() returning None,
+# which TestPlausibilityBand above still scores in full, and of start_pump()
+# refusing on that None, which TestPumpInterlock below still scores unchanged.
 
 
 class TestPumpInterlock(WaterTestBase):
@@ -359,69 +341,54 @@ class TestThresholdValidation(WaterTestBase):
                 self._set_threshold(payload)
                 self.assertEqual(mqtt_mod.WATER_LOW_CM, 11.0)
 
-    def test_refused_threshold_is_re_asserted_to_ha(self):
+    def test_a_refused_threshold_leaves_the_interlock_on_the_old_value(self):
+        # Was test_refused_threshold_is_re_asserted_to_ha, which asserted the
+        # rejected value was echoed back to HA's number entity so the slider
+        # could not sit showing something the interlock was not using. That
+        # entity is retired (T-475) and nothing is echoed anywhere. What the
+        # rejection has to achieve is unchanged and is what is asserted now:
+        # the threshold in force does not move.
         self._set_threshold("nan")
-        self.assertEqual(self.published("gardyn/water/low/cm"), ["11.00"])
+        self.assertEqual(mqtt_mod.WATER_LOW_CM, 11.0)
+        self.assertNotIn("gardyn/water/low/cm", self.topics())
 
     def test_valid_threshold_is_applied(self):
+        # The publish assertion is gone with the number entity; the assignment
+        # it accompanied is the half that arms the interlock, and is unchanged.
         self.sensor.measure_once.return_value = 8.0
         self._set_threshold("9.5")
         self.assertEqual(mqtt_mod.WATER_LOW_CM, 9.5)
-        self.assertIn("9.50", self.published("gardyn/water/low/cm"))
 
-    def test_zero_disables_and_is_published_as_zero(self):
+    def test_zero_disables_the_threshold(self):
+        # Was test_zero_disables_and_is_published_as_zero. The publishing half
+        # existed because a retained stale number would have left HA's slider
+        # disagreeing with the interlock - a problem that cannot arise once
+        # there is no slider. The state change is what still matters, and it is
+        # the sharp one: disabled means start_pump() stops checking at all.
         self.sensor.measure_once.return_value = 8.0
-        # Returning without publishing left the previous number retained, so
-        # HA's slider snapped back to a threshold the interlock was not using -
-        # and "disabled" is exactly when that matters, since it bypasses the
-        # pump interlock entirely.
         self._set_threshold("0")
         self.assertIsNone(mqtt_mod.WATER_LOW_CM)
-        self.assertIn("0.00", self.published("gardyn/water/low/cm"))
-        self.assertIn("Disabled", self.published("gardyn/water/low/mode"))
+        self.assertNotIn("gardyn/water/low/mode", self.topics())
 
     def test_unparseable_threshold_is_ignored(self):
         self._set_threshold("banana")
         self.assertEqual(mqtt_mod.WATER_LOW_CM, 11.0)
 
 
-class TestConnectSequencing(WaterTestBase):
-    def test_water_trust_is_retracted_before_the_device_is_announced_online(self):
-        # gardyn/water/status is retained and has no will, so a reading vouched
-        # for before the last death is still on the broker saying "trustworthy",
-        # alongside the retained level it vouched for. Announce the device
-        # online first and HA marks the water entities available showing that
-        # old level as current.
-        self.sensor.measure_once.return_value = 8.0
-        mqtt_mod._publisher_threads_started = True  # don't spawn real threads
-        mqtt_mod.on_connect(self.client, None, None, 0)
-        topics = self.topics()
-        first_water_status = topics.index("gardyn/water/status")
-        device_online = topics.index("gardyn/status")
-        self.assertLess(first_water_status, device_online)
-        self.assertEqual(self.published("gardyn/water/status")[0], "offline")
-
-    def test_connect_refreshes_the_water_state(self):
-        # The publish loop only fires every 30 minutes and its thread survives a
-        # reconnect, so without this a reconnect leaves the water entities on
-        # whatever the trust topic last said.
-        self.sensor.measure_once.return_value = 8.0
-        mqtt_mod._publisher_threads_started = True
-        mqtt_mod.on_connect(self.client, None, None, 0)
-        self.assertEqual(self.published("gardyn/water/status")[-1], "online")
-        self.assertIn("8.00", self.published("gardyn/water/level"))
-
-    def test_a_failing_water_refresh_does_not_block_the_publisher_threads(self):
-        # The swallowed-exception guard is the thing under test here, so opt out
-        # of it: this test asserts that on_connect DOES catch and continue.
-        self._swallowed.records.clear()
-        self.addCleanup(self._swallowed.records.clear)
-        mqtt_mod._publisher_threads_started = False
-        with patch.object(mqtt_mod, "refresh_water_state",
-                          side_effect=RuntimeError("sensor exploded")), \
-             patch.object(mqtt_mod, "start_publisher_threads") as start:
-            mqtt_mod.on_connect(self.client, None, None, 0)
-        start.assert_called_once()
+# TestConnectSequencing stood here (T-475) and now lives, rewritten, in
+# tests/test_retired_entities.py.
+#
+# Its three tests scored the retained water TRUST topic: that it was retracted
+# before the device was announced online, that a reconnect re-earned it with a
+# fresh measurement, and that an exploding sensor could not leave the publisher
+# threads unstarted. gardyn/water/status backed the water entities' availability
+# list; with those entities gone nothing subscribes to it, and on_connect no
+# longer touches the reservoir at all.
+#
+# The successor tests keep the same shape and the same worry - assert ordering
+# by observed call sequence, and prove the connect path REACHES ITS END rather
+# than only that something is absent - applied to the sequence that replaced it:
+# clear the retired topics, then announce, and never the other way round.
 
 
 class TestDiscoveryAvailability(WaterTestBase):
@@ -440,55 +407,27 @@ class TestDiscoveryAvailability(WaterTestBase):
                 return payload
         self.fail(f"no discovery config published for {fragment}")
 
-    def test_water_entities_use_an_availability_list(self):
-        for fragment in ("_water_level/config", "_water_low/config"):
-            with self.subTest(entity=fragment):
-                cfg = self._config(fragment)
-                topics = [a["topic"] for a in cfg["availability"]]
-                self.assertEqual(topics, ["gardyn/status", "gardyn/water/status"])
-                self.assertEqual(cfg["availability_mode"], "all")
+    # Five tests scoring the water entities' two-topic `availability` LIST stood
+    # here (T-475): that it named gardyn/status and gardyn/water/status in
+    # order, that the payload keys were stated per entry rather than at the top
+    # level, that water_level carried expire_after, that the threshold entity's
+    # range reached the top of the plausibility band, and that neither entity
+    # also set availability_topic. All five described entities that no longer
+    # exist, and the compound availability config went with them.
 
-    def test_availability_payloads_are_stated_per_entry(self):
-        # HA reads payload_available from the PER-ENTRY dict for the list form
-        # and only falls back to the top-level keys for the availability_topic
-        # form. Top-level values here would be silently ignored - working today
-        # only because "online"/"offline" are the per-entry defaults.
-        for fragment in ("_water_level/config", "_water_low/config"):
-            with self.subTest(entity=fragment):
-                cfg = self._config(fragment)
-                self.assertNotIn("payload_available", cfg)
-                self.assertNotIn("payload_not_available", cfg)
-                for entry in cfg["availability"]:
-                    self.assertEqual(entry["payload_available"], "online")
-                    self.assertEqual(entry["payload_not_available"], "offline")
-
-    def test_water_level_expires_so_a_latched_value_cannot_look_current(self):
-        # The one staleness case the trust topic cannot catch: the process stays
-        # healthy while the SENSOR quietly stops changing. gpiozero keeps its
-        # last samples indefinitely, so a latched value still passes the band.
-        cfg = self._config("_water_level/config")
-        self.assertGreater(cfg["expire_after"], 2 * 1800)
-
-    def test_threshold_entity_range_reaches_the_top_of_the_band(self):
-        # Capped at 15 before, which put the whole 15-25 cm span out of reach -
-        # and on the PR #90 calibration that is where a threshold separating a
-        # full tank from an empty one belongs.
-        cfg = self._config("_water_low_cm/config")
-        self.assertEqual(cfg["max"], mqtt_mod.WATER_VALID_MAX_CM)
-
-    def test_water_entities_do_not_also_set_availability_topic(self):
-        # The MQTT integration docs: availability_topic "must not be used
-        # together with availability". Both keys present is a config error, and
-        # merging the shared availability_config would have produced exactly it.
-        for fragment in ("_water_level/config", "_water_low/config"):
-            with self.subTest(entity=fragment):
-                self.assertNotIn("availability_topic", self._config(fragment))
-
-    def test_non_water_entities_keep_the_single_topic_form(self):
-        for fragment in ("_light/config", "_water_low_cm/config"):
+    def test_every_surviving_entity_uses_the_single_topic_form(self):
+        # Every entity left answers to the controller's liveness alone. Stated
+        # over ALL four rather than a sample, so an entity that quietly grew a
+        # second availability condition - or lost the topic entirely, which
+        # would leave HA showing its last value forever after a dead Pi - is
+        # caught here.
+        for fragment in ("_light/config", "_pcb_temp/config",
+                         "_upper_camera/config", "_lower_camera/config"):
             with self.subTest(entity=fragment):
                 cfg = self._config(fragment)
                 self.assertEqual(cfg["availability_topic"], "gardyn/status")
+                self.assertEqual(cfg["payload_available"], "online")
+                self.assertEqual(cfg["payload_not_available"], "offline")
                 self.assertNotIn("availability", cfg)
 
 
