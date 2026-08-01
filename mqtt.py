@@ -42,10 +42,11 @@ logging.basicConfig(
 )
 
 # NOTE: the light module raises its OWN logger to INFO at import (see
-# app/sensors/light/light.py). It is deliberately not done here: this file
-# cannot be imported without paho/gpiozero/pigpio, so a policy set here is
-# unreachable from the test suite, and the root WARNING above would otherwise
-# discard every light command before it reaches a handler.
+# app/sensors/light/light.py) so that policy travels with the module rather than
+# depending on this file having run. The root stays at WARNING above; both
+# module levels are asserted by tests/test_water_interlock.py, which already
+# imports this file under stubs — so "mqtt.py is untestable" is NOT a reason to
+# leave a logging policy uncovered here.
 logger = logging.getLogger(__name__)
 
 # Retained availability topic backing every entity's availability_config.
@@ -89,8 +90,25 @@ COMMAND_SUBSCRIPTIONS = [
     (BASE_TOPIC + "/humidity/get", 0),
 ]
 
-# set to INFO, for to capture mqtt messages at info-level messages.
-logger.setLevel(logging.WARNING)
+# INFO, so a command can be ATTRIBUTED. The previous line here set WARNING
+# under a comment claiming it set INFO - the code and its comment said opposite
+# things, and the code won: every command-attribution site below (the button
+# toggles at :148/:151, the pump toggles, the low-water abort flash at :209) and
+# the inbound decode in on_message were discarded before reaching a handler.
+#
+# That is what made 2026-07-31 20:08 unanswerable. The grow light asserted 50%
+# an hour after its scheduled off - real, the Zigbee plug metered 55W for 28s -
+# and nothing recorded either the command or where it came from. Recording the
+# light's own action (see app/sensors/light/light.py) says WHAT happened; this
+# says WHO asked for it, which is the half that identifies a replayed queued
+# message, a button press and an HA automation as different causes.
+#
+# The periodic publishers below are demoted to debug in exchange, so this is a
+# trade rather than a blanket INFO: the camera pair alone publishes ~576 lines a
+# day and would bury four meaningful light events. Same trade light.py makes,
+# for the same signal-to-noise reason - not for disk, which is a non-issue
+# (~26 KB/day against 25 GB free, journald capped at 64M).
+logger.setLevel(logging.INFO)
 
 # Initialize devices
 pin_factory = PiGPIOFactory()
@@ -266,7 +284,7 @@ def safe_distance_measure():
         # never echoed - and the 0.0 it would hand back is indistinguishable
         # from a full tank. Report "no reading" without claiming to know
         # anything, and let the caller decline to publish a verdict at all.
-        logger.info("Distance sampler has no readings yet")
+        logger.debug("Distance sampler has no readings yet")
         return None
 
     try:
@@ -296,7 +314,7 @@ def publish_water_low_mode(client):
         mode = "Enabled"
     else:
         mode = "Disabled"
-    logger.info(f"Publishing water low mode: {mode}")
+    logger.debug(f"Publishing water low mode: {mode}")
     client.publish(BASE_TOPIC + "/water/low/mode", mode, retain=True)
 
 
@@ -337,7 +355,7 @@ def publish_water_low_threshold(client):
     # that matters most is precisely this one, since a disabled threshold means
     # the pump interlock is bypassed entirely.
     effective = 0.0 if WATER_LOW_CM in (None, 0) else WATER_LOW_CM
-    logger.info(f"Publishing water low threshold: {effective:.2f}cm")
+    logger.debug(f"Publishing water low threshold: {effective:.2f}cm")
     client.publish(BASE_TOPIC + "/water/low/cm", f"{effective:.2f}", retain=True)
 
 
@@ -399,7 +417,7 @@ def refresh_water_state(client):
         )
         return None
 
-    logger.info(f"Publishing Water Level: {distance:.2f}cm")
+    logger.debug(f"Publishing Water Level: {distance:.2f}cm")
     # Retained, like the other state topics, so HA gets it on subscribe instead
     # of sitting at `unknown`. Safe to retain only because the retained trust
     # topic travels with it - a stale level cannot be read as current while
@@ -756,7 +774,7 @@ def on_message(client, userdata, msg):
 
     try:
         payload = msg.payload.decode("utf-8").strip()
-        logger.debug(f"Decoded payload on {msg.topic}: '{payload}'")
+        logger.info(f"Decoded payload on {msg.topic}: '{payload}'")
     except UnicodeDecodeError:
         logger.error(f"Failed to decode message on topic {msg.topic}. Likely binary.")
         return
@@ -859,7 +877,7 @@ def publish_pcb_temperature(client):
     while True:
         try:
             pcb_temp = get_pcb_temperature()
-            logger.info(f"Publishing PCB Temperature: {pcb_temp:.2f}°C")
+            logger.debug(f"Publishing PCB Temperature: {pcb_temp:.2f}°C")
             client.publish(BASE_TOPIC + "/pcb/temperature", f"{pcb_temp:.2f}")
         except Exception as e:
             logger.error(f"Failed to read or publish PCB temperature: {e}")
@@ -869,7 +887,7 @@ def publish_temperature(client):
     while True:
         try:
             temperature = temperature_sensor.read()
-            logger.info(f"Publishing Temperature: {temperature:.2f}°C")
+            logger.debug(f"Publishing Temperature: {temperature:.2f}°C")
             client.publish(BASE_TOPIC + "/temperature", f"{temperature:.2f}")
         except Exception as e:
             logger.error(f"Failed to read or publish ambient temperature: {e}")
@@ -879,7 +897,7 @@ def publish_humidity(client):
     while True:
         try:
             humidity = humidity_sensor.read()
-            logger.info(f"Publishing Humidity: {humidity:.2f}%")
+            logger.debug(f"Publishing Humidity: {humidity:.2f}%")
             client.publish(BASE_TOPIC + "/humidity", f"{humidity:.2f}")
         except Exception as e:
             logger.error(f"Failed to read or publish ambient humidity: {e}")
@@ -913,7 +931,7 @@ def _capture_and_publish(client, label, device, resolution, image_path, topic):
         ])
         with open(image_path, 'rb') as f:
             client.publish(BASE_TOPIC + topic, payload=f.read(), qos=0, retain=False)
-        logger.info(f"Captured+published {label} camera ({device}) @ {resolution}")
+        logger.debug(f"Captured+published {label} camera ({device}) @ {resolution}")
     except subprocess.CalledProcessError as e:
         logger.error(f"{label} camera capture failed ({device}): {e}")
     except Exception:

@@ -37,7 +37,9 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIGHT = os.path.join(REPO, "app", "sensors", "light", "light.py")
+MQTT = os.path.join(REPO, "mqtt.py")
 SUITE = "tests.test_light_logging"
+MQTT_SUITE = "tests.test_water_interlock"
 
 # Each mutant reintroduces a real regression. Note the mix: some BREAK present
 # code, one REINTRODUCES deleted code (the bare root call), and one applies the
@@ -71,6 +73,36 @@ MUTANTS = [
 ]
 
 
+# --- mqtt.py half -----------------------------------------------------------
+#
+# A battery is evidence only for the code it MUTATES. The list above scores
+# light.py; every one of these four regressions previously left the suite GREEN,
+# because the deployed policy in mqtt.py had no coverage at all. The first is
+# the one that matters: `basicConfig(level=INFO)` is the blanket fix a person
+# would actually write, and it lives HERE, not in light.py where the light
+# battery tests for it.
+MQTT_MUTANTS = [
+    ("the REAL blanket-INFO fix, in the file someone would write it",
+     "    level=logging.WARNING,",
+     "    level=logging.INFO,"),
+    ("revert the service logger to WARNING (the original bug)",
+     "logger.setLevel(logging.INFO)",
+     "logger.setLevel(logging.WARNING)"),
+    ("raise the handlers above INFO, silencing everything invisibly",
+     "    force=True,\n)",
+     "    force=True,\n)\nfor _h in logging.getLogger().handlers:\n    _h.setLevel(logging.WARNING)"),
+    ("disable logging globally - no logger or handler level reflects it",
+     "    force=True,\n)",
+     "    force=True,\n)\nlogging.disable(logging.INFO)"),
+    ("re-bury the inbound decode that identifies a replayed command",
+     'logger.info(f"Decoded payload on {msg.topic}',
+     'logger.debug(f"Decoded payload on {msg.topic}'),
+    ("re-promote a periodic publisher, re-burying the command record",
+     'logger.debug(f"Captured+published {label} camera',
+     'logger.info(f"Captured+published {label} camera'),
+]
+
+
 def purge_pycache():
     for root, dirs, _ in os.walk(REPO):
         if ".git" in root:
@@ -80,12 +112,12 @@ def purge_pycache():
                 shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
 
-def run_suite():
+def run_suite(suite=SUITE):
     """Return (passed, combined_output). stderr merged - unittest writes there."""
     purge_pycache()
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     proc = subprocess.run(
-        [sys.executable, "-m", "unittest", SUITE],
+        [sys.executable, "-m", "unittest", suite],
         cwd=REPO, env=env, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True,
     )
@@ -163,10 +195,55 @@ def main():
             killed += 1
             print(f"  [{i}] killed    {label}")
 
+    # --- mqtt.py pass -------------------------------------------------------
     print("\n" + "=" * 68)
-    print(f"RESULT: {killed}/{len(MUTANTS)} killed")
+    print("mqtt.py policy mutants (scored by " + MQTT_SUITE + ")")
+    mqtt_src = open(MQTT).read()
+    mqtt_sha = sha(MQTT)
 
-    restored = sha(LIGHT) == original_sha
+    ok_m, _ = run_suite(MQTT_SUITE)
+    print(f"  CONTROL A - clean tree: {'GREEN' if ok_m else 'RED'}")
+    if not ok_m:
+        print("  ABORT: mqtt suite is not green on a clean tree; verdicts unreadable.")
+        return 2
+    broken_m = mqtt_src.replace("logger.setLevel(logging.INFO)",
+                                "logger.setLevel(logging.CRITICAL)")
+    assert broken_m != mqtt_src, "control-B anchor missed"
+    open(MQTT, "w").write(broken_m)
+    ok_mb, _ = run_suite(MQTT_SUITE)
+    open(MQTT, "w").write(mqtt_src)
+    print(f"  CONTROL B - broken policy: {'GREEN' if ok_mb else 'RED'}")
+    if ok_mb:
+        print("  ABORT: mqtt suite passed a deliberately broken policy.")
+        return 2
+    print()
+
+    for j, (label, old_s, new_s) in enumerate(MQTT_MUTANTS, 1):
+        count = mqtt_src.count(old_s)
+        if count != 1:
+            print(f"  [m{j}] HARNESS ERROR ({count} anchor matches): {label}")
+            survived.append((label, f"anchor matched {count}x, not 1"))
+            continue
+        open(MQTT, "w").write(mqtt_src.replace(old_s, new_s, 1))
+        if open(MQTT).read() == mqtt_src:
+            print(f"  [m{j}] HARNESS ERROR (file unchanged): {label}")
+            survived.append((label, "mutation did not apply"))
+            open(MQTT, "w").write(mqtt_src)
+            continue
+        ok_mm, _ = run_suite(MQTT_SUITE)
+        open(MQTT, "w").write(mqtt_src)
+        if ok_mm:
+            print(f"  [m{j}] SURVIVED  {label}")
+            survived.append((label, "suite stayed green"))
+        else:
+            killed += 1
+            print(f"  [m{j}] killed    {label}")
+
+    total = len(MUTANTS) + len(MQTT_MUTANTS)
+    print("\n" + "=" * 68)
+    print(f"RESULT: {killed}/{total} killed")
+
+    restored = sha(LIGHT) == original_sha and sha(MQTT) == mqtt_sha
     print(f"tree restored byte-identical: {restored}")
     shutil.rmtree(pristine, ignore_errors=True)
 
@@ -178,7 +255,7 @@ def main():
         for label, why in survived:
             print(f"  - {label}: {why}")
 
-    return 0 if (killed == len(MUTANTS) and restored) else 1
+    return 0 if (killed == total and restored) else 1
 
 
 if __name__ == "__main__":

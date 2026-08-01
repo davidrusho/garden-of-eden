@@ -660,5 +660,99 @@ class TestBandConfigValidation(unittest.TestCase):
                 self.assertEqual(self._load(WATER_VALID_MIN_CM=bad), (3.0, 25.0))
 
 
+class LoggingPolicyTestCase(unittest.TestCase):
+    """Asserts the DEPLOYED logging policy, not a hand copy of it.
+
+    These live here rather than in test_light_logging.py because this module
+    already owns the sys.modules stubs and the real `import mqtt` - a second
+    stubbing module would fight this one, which is exactly the collision that
+    made test_light_logging inert under `unittest discover`.
+
+    Why they exist. A review found the policy in mqtt.py had no coverage at all:
+    four separate regressions - including `basicConfig(level=INFO)`, the blanket
+    fix a person would most plausibly write - all left the suite green. The
+    battery that scored the light module was honest about what it measured, and
+    what it measured was light.py only.
+
+    The policy under test is a TRADE, and both halves have to hold:
+      * mqtt.py and light.py at INFO, so a command can be attributed
+      * the ROOT at WARNING, so everything else stays quiet
+    Asserting only the first would pass under a blanket INFO, which is the
+    regression these are here to catch.
+    """
+
+    LIGHT_LOGGER = "app.sensors.light.light"
+
+    def test_service_logger_is_info_so_commands_are_attributable(self):
+        """mqtt.py's own logger carries the inbound decode and the button/pump
+        toggles. At WARNING - which is what it shipped as, under a comment
+        claiming INFO - a command leaves no record of where it came from."""
+        self.assertEqual(logging.getLogger("mqtt").level, logging.INFO)
+
+    def test_light_module_still_owns_its_level(self):
+        """Source-level, deliberately.
+
+        This module stubs app.sensors.light.light with a MagicMock, so the real
+        light.py never executes here and its logger reads NOTSET - asserting the
+        live level in this file would test the stub, not the code. The
+        behavioural assertion lives in test_light_logging.py, which loads the
+        real module. What is checked here is only that the policy has not been
+        DELETED from the source, which the stub cannot mask."""
+        path = os.path.join(_REPO_ROOT, "app", "sensors", "light", "light.py")
+        with open(path) as fh:
+            source = fh.read()
+        self.assertIn("logger.setLevel(logging.INFO)", source)
+
+    def test_root_stays_at_warning(self):
+        """The half that fails under a blanket fix.
+
+        `basicConfig(level=INFO)` in mqtt.py would satisfy both tests above
+        while switching on every periodic publisher and the camera path. This
+        is the only assertion that tells the targeted policy apart from the
+        lazy one."""
+        self.assertEqual(logging.getLogger().level, logging.WARNING)
+
+    def test_periodic_publishers_are_not_at_info(self):
+        """The demotions are load-bearing, not cosmetic: they are what buys the
+        headroom for raising the service logger. If these return to INFO the
+        camera pair alone re-buries the command record."""
+        import inspect
+        import re
+
+        source = inspect.getsource(mqtt_mod)
+        offenders = re.findall(
+            r'logger\.info\(f?"(?:Publishing (?:PCB Temperature|Temperature|'
+            r'Humidity|Water Level|water low)|Captured\+published)', source)
+        self.assertEqual(offenders, [],
+                         f"periodic publisher back at INFO: {offenders}")
+
+    def test_inbound_decode_is_recorded(self):
+        """on_message's decode is the ONLY record of what arrived on the wire.
+        At debug it is invisible, and a replayed queued command then looks
+        identical to a fresh one."""
+        import inspect
+
+        source = inspect.getsource(mqtt_mod)
+        self.assertIn('logger.info(f"Decoded payload on {msg.topic}', source)
+
+    def test_logging_is_not_globally_disabled(self):
+        """logging.disable() is a module-wide threshold that no logger or
+        handler level reflects, so every other assertion here would still pass
+        while nothing was emitted at all."""
+        self.assertLess(logging.root.manager.disable, logging.INFO)
+
+    def test_handlers_do_not_filter_above_the_logger_levels(self):
+        """A handler level would silently undo all of the above.
+
+        basicConfig leaves its handlers at NOTSET; callHandlers consults the
+        HANDLER's level, never an ancestor logger's, so a handler raised to
+        WARNING suppresses every INFO record while all four assertions above
+        still pass."""
+        for handler in logging.getLogger().handlers:
+            self.assertLessEqual(
+                handler.level, logging.INFO,
+                f"{handler!r} filters at {handler.level}, above INFO")
+
+
 if __name__ == "__main__":
     unittest.main()
