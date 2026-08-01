@@ -231,31 +231,19 @@ function enable_pigpiod_service {
     log_info "pigpiod has been started and enabled on boot."
 }
 
-# Setup and start MQTT service
-function setup_mqtt_service {
-    local service_file="$INSTALL_DIR/services/etc/systemd/system/mqtt.service"
-
-    cat > $service_file <<EOF
-[Unit]
-Description=MQTT Service
-Requires=pigpiod.service
-After=network.target pigpiod.service
-
-[Service]
-User=$USER
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/mqtt.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    sudo cp $service_file /etc/systemd/system/
-    sudo systemctl daemon-reload
-    sudo systemctl enable mqtt.service
-    sudo systemctl start mqtt.service
-    log_info "MQTT service has been started and enabled on boot."
+# Install every systemd unit this project ships, from the tracked files under
+# services/etc/systemd/system/.
+#
+# This used to generate mqtt.service with a heredoc whose target was that
+# tracked file, so a setup run overwrote its own source: the tree came back
+# dirty, the T-471 boot-resilience directives were silently reverted, and the
+# health sampler and network watchdog were not installed at all. The unit files
+# are the single source of truth now; bin/install-systemd-units.sh copies them.
+function install_systemd_units {
+    if ! "$BIN_DIR/install-systemd-units.sh"; then
+        log_error "systemd unit installation failed."
+        return 1
+    fi
 }
 
 # Main script execution
@@ -277,4 +265,4 @@ create_bash_script_symlinks
 #Note: pigpiod will be started by mqtt.service
 #enable_pigpiod_service
 
-setup_mqtt_service
+install_systemd_units

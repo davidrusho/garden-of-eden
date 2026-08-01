@@ -97,6 +97,25 @@ sudo systemctl status pigpiod
 sudo systemctl status mqtt.service
 ```
 
+### systemd units
+
+Every unit this project ships is a tracked file under
+`services/etc/systemd/system/`. `setup.sh` **copies** them into
+`/etc/systemd/system/`; it does not generate them, so the repository copy is
+the single source of truth and a setup run leaves the working tree clean.
+
+To redeploy the units without re-running the whole setup:
+
+```
+./bin/install-systemd-units.sh
+```
+
+It installs every `*.service` and `*.timer` in that directory — the list is
+derived from the directory, so a new unit needs no edit to the script — enables
+the ones that carry an `[Install]` section, and restarts only the units whose
+file actually changed. Units with no `[Install]` section are `Type=oneshot`
+jobs started by their timer, so they are installed but never enabled directly.
+
 ## Usage
 
 ## Quick Toggle Guide
