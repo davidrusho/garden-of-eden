@@ -6,6 +6,11 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.sensors.light.light import Light
 
+# The logger these records actually go to. assertLogs' first argument is a
+# LOGGER NAME - passing the expected message there (as this file used to)
+# builds a context manager that is never entered and asserts nothing.
+_LIGHT_LOGGER = 'app.sensors.light.light'
+
 class TestLight(unittest.TestCase):
     @patch('app.sensors.light.light.PWMLED')
     @patch('app.sensors.light.light.PiGPIOFactory')
@@ -18,21 +23,24 @@ class TestLight(unittest.TestCase):
 
     def test_turn_on_from_0(self):
         self.mock_led.value = 0
-        self.light.on()
+        with self.assertLogs(_LIGHT_LOGGER, level='INFO') as cm:
+            self.light.on()
         self.assertEqual(self.mock_led.value, 1)
-        self.assertLogs('Turning light on')
+        self.assertIn('Turning light on', '\n'.join(cm.output))
 
     def test_turn_on_from_nonzero(self):
         self.mock_led.value = 0.5
-        self.light.on()
+        with self.assertLogs(_LIGHT_LOGGER, level='INFO') as cm:
+            self.light.on()
         self.assertEqual(self.mock_led.value, 0.5)
-        self.assertLogs('Light already on, skipping')
+        self.assertIn('Light already on, skipping', '\n'.join(cm.output))
 
     def test_off(self):
         self.mock_led.value = 1
-        self.light.off()
+        with self.assertLogs(_LIGHT_LOGGER, level='INFO') as cm:
+            self.light.off()
         self.assertEqual(self.mock_led.value, 0)
-        self.assertLogs('Turning light off')
+        self.assertIn('Turning light off', '\n'.join(cm.output))
 
     def test_set_brightness_valid(self):
         valid_brightness = 70

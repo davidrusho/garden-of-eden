@@ -1,3 +1,15 @@
+# UPSTREAM EXAMPLE - NOT the schedule running on this deployment.
+#
+# Nothing deploys this file. The live automation is owned by Home Assistant
+# (automation.gardyn_grow_light_schedule) and differs in every trigger:
+# HA runs 03:00 @50%, 04:00 @100%, 18:00 @50%, 19:00 off, plus a /15 re-assert
+# and a homeassistant-start trigger that this file has no equivalent of.
+#
+# Read the live automation, not this, when reasoning about what the light does.
+# On 2026-07-31 a review took this file's 20:00 off as current and built a wrong
+# timeline for a real incident from it. Kept only because it is upstream
+# content; treat it as an example of the integration's shape, not as truth
+# about this host.
 description: Schedule for Gardyn light control
 trigger:
   - platform: time
