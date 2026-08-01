@@ -5,7 +5,15 @@ __pycache__/
 venv/
 # If using Jython
 *.class
+
+# Secrets. `.env` alone matched only that exact name, so gardyn.env,
+# .env.local or anything under a subdirectory was committable - on a public
+# repo. `.env-dist` is the tracked template and matches none of these
+# patterns (it ends in -dist, not .env), so it keeps shipping.
 .env
+*.env
+.env.*
+!.env-dist
 
 # Runtime log written by mqtt.service; not an artifact.
 *.log
