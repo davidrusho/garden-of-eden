@@ -31,6 +31,7 @@ The end-to-end setup.sh case at the bottom uses a LOGGING NO-OP `sudo` instead -
 setup.sh writes to /boot/config.txt, /etc/modules and /usr/local/bin, and under
 `exec` those would land on the machine running the tests.
 """
+# Reviewed: 2026-08-01 against 3e8374c and 92dd3fd (T-477)
 import os
 import shutil
 import stat
@@ -239,6 +240,13 @@ class SetupScriptTests(unittest.TestCase):
         # alone and silently wrong the moment anything is appended.
         self.assertRegex(self.text, r"(?m)^install_systemd_units \|\| exit 1\s*$")
 
+    def test_the_installer_uses_escape_sequences_bash_3_2_understands(self):
+        """macOS ships bash 3.2 as /bin/bash, and the installer runs under its
+        own shebang - where `echo -e "\\e["` emits the literal characters."""
+        text = read(INSTALLER).decode()
+        self.assertNotIn(r"\e[", text)
+        self.assertIn(r"\033[", text)
+
     def test_installer_script_is_executable(self):
         self.assertTrue(os.access(INSTALLER, os.X_OK))
 
@@ -434,10 +442,103 @@ class InstallerFailureTests(unittest.TestCase):
         self.assertIn("destination is a symlink", proc.stderr)
         self.assertTrue(os.path.islink(dest))
         self.assertEqual("/dev/null", os.readlink(dest))
+        # BSD `install` refuses a symlink destination on its own, so the
+        # assertions above pass with or without the guard. This one does not:
+        # it proves the install was never attempted, which is what matters on
+        # the Pi, where GNU install unlinks the destination before writing.
+        self.assertNotIn("failed to install mqtt.service", proc.stderr)
         calls = box.systemctl_calls()
         self.assertNotIn("enable mqtt.service", calls)
         # The other four are still installed and armed.
         self.assertIn("enable gardyn-netwatch.timer", calls)
+
+    def test_a_pending_restart_survives_a_failed_run(self):
+        """An interrupted run leaves the new file on disk with the old
+        definition loaded. Without a marker the next run sees no difference,
+        issues `start`, and reports success over a stale service."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        box.run()                                   # everything current
+        with open(box.src_path("mqtt.service"), "a") as fh:
+            fh.write("\n# a new definition\n")
+        box.clear_log()
+        proc = box.run(fail_on="restart mqtt.service")
+        self.assertNotEqual(0, proc.returncode)
+        # The file is now deployed but the running unit is stale.
+        self.assertEqual(read(box.src_path("mqtt.service")),
+                         read(box.dest_path("mqtt.service")))
+        box.clear_log()
+        proc = box.run()                            # a healthy re-run
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("restart mqtt.service", box.systemctl_calls())
+        # …and once restarted, the pending state is cleared.
+        box.clear_log()
+        box.run()
+        self.assertNotIn("restart mqtt.service", box.systemctl_calls())
+
+    def test_a_service_with_no_execstart_is_not_enabled(self):
+        """"found no problem" and "could not look" are the same empty result;
+        only one of them is an all-clear."""
+        box = Sandbox(units={"probe.service":
+                             "[Unit]\nDescription=probe\n\n[Service]\n"
+                             "Type=oneshot\nExecStartPre=/nowhere/x.py\n\n"
+                             "[Install]\nWantedBy=multi-user.target\n"})
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("no ExecStart line found", proc.stderr)
+        self.assertEqual(["daemon-reload"], box.systemctl_calls())
+
+    def test_whitespace_around_the_execstart_equals_is_still_checked(self):
+        """systemd.syntax(7): whitespace either side of `=` is ignored."""
+        box = Sandbox(units={"probe.service":
+                             "[Unit]\nDescription=probe\n\n[Service]\n"
+                             "Type=oneshot\nExecStart = /nowhere/x.py\n\n"
+                             "[Install]\nWantedBy=multi-user.target\n"})
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("/nowhere/x.py", proc.stderr)
+
+    def test_a_quoted_execstart_path_is_still_checked(self):
+        box = Sandbox(units={"probe.service":
+                             "[Unit]\nDescription=probe\n\n[Service]\n"
+                             'Type=oneshot\nExecStart="/nowhere/x.py"\n\n'
+                             "[Install]\nWantedBy=multi-user.target\n"})
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("/nowhere/x.py", proc.stderr)
+
+    def test_a_timer_is_not_armed_when_its_service_was_refused(self):
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        os.symlink("/dev/null", box.dest_path("gardyn-netwatch.service"))
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("gardyn-netwatch.service was not installed", proc.stderr)
+        self.assertNotIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+        # The unrelated sibling timer is unaffected.
+        self.assertIn("enable gardyn-health-log.timer", box.systemctl_calls())
+
+    def test_an_unreadable_unit_source_is_not_read_as_an_all_clear(self):
+        """A grep that cannot open the file and a grep that finds no problem
+        return the same empty result."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        os.chmod(box.src_path("gardyn-netwatch.service"), 0o000)
+        self.addCleanup(os.chmod, box.src_path("gardyn-netwatch.service"), 0o644)
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("cannot read", proc.stderr)
+        self.assertNotIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+
+    def test_a_failing_run_does_not_print_a_pass_summary(self):
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        proc = box.run(fail_on="enable mqtt.service")
+        self.assertNotEqual(0, proc.returncode)
+        self.assertNotIn("units installed;", proc.stdout)
 
     def test_a_directory_destination_is_refused(self):
         """`install SOURCE DIRECTORY` is a valid second form that exits 0 and

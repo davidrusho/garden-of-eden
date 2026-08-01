@@ -34,6 +34,7 @@ Mechanics that have bitten this repo before, all handled here:
   * the tree is asserted byte-identical at the end, including the file the
     deletion mutant removes.
 """
+# Reviewed: 2026-08-01 against 3e8374c and 92dd3fd (T-477)
 import hashlib
 import os
 import shutil
@@ -97,8 +98,10 @@ MUTANTS = [
 
     ("i4", "restart on every run, bouncing the controller during a no-op setup",
      INSTALLER,
-     '    if in_list "$u" ${changed[@]+"${changed[@]}"}; then',
-     '    if true; then'),
+     # Anchored on the newline: the marker branch in the install loop is the
+     # same text at deeper indentation, so a bare match hits twice.
+     '\n    if in_list "$u" ${changed[@]+"${changed[@]}"}; then',
+     '\n    if true; then'),
 
     ("i5", "never restart, so a changed unit file is installed but not applied",
      INSTALLER,
@@ -187,13 +190,13 @@ MUTANTS = [
 
     ("i20", "drop the drop-in directory refusal",
      INSTALLER,
-     '        *.d) fail "drop-in directory not supported by this installer: $(basename "$f")" ;;',
-     '        *.d) ;;'),
+     '        *.d) [ -d "$f" ] && fail "drop-in directory not supported by this installer: $(basename "$f")"',
+     '        *.d) [ -d "$f" ] && :'),
 
     ("i21", "collect the failures and then exit 0 anyway",
      INSTALLER,
-     'if [ ${#failures[@]} -gt 0 ]; then',
-     'if false; then'),
+     '    if [ ${#failures[@]} -gt 0 ]; then\n        log_error "${#failures[@]} problem(s):"',
+     '    if false; then\n        log_error "${#failures[@]} problem(s):"'),
 
     ("i22", "drop the nothing-was-installed guard",
      INSTALLER,
@@ -204,6 +207,60 @@ MUTANTS = [
      INSTALLER,
      '    if [ ! -e "$dest" ]; then',
      '    if false; then'),
+
+    ("i26", "drop the pending-restart marker, losing an interrupted run's state",
+     INSTALLER,
+     '            sudo touch "$(pending_marker "$u")" \\\n'
+     '                || log_warn "$u: could not record that it still needs a restart"',
+     '            :'),
+
+    ("i27", "clear the pending marker before the restart has happened",
+     INSTALLER,
+     '        if sudo systemctl restart "$u"; then\n'
+     '            sudo rm -f "$(pending_marker "$u")"',
+     '        sudo rm -f "$(pending_marker "$u")"\n'
+     '        if sudo systemctl restart "$u"; then\n'
+     '            :'),
+
+    ("i28", "ignore the pending marker when deciding whether to restart",
+     INSTALLER,
+     '            0) if [ -e "$(pending_marker "$u")" ]; then',
+     '            0) if false; then'),
+
+    ("i29", "let a .service with no ExecStart pass the gate (fail open)",
+     INSTALLER,
+     '            if [ $seen -eq 0 ]; then',
+     '            if false; then'),
+
+    ("i30", "treat an unreadable unit file as an all-clear",
+     INSTALLER,
+     '    if [ $rc -gt 1 ]; then',
+     '    if false; then'),
+
+    ("i31", "require ExecStart= with no whitespace, missing a legal unit",
+     INSTALLER,
+     "    lines=$(grep -E '^[[:space:]]*ExecStart[[:space:]]*=' \"$UNIT_SRC_DIR/$unit\")",
+     "    lines=$(grep -E '^ExecStart=' \"$UNIT_SRC_DIR/$unit\")"),
+
+    ("i32", "stop stripping quotes, so a quoted path is never checked",
+     INSTALLER,
+     '            token="${token#\\"}"; token="${token%\\"}"',
+     '            :'),
+
+    ("i33", "arm a timer whose service was refused",
+     INSTALLER,
+     '               && ! in_list "$sib" ${installed[@]+"${installed[@]}"}; then',
+     '               && false; then'),
+
+    ("i34", "print a PASS line on a run that had failures",
+     INSTALLER,
+     'if [ ${#failures[@]} -gt 0 ]; then\n    report_and_exit\nfi',
+     ':'),
+
+    ("i35", "use \\\\e escapes bash 3.2 cannot expand",
+     INSTALLER,
+     'GRN="\\033[32m"',
+     'GRN="\\e[32m"'),
 
     ("s1", "REINTRODUCE the heredoc that overwrites the tracked unit file",
      SETUP,
@@ -296,6 +353,13 @@ def main():
     original = {p: read(p) for p in targets}
     original_sha = {p: sha(p) for p in targets}
     stash = tempfile.mkdtemp(prefix="t477mut-")
+    try:
+        return _run(targets, original, original_sha, stash)
+    finally:
+        _restore(targets, original, stash)
+
+
+def _run(targets, original, original_sha, stash):
 
     print("=" * 70)
     print("CONTROL A - clean tree must be GREEN")
@@ -388,6 +452,27 @@ def main():
             print(f"  [{tag}] {label}: {why}")
 
     return 0 if (killed == total and restored) else 1
+
+
+def _restore(targets, original, stash):
+    """Put every mutated file back, whatever happened.
+
+    Without this a battery killed part-way through (^C, a timeout) leaves a
+    mutant applied in the working tree - which is a silent, plausible-looking
+    change to shipping code. Observed 2026-08-01: a 10-minute timeout left
+    setup.sh with its installer call commented out.
+    """
+    for path, text in original.items():
+        try:
+            if sha(path) != hashlib.sha256(text.encode()).hexdigest():
+                write(path, text)
+        except OSError:
+            write(path, text)
+    for name in os.listdir(stash) if os.path.isdir(stash) else []:
+        for path in targets:
+            if os.path.basename(path) == name and not os.path.exists(path):
+                shutil.copyfile(os.path.join(stash, name), path)
+    shutil.rmtree(stash, ignore_errors=True)
 
 
 if __name__ == "__main__":

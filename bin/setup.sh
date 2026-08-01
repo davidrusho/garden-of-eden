@@ -1,4 +1,5 @@
 #!/bin/bash
+# Reviewed: 2026-08-01 against 3e8374c and 92dd3fd (T-477)
 
 # Configuration
 BIN_DIR=$(dirname $(readlink -f $0))
