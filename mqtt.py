@@ -41,6 +41,11 @@ logging.basicConfig(
     force=True,
 )
 
+# NOTE: the light module raises its OWN logger to INFO at import (see
+# app/sensors/light/light.py). It is deliberately not done here: this file
+# cannot be imported without paho/gpiozero/pigpio, so a policy set here is
+# unreachable from the test suite, and the root WARNING above would otherwise
+# discard every light command before it reaches a handler.
 logger = logging.getLogger(__name__)
 
 # Retained availability topic backing every entity's availability_config.

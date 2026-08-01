@@ -4,6 +4,33 @@ from gpiozero.pins.pigpio import PiGPIOFactory
 import pigpio
 import logging
 
+# A module logger, not the root one. Every call below used to log through the
+# bare `logging.info(...)` root shim, and mqtt.py pins the root at WARNING - so
+# no light command has ever reached a handler, legitimate or otherwise. When an
+# unexplained 50% assert hit the grow light at 20:08 on 2026-07-31 (real, not a
+# reporting glitch: the Zigbee plug metered 55W for 28s), there was nothing to
+# attribute it with, and the same silence covers every correct command too.
+logger = logging.getLogger(__name__)
+
+# Module-owned policy, set at import so it cannot be lost to import ordering.
+#
+# It lives HERE rather than in mqtt.py because mqtt.py cannot be imported
+# without paho/gpiozero/pigpio - a level set there is untestable, and an
+# untested control on an appliance whose failures are silent is the exact
+# pattern this codebase keeps getting bitten by.
+#
+# Scoped to this module on purpose. A blanket INFO would also enable the
+# per-cycle read path and the camera chatter, writing continuously to an SD
+# card that is the single copy of this deployment; get_duty_cycle() below is
+# demoted to debug for the same reason.
+#
+# This works despite the root sitting at WARNING because Logger.callHandlers
+# walks the ancestor chain and consults each HANDLER's level - never the
+# ancestor LOGGER's. Measured with controls, not assumed; see
+# tests/test_light_logging.py, which fails if either half regresses.
+logger.setLevel(logging.INFO)
+
+
 class GPIOController:
     def __init__(self, pin, pin_factory=None):
         self.pin = pin
@@ -37,17 +64,17 @@ class Light:
         Turn on lights.
         """
         if self.led.value > 0:
-            logging.info("Light already on, skipping")
+            logger.info("Light already on, skipping")
             return
 
-        logging.info("Turning light on")
+        logger.info("Turning light on")
         self.led.value = 1
 
     def off(self):
         """
         Turn off lights.
         """
-        logging.info("Turning light off")
+        logger.info("Turning light off")
         self.led.value = 0
     
     def set_brightness(self, brightness_percentage):
@@ -69,7 +96,7 @@ class Light:
         return self.get_duty_cycle()
 
     def set_frequency(self, frequency):
-        logging.info(f"Setting light frequency to {frequency}")
+        logger.info(f"Setting light frequency to {frequency}")
         self.gpio.set_frequency(frequency)
     
     def set_duty_cycle(self, duty_cycle_percentage):
@@ -82,7 +109,7 @@ class Light:
         if 0 <= duty_cycle_percentage <= 100:
             # gpiozero's PWMLED uses a 0-1 scale for duty cycle
             duty = duty_cycle_percentage / 100.0
-            logging.info(f"Setting light duty_cycle to {duty_cycle_percentage}%")
+            logger.info(f"Setting light duty_cycle to {duty_cycle_percentage}%")
             self.led.value = duty
         else:
             raise ValueError("Speed must be between 0 and 100")
@@ -95,7 +122,7 @@ class Light:
         - float: The current duty cycle percentage.
         """
         duty_cycle = self.led.value * 100
-        logging.info(f"Light duty_cycle is {duty_cycle}%")
+        logger.debug(f"Light duty_cycle is {duty_cycle}%")
         return duty_cycle
 
     def close(self):
@@ -122,4 +149,4 @@ if __name__ == '__main__':
         light.on()
         light.set_brightness(args.brightness)
     else:
-        logging.info("No action specified. Use --on, --off, or --brightness.")
+        logger.info("No action specified. Use --on, --off, or --brightness.")
