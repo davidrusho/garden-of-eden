@@ -21,10 +21,12 @@
   "Unattended-Upgrade::Automatic-Reboot": "false",
   "Unattended-Upgrade::InstallOnShutdown": null,
   "Unattended-Upgrade::MinimalSteps": null,
+  "Unattended-Upgrade::OnlyOnACPower": null,
   "Unattended-Upgrade::Package-Whitelist-Strict": null,
   "Unattended-Upgrade::Remove-New-Unused-Dependencies": null,
   "Unattended-Upgrade::Remove-Unused-Dependencies": "false",
   "Unattended-Upgrade::Remove-Unused-Kernel-Packages": "false",
+  "Unattended-Upgrade::Skip-Updates-On-Metered-Connections": null,
   "Unattended-Upgrade::SyslogEnable": "true",
   "Unattended-Upgrades::MinimalSteps": null
  },
@@ -769,8 +771,11 @@
  ],
  "legacy_allowed_origins": [],
  "timers": {
+  "apt-daily-upgrade.service": "static",
   "apt-daily-upgrade.timer": "enabled",
+  "apt-daily.service": "static",
   "apt-daily.timer": "enabled"
  },
+ "update_days": [],
  "whitelist": []
 }

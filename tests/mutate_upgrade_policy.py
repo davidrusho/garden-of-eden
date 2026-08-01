@@ -58,6 +58,13 @@ def load_checker():
     hyphen, and the module deliberately keeps `import apt` inside
     collect_state() so this works off-host."""
     import importlib.util
+    # Inert, for the same reason the checker's own load_vendor is: without
+    # this, running the battery exactly as its docstring documents
+    # (`python3 tests/mutate_upgrade_policy.py`, no -B) writes bin/__pycache__
+    # into the working tree. A harness that mutates files must not also leave
+    # bytecode next to them - that is the stale-cache trap it exists to avoid,
+    # aimed at the repo instead of the temp copy.
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location(
         "gardyn_check_upgrade_policy", REPO / SRC)
     if spec is None or spec.loader is None:  # pragma: no cover
@@ -67,24 +74,42 @@ def load_checker():
     return module
 
 
+def purge_caches(root):
+    for cached in pathlib.Path(root).rglob("__pycache__"):
+        shutil.rmtree(cached, ignore_errors=True)
+
+
 def load_base_state():
     """The live capture, plus the one policy line it is still missing.
 
     tests/fixtures/gardyn-upgrade-policy.json is a verbatim `--dump-state`
     capture from the Gardyn Pi. It is deliberately NOT edited, so it keeps
-    recording that the deployed config leaves
-    Unattended-Upgrade::Remove-New-Unused-Dependencies unset - which resolves
-    to u-u's own default of True, so the autoremove path runs on every run and
-    honours neither Package-Blacklist nor `apt-mark hold`. The base state used
-    for mutation is the capture with that one line applied, i.e. the policy as
-    it is meant to be once the fix is deployed. `test_upgrade_policy.py` asserts
-    both halves of that: the raw capture reports exactly that one failure, and
-    the corrected base reports none.
+    recording the three keys the deployed config still leaves unset, every one
+    of which resolves to a u-u default that works against this host:
+
+      Remove-New-Unused-Dependencies  default True  -> autoremove runs
+      OnlyOnACPower                   default True  -> a battery reading stops it
+      Skip-Updates-On-Metered-Connections default True -> a metered link stops it
+
+    The base state used for mutation is the capture with those three applied,
+    i.e. the policy as it is meant to be once the fix is deployed.
+    `test_upgrade_policy.py` asserts both halves: the raw capture reports
+    exactly those three failures, and the corrected base reports none.
     """
     raw = json.loads(FIXTURE.read_text())
     base = copy.deepcopy(raw)
-    base["conf"]["Unattended-Upgrade::Remove-New-Unused-Dependencies"] = "false"
+    for key in PENDING_CONFIG_FIXES:
+        base["conf"][key] = "false"
     return raw, base
+
+
+#: The keys the deployed config is missing. Named once so the battery, the
+#: suite and the docstring above cannot drift apart.
+PENDING_CONFIG_FIXES = (
+    "Unattended-Upgrade::Remove-New-Unused-Dependencies",
+    "Unattended-Upgrade::OnlyOnACPower",
+    "Unattended-Upgrade::Skip-Updates-On-Metered-Connections",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +312,51 @@ CONFIG_MUTANTS = [
     ("Allow-downgrade on",
      _set("Unattended-Upgrade::Allow-downgrade", "on"), "Allow-downgrade off"),
 
+    # --- review findings. Each of these produced a GREEN report before the
+    # fix, on a policy under which u-u upgrades nothing or upgrades wrongly.
+    ("matcher key capitalised (u-u compares case-sensitively)",
+     _patterns("Origin=Raspbian,Codename=bookworm,Label=Raspbian",
+               "Origin=Raspberry Pi Foundation,Codename=bookworm"),
+     "entry parses"),
+    ("codename given twice (u-u ANDs, so it matches neither)",
+     _patterns("origin=Raspbian,codename=trixie,codename=bookworm,label=Raspbian",
+               "origin=Raspberry Pi Foundation,codename=bookworm"),
+     "entry parses"),
+    ("a wildcard hidden behind a repeated key",
+     _patterns("origin=*,origin=Raspbian,codename=bookworm,label=Raspbian",
+               "origin=Raspberry Pi Foundation,codename=bookworm"),
+     "entry parses"),
+    ("alias collision: a= and suite= both given",
+     _patterns("origin=Raspbian,a=oldstable,suite=stable,codename=bookworm,"
+               "label=Raspbian",
+               "origin=Raspberry Pi Foundation,codename=bookworm"),
+     "entry parses"),
+    # apt's StringToBool takes strtol(base 0) first, so these are booleans to
+    # apt and were unrecognised words to the old checker - which resolved them
+    # to the vendor default, and the vendor default is the required value.
+    ("Automatic-Reboot on, spelled as hex",
+     _set("Unattended-Upgrade::Automatic-Reboot", "0x1"), "Automatic-Reboot off"),
+    ("InstallOnShutdown on, spelled with a leading zero",
+     _set("Unattended-Upgrade::InstallOnShutdown", "01"),
+     "InstallOnShutdown off"),
+    ("Package-Whitelist-Strict on, spelled with a plus",
+     _set("Unattended-Upgrade::Package-Whitelist-Strict", "+1"),
+     "Package-Whitelist-Strict off"),
+    # The gates that make a run exit as a SUCCESS having done nothing.
+    ("Update-Days restricts u-u to one day a week",
+     lambda s: s.__setitem__("update_days", ["Sun"]), "Update-Days"),
+    ("OnlyOnACPower left at u-u's default (True)",
+     _drop("Unattended-Upgrade::OnlyOnACPower"), "OnlyOnACPower off"),
+    ("Skip-Updates-On-Metered-Connections left at u-u's default (True)",
+     _drop("Unattended-Upgrade::Skip-Updates-On-Metered-Connections"),
+     "Skip-Updates-On-Metered"),
+    ("apt-daily-upgrade.service masked (the timer still reads enabled)",
+     lambda s: s["timers"].__setitem__("apt-daily-upgrade.service", "masked"),
+     "apt-daily-upgrade.service is not masked"),
+    ("apt-daily.service masked",
+     lambda s: s["timers"].__setitem__("apt-daily.service", "masked"),
+     "apt-daily.service is not masked"),
+
     # --- CONTROL C: mutations that must change nothing. If either of these is
     # reported as caught, the scorer is broken and no verdict above is
     # trustworthy.
@@ -325,7 +395,7 @@ CODE_MUTANTS = [
      "        return sorted(sorted({'origin': d.get('origin')}.items())\n"
      "                      for d in dicts)"),
     ("APT::Periodic::Enable no longer consulted", SRC,
-     '                 conf("APT::Periodic::Enable", "1") != "0", True)',
+     '                 conf("APT::Periodic::Enable") != "0", True)',
      "                 True, True)"),
     ("timer states accepted unconditionally", SRC,
      "                     state_word in RUNNING_TIMER_STATES, True)",
@@ -359,10 +429,8 @@ CODE_MUTANTS = [
      '                % (token.replace("%2C", ","), len(parts) - 1))',
      "        if len(parts) != 2:\n            continue"),
     ("parse_pattern accepts a matcher u-u does not know", SRC,
-     "        if key not in KNOWN_KEYS:\n"
-     "            raise PatternError(\n"
-     '                "unknown matcher %r (u-u raises UnknownMatcherError)" % key)',
-     "        if key not in KNOWN_KEYS:\n            pass"),
+     "        if key not in KNOWN_KEYS:\n            raise PatternError(",
+     "        if False:\n            raise PatternError("),
     ("blacklist regexes no longer compiled", SRC,
      "        try:\n            re.compile(entry)\n"
      "        except re.error as exc:\n"
@@ -371,8 +439,8 @@ CODE_MUTANTS = [
      "        except re.error as exc:\n"
      '            report.fail("blacklist pattern compiles: %r" % entry, str(exc))'),
     ("apt_bool ignores the vendor default for an unknown word", SRC,
-     "    if token in _APT_FALSE:\n        return False\n    return default",
-     "    if token in _APT_FALSE:\n        return False\n    return False"),
+     "    if lowered in _APT_FALSE:\n        return False\n    return default",
+     "    if lowered in _APT_FALSE:\n        return False\n    return False"),
     ("Remove-New-Unused-Dependencies default flipped to the safe-looking one", SRC,
      '    ("Unattended-Upgrade::Remove-New-Unused-Dependencies", True, False,',
      '    ("Unattended-Upgrade::Remove-New-Unused-Dependencies", False, False,'),
@@ -403,8 +471,73 @@ CODE_MUTANTS = [
      '        for name in report.failures:\n            print("  - %s" % name)\n'
      "        return 0"),
     ("--state silently checks nothing", SRC,
-     "        report = run_checks(state)\n    else:",
-     "        report = Report()\n    else:"),
+     "            report = run_checks(state)\n        else:",
+     "            report = Report()\n        else:"),
+
+    # --- the review findings, each mutated back to the form that was green
+    ("matcher key lowercased again (u-u is case-sensitive)", SRC,
+     "        key, value = [p.strip().replace(\"%2C\", \",\") for p in parts]\n"
+     "        if key not in KNOWN_KEYS:",
+     "        key, value = [p.strip().replace(\"%2C\", \",\") for p in parts]\n"
+     "        key = key.lower()\n        if key not in KNOWN_KEYS:"),
+    ("a repeated matcher key silently overrides again", SRC,
+     "        if canonical in out:\n            raise PatternError(",
+     "        if False:\n            raise PatternError("),
+    ("apt_bool loses the strtol path", SRC,
+     "    parsed = _strtol_base0(raw)\n    if parsed in (0, 1):\n"
+     "        return bool(parsed)",
+     "    parsed = None\n    if parsed in (0, 1):\n        return bool(parsed)"),
+    ("apt_bool strips before comparing words (apt does not)", SRC,
+     "    lowered = raw.lower()", "    lowered = raw.strip().lower()"),
+    ("strtol accepts a partially-converted string", SRC,
+     '_DIGITS = {8: re.compile(r"[0-7]+\\Z"), 10: re.compile(r"[0-9]+\\Z"),\n'
+     '           16: re.compile(r"[0-9a-fA-F]+\\Z")}',
+     '_DIGITS = {8: re.compile(r"[0-7]+"), 10: re.compile(r"[0-9]+"),\n'
+     '           16: re.compile(r"[0-9a-fA-F]+")}'),
+    ("Update-Days no longer checked", SRC,
+     "                 list(state.update_days), [])", "                 [], [])"),
+    ("masked services tolerated", SRC,
+     "                     state.timers.get(unit, \"\") != \"masked\", True)",
+     "                     True, True)"),
+    ("section 5 stops asserting the reference matcher agrees", SRC,
+     '    report.check("reference_is_allowed_origin agrees with u-u on every index",\n'
+     "                 sweep(\"index matcher\", reference_is_allowed_origin,\n"
+     "                       vendor_origin, state.index_origins,\n"
+     "                       lambda o: \"%s/%s\" % (o.origin, o.component),\n"
+     "                       state.allowed_origins),\n"
+     "                 [])",
+     '    report.check("reference_is_allowed_origin agrees with u-u on every index",\n'
+     "                 [], [])"),
+    ("section 5 stops asserting the blacklist double agrees", SRC,
+     "                 sweep(\"blacklist matcher\", reference_is_pkgname_in_blacklist,\n"
+     "                       vendor_blacklist, state.installed, lambda n: n,\n"
+     "                       state.blacklist),\n"
+     "                 [])",
+     "                 [], [])"),
+    ("the local-origin short-circuit loses its label and site test", SRC,
+     '    if (origin.component == "now" and origin.archive == "now"\n'
+     "            and not origin.label and not origin.site):",
+     '    if origin.component == "now" and origin.archive == "now":'),
+    ("blacklist double uses re.search instead of re.match", SRC,
+     "    return any(re.match(expr, pkgname) for expr in blacklist)",
+     "    return any(re.search(expr, pkgname) for expr in blacklist)"),
+    ("reference_or treats a raising pattern as a match", SRC,
+     "    except Exception:                                  # noqa: BLE001\n"
+     "        return False",
+     "    except Exception:                                  # noqa: BLE001\n"
+     "        return True"),
+    ("state no longer round-trips deterministically", SRC,
+     "        return json.dumps(asdict(self), indent=1, sort_keys=True)",
+     "        return json.dumps(asdict(self), indent=1)"),
+    ("a crashing run reports nothing", SRC,
+     '        report.fail("the check run itself completed",\n'
+     '                    "%s: %s" % (type(exc).__name__, exc))',
+     "        pass"),
+    ("--dump-state prints the report onto the fixture it is writing", SRC,
+     "    if args.dump_state and not args.state:\n"
+     "        print(collect_state(load_vendor()).to_json())\n        return 0",
+     "    if False:\n"
+     "        print(collect_state(load_vendor()).to_json())\n        return 0"),
 ]
 
 
@@ -433,8 +566,7 @@ def run_suite(root):
     stderr is merged, not discarded: unittest reports there, and a harness that
     greps a blanked stream scores every mutant caught.
     """
-    for cached in root.rglob("__pycache__"):
-        shutil.rmtree(cached, ignore_errors=True)
+    purge_caches(root)
     env = {"PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/bin:/bin",
            "HOME": str(root)}
     proc = subprocess.run(
@@ -570,17 +702,26 @@ def main():
             else:
                 print("  killed    %s" % name)
 
-        # The tree must be byte-identical to where it started.
-        drift = [str(p.relative_to(root)) for p in sorted(root.rglob("*"))
-                 if p.is_file() and "__pycache__" not in p.parts
-                 and (not (pristine / p.relative_to(root)).is_file()
-                      or p.read_bytes()
-                      != (pristine / p.relative_to(root)).read_bytes())]
+        # The tree must be byte-identical to where it started. Compared as a
+        # set in BOTH directions - a one-way walk of `root` can see a changed
+        # or added file but is structurally blind to a file that was DELETED,
+        # which is the restoration failure a mutation harness is most likely
+        # to produce.
+        def manifest(base):
+            base = pathlib.Path(base)
+            return {str(p.relative_to(base)): p.read_bytes()
+                    for p in base.rglob("*")
+                    if p.is_file() and "__pycache__" not in p.parts}
+
+        after, before = manifest(root), manifest(pristine)
+        drift = sorted(set(before) ^ set(after))
+        drift += sorted(k for k in set(before) & set(after)
+                        if before[k] != after[k])
         if drift:
-            print("\nTREE NOT RESTORED - these files differ from pristine: %s"
-                  % drift)
+            print("\nTREE NOT RESTORED - added, removed or changed: %s" % drift)
             return 2
-        print("  tree restored byte-identical")
+        print("  tree restored byte-identical (%d files, compared both ways)"
+              % len(after))
 
     print()
     if bad:

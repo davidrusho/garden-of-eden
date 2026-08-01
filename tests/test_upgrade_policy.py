@@ -20,7 +20,9 @@ The companion battery, tests/mutate_upgrade_policy.py, proves this suite can
 fail - both by mutating the policy and by mutating the checker.
 """
 import copy
+import json
 import unittest
+from unittest import mock
 
 from tests import mutate_upgrade_policy as battery
 
@@ -48,14 +50,16 @@ class TestPolicyControls(unittest.TestCase):
         # other test asserts that a MUTATION turns a green baseline red.
         self.assertEqual(failures(copy.deepcopy(BASE)), [])
 
-    def test_the_raw_live_capture_reports_the_one_outstanding_defect(self):
+    def test_the_raw_live_capture_reports_the_outstanding_defects(self):
         # The fixture is a verbatim capture and is deliberately not edited.
-        # The deployed config still leaves Remove-New-Unused-Dependencies
-        # unset, which resolves to u-u's default of True. Delete this test when
-        # the config line ships - and update the fixture in the same commit.
+        # Three keys are still unset on the deployed config, each resolving to
+        # a u-u default that works against this host. Narrow this test as each
+        # one ships, and re-capture the fixture in the same commit.
         got = failures(copy.deepcopy(RAW_CAPTURE))
-        self.assertEqual(len(got), 1, got)
-        self.assertIn("Remove-New-Unused-Dependencies", got[0])
+        self.assertEqual(len(got), len(battery.PENDING_CONFIG_FIXES), got)
+        for key in battery.PENDING_CONFIG_FIXES:
+            leaf = key.split("::")[-1]
+            self.assertTrue(any(leaf in f for f in got), leaf)
 
     def test_a_check_that_cannot_fail_would_be_caught(self):
         # The negative control on the Report itself: a failing check must land
@@ -117,9 +121,16 @@ class TestReleasePin(unittest.TestCase):
 
 
 class TestAutoremovePath(unittest.TestCase):
-    """F2: do_auto_remove() calls mark_delete() directly, so neither
-    Package-Blacklist nor `apt-mark hold` protects a package from REMOVAL. The
-    key that governs it defaults to True and was never checked."""
+    """F2: the key governing the autoremove path defaults to True and was
+    never checked, so this host - having switched the OTHER autoremove off -
+    silently has this one on.
+
+    The ticket claimed the blacklist and `apt-mark hold` do not apply to
+    removals. That is false: do_auto_remove() calls is_autoremove_valid()
+    (:1873, :1891), which walks the change set through is_pkg_change_allowed()
+    (:1811) and tests both. The key still has to be off on narrower grounds -
+    the protection aborts a whole step rather than filtering it, and it does
+    nothing for packages this host has not frozen."""
 
     def test_absent_key_resolves_to_the_vendor_default_and_fails(self):
         got = mutated(battery._drop(
@@ -235,8 +246,7 @@ class TestAptBool(unittest.TestCase):
     ANYTHING else silently returns the caller's default."""
 
     def test_true_words(self):
-        for word in ("yes", "true", "with", "on", "enable", "1",
-                     "TRUE", " True "):
+        for word in ("yes", "true", "with", "on", "enable", "1", "TRUE"):
             self.assertTrue(cup.apt_bool(word, False), word)
 
     def test_false_words(self):
@@ -244,9 +254,24 @@ class TestAptBool(unittest.TestCase):
             self.assertFalse(cup.apt_bool(word, True), word)
 
     def test_unrecognised_value_falls_back_to_the_default(self):
-        for word in ("2", "-1", "bogus", ""):
+        # Including the shapes strtol REJECTS: it stops at trailing space and
+        # apt then requires the whole string to have converted, and the word
+        # compare is against the raw string with no stripping.
+        for word in ("2", "-1", "bogus", "", "1 ", "true ", " true", "1.0",
+                     "0b1", "07", "08"):
             self.assertTrue(cup.apt_bool(word, True), word)
             self.assertFalse(cup.apt_bool(word, False), word)
+
+    def test_strtol_shapes_apt_does_accept(self):
+        # Measured against apt_pkg.config.find_b on the host. Every one of
+        # these is a boolean to apt; treating them as unrecognised resolves
+        # them to the vendor default, which for six of the checks IS the
+        # required value - a guaranteed PASS on a config that does the
+        # opposite of what it says.
+        for word in ("01", "0x1", "0X1", "+1", " 1"):
+            self.assertTrue(cup.apt_bool(word, False), word)
+        for word in ("-0", "0x0", "00", "+0", "  0  ".rstrip()):
+            self.assertFalse(cup.apt_bool(word, True), word)
 
     def test_absent_key_uses_the_default(self):
         self.assertTrue(cup.apt_bool(None, True))
@@ -309,6 +334,16 @@ class TestReferenceMatchers(unittest.TestCase):
         local = cup.Origin(component="now", archive="now")
         self.assertTrue(cup.reference_is_allowed_origin(local, []))
 
+    def test_the_local_short_circuit_also_requires_no_label_and_no_site(self):
+        # All four conditions are load-bearing in the vendor. Testing only the
+        # already-empty case cannot tell the four-part test from a two-part
+        # one, so a repo presenting archive=now/component=now WITH a label
+        # would be allowed here and rejected by u-u.
+        self.assertFalse(cup.reference_is_allowed_origin(
+            cup.Origin(component="now", archive="now", label="Sneaky"), []))
+        self.assertFalse(cup.reference_is_allowed_origin(
+            cup.Origin(component="now", archive="now", site="evil.example"), []))
+
     def test_blacklist_is_a_regex_match_not_a_substring(self):
         self.assertTrue(cup.reference_is_pkgname_in_blacklist(
             "linux-image-6.12", ["linux-image-.*"]))
@@ -318,6 +353,32 @@ class TestReferenceMatchers(unittest.TestCase):
             "rpi-eeprom-update", ["rpi-eeprom"]))
         self.assertFalse(cup.reference_is_pkgname_in_blacklist(
             "rpi-eeprom-update", ["rpi-eeprom$"]))
+
+    def test_the_match_is_anchored_at_the_start_unlike_search(self):
+        # The case above cannot separate re.match from re.search, because
+        # re.search("rpi-eeprom$", "rpi-eeprom-update") is also None. This one
+        # can: the vendor uses re.match, so a pattern matching mid-string does
+        # not block.
+        self.assertFalse(cup.reference_is_pkgname_in_blacklist(
+            "rpi-eeprom", ["eeprom"]))
+        self.assertTrue(cup.reference_is_pkgname_in_blacklist(
+            "rpi-eeprom", ["rpi-"]))
+
+    def test_a_later_invalid_regex_is_not_reached_after_a_match(self):
+        # The vendor's loop returns on the first match, so an invalid pattern
+        # further down never compiles. The double must short-circuit the same
+        # way or it raises where u-u does not.
+        self.assertTrue(cup.reference_is_pkgname_in_blacklist(
+            "linux-image-6.12", ["linux-image-.*", "*-broken"]))
+
+    def test_reference_or_treats_a_raising_pattern_as_no_match(self):
+        # The two-sided set comparison must not silently gain a package
+        # because one pattern is malformed; the compile check reports that
+        # separately.
+        self.assertFalse(cup.reference_or(
+            cup.reference_is_pkgname_in_blacklist, "openssl", ["*-broken"]))
+        self.assertTrue(cup.reference_or(
+            cup.reference_is_pkgname_in_blacklist, "openssl", ["open.*"]))
 
 
 class TestMatcherCrashesBecomeFailures(unittest.TestCase):
@@ -368,6 +429,91 @@ class TestMatcherCrashesBecomeFailures(unittest.TestCase):
         self.assertIn("nothing to repeat", report.text())
 
 
+class TestMatchersAgreeSection(unittest.TestCase):
+    """Section 5 runs only on the live host, which is why it had no tests and
+    no mutants - and it is the check that justifies the doubles existing at
+    all. It is a pure function of (state, report, two callables), so "needs
+    apt" was never a reason: stubs are enough."""
+
+    def _run(self, vendor_origin, vendor_blacklist):
+        report = cup.Report()
+        cup.check_matchers_agree(cup.PolicyState.from_dict(copy.deepcopy(BASE)),
+                                 report, vendor_origin, vendor_blacklist)
+        return report
+
+    def test_agreeing_vendor_produces_no_failures(self):
+        report = self._run(cup.reference_is_allowed_origin,
+                           cup.reference_is_pkgname_in_blacklist)
+        self.assertEqual(report.failures, [])
+
+    def test_a_disagreeing_origin_matcher_is_caught(self):
+        report = self._run(lambda o, a: not cup.reference_is_allowed_origin(o, a),
+                           cup.reference_is_pkgname_in_blacklist)
+        self.assertTrue(any("reference_is_allowed_origin" in f
+                            for f in report.failures), report.failures)
+
+    def test_a_disagreeing_blacklist_matcher_is_caught(self):
+        report = self._run(cup.reference_is_allowed_origin,
+                           lambda n, b: not cup.reference_is_pkgname_in_blacklist(n, b))
+        self.assertTrue(any("reference_is_pkgname_in_blacklist" in f
+                            for f in report.failures), report.failures)
+
+    def test_a_raising_vendor_matcher_is_reported_not_propagated(self):
+        # The defect this section had: an unguarded raise escaped main()
+        # BEFORE the report was printed, so a malformed Origins-Pattern
+        # produced a traceback and not one [FAIL] line.
+        def boom(*_args):
+            raise ValueError("vendor exploded")
+        report = self._run(boom, cup.reference_is_pkgname_in_blacklist)
+        self.assertTrue(any("raised on" in f for f in report.failures),
+                        report.failures)
+        self.assertIn("ValueError: vendor exploded", report.text())
+
+    def test_a_malformed_pattern_does_not_escape_the_section(self):
+        state = copy.deepcopy(BASE)
+        battery._patterns("origin=Raspbian,arch=armhf")(state)
+        report = cup.Report()
+        cup.check_matchers_agree(cup.PolicyState.from_dict(state), report,
+                                 cup.reference_is_allowed_origin,
+                                 cup.reference_is_pkgname_in_blacklist)
+        self.assertTrue(report.failures)
+
+    def test_one_raise_does_not_produce_a_row_per_package(self):
+        # 650 identical FAIL rows bury a report as effectively as a traceback.
+        def boom(*_args):
+            raise ValueError("x")
+        report = self._run(cup.reference_is_allowed_origin, boom)
+        self.assertLess(len(report.failures), 5, report.failures)
+
+
+class TestStateRoundTrip(unittest.TestCase):
+    def test_json_round_trip_is_lossless_and_stable(self):
+        # The fixture is ground truth for every other test here, and it is
+        # produced by this method.
+        state = cup.PolicyState.from_dict(copy.deepcopy(BASE))
+        again = cup.PolicyState.from_dict(json.loads(state.to_json()))
+        self.assertEqual(state, again)
+        self.assertEqual(state.to_json(), again.to_json())
+
+    def test_key_order_is_deterministic(self):
+        # Shuffling the TOP level proves nothing - asdict() emits dataclass
+        # fields in declaration order whatever the input dict looked like. The
+        # keys that actually move are the nested ones (`conf`, `timers`),
+        # which come from apt in whatever order it hands them over, and those
+        # are the ones sort_keys pins so a re-captured fixture diffs cleanly.
+        import random
+        shuffled = copy.deepcopy(BASE)
+        for nested in ("conf", "timers"):
+            items = list(shuffled[nested].items())
+            random.shuffle(items)
+            shuffled[nested] = dict(items)
+        self.assertNotEqual(list(shuffled["conf"]), list(BASE["conf"]),
+                            "shuffle was a no-op; this test proves nothing")
+        a = cup.PolicyState.from_dict(copy.deepcopy(BASE)).to_json()
+        b = cup.PolicyState.from_dict(shuffled).to_json()
+        self.assertEqual(a, b)
+
+
 class TestCommandLine(unittest.TestCase):
     """The --state seam, which is what makes a captured policy checkable at
     all. Nothing else here drives main(), so an exit code that stopped
@@ -380,7 +526,8 @@ class TestCommandLine(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             rc = cup.main(["--state", str(battery.FIXTURE)])
         self.assertEqual(rc, 1)
-        self.assertIn("RESULT: 1 FAILURE(S)", out.getvalue())
+        self.assertIn("RESULT: %d FAILURE(S)" % len(battery.PENDING_CONFIG_FIXES),
+                      out.getvalue())
         self.assertIn("Remove-New-Unused-Dependencies", out.getvalue())
 
     def test_a_compliant_state_file_exits_zero(self):
@@ -396,6 +543,59 @@ class TestCommandLine(unittest.TestCase):
                 rc = cup.main(["--state", handle.name])
         self.assertEqual(rc, 0)
         self.assertIn("all checks passed", out.getvalue())
+
+
+class TestCrashHandling(unittest.TestCase):
+    """A run that dies must still print what it had and exit non-zero. The
+    original defect this whole script exists for is a process that reports
+    success while doing nothing; a process that reports NOTHING while dying is
+    the same failure wearing a different hat, and it is what an unguarded
+    matcher used to produce."""
+
+    def _main(self, argv):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cup.main(argv)
+        return rc, out.getvalue()
+
+    def test_an_unreadable_state_file_is_reported_not_raised(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            handle.write("{not json")
+            handle.flush()
+            rc, text = self._main(["--state", handle.name])
+        self.assertEqual(rc, 1)
+        self.assertIn("the check run itself completed", text)
+        self.assertIn("RESULT:", text)
+
+    def test_a_missing_state_file_is_reported_not_raised(self):
+        rc, text = self._main(["--state", "/nonexistent/nope.json"])
+        self.assertEqual(rc, 1)
+        self.assertIn("FileNotFoundError", text)
+
+
+class TestDumpState(unittest.TestCase):
+    """`--dump-state` writes the fixture every other test here is built on, so
+    its stdout has to be JSON and nothing else."""
+
+    def test_dump_state_emits_only_json(self):
+        import contextlib
+        import io
+        state = cup.PolicyState.from_dict(copy.deepcopy(BASE))
+        with mock.patch.object(cup, "load_vendor", lambda *a, **k: object()), \
+                mock.patch.object(cup, "collect_state", lambda _uu: state):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cup.main(["--dump-state"])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertNotIn("[PASS]", text)
+        self.assertNotIn("RESULT:", text)
+        # Round-trips, and carries no trailing report text.
+        self.assertEqual(json.loads(text)["distro_codename"],
+                         BASE["distro_codename"])
 
 
 class TestModuleIsImportableOffHost(unittest.TestCase):

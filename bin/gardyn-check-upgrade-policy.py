@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Reviewed: 2026-07-31 against 65621ff (T-484)
+# Reviewed: 2026-07-31 against 1ad05d6 (T-484)
 """Verify one host's unattended-upgrades policy against unattended-upgrades'
 own matching code.
 
@@ -113,6 +113,13 @@ STOCK_DEBIAN_PATTERNS = [
 REQUIRED_TIMERS = ("apt-daily.timer", "apt-daily-upgrade.timer")
 RUNNING_TIMER_STATES = ("enabled", "enabled-runtime")
 
+#: The services the timers pull in. `systemctl is-enabled` reports these as
+#: "static" when healthy - they have no [Install] section and are started by
+#: their timer - so the question here is only whether one has been masked.
+#: Masking the SERVICE is invisible to an is-enabled check on the TIMER, which
+#: keeps reporting "enabled" while every activation fails.
+REQUIRED_SERVICES = ("apt-daily.service", "apt-daily-upgrade.service")
+
 # ===========================================================================
 # VENDOR FACTS - transcribed from /usr/bin/unattended-upgrade 2.9.1+nmu3 and
 # /usr/lib/apt/apt.systemd.daily. Each carries the line it came from, because a
@@ -133,24 +140,49 @@ BOOL_POLICY = [
      "Remove-Unused-Dependencies off"),
     # Remove-New-Unused-Dependencies: :2406, default TRUE, and it is the `elif`
     # branch that runs precisely BECAUSE Remove-Unused-Dependencies is false.
-    # do_auto_remove() (:1850) calls mark_delete() directly, so
-    # is_pkg_change_allowed() is never reached: neither Package-Blacklist nor
-    # `apt-mark hold` protects a package on the REMOVAL path, only on upgrade.
-    # Left at its default, an automatic run may delete boot-path packages this
-    # host has explicitly frozen against upgrade.
+    # So this host, having switched one autoremove off, silently has the other
+    # one on, and an automatic run reaches do_auto_remove() (:1850) every time.
+    #
+    # NOTE, because the ticket this came from got the mechanism wrong and the
+    # wrong version was quoted in this label: the blacklist and `apt-mark hold`
+    # DO still apply on the removal path. do_auto_remove() calls
+    # is_autoremove_valid() in both branches (:1873, :1891), and that walks the
+    # pending change set through is_pkg_change_allowed() (:1811), which tests
+    # is_pkgname_in_blacklist (:1029) and SELSTATE_HOLD (:1042). A protected
+    # package in the change set aborts that removal step.
+    #
+    # The key still has to be off, on narrower grounds: the protection is
+    # coarse (it aborts a step rather than filtering it), and it does nothing
+    # for the packages this host has NOT frozen. Deleting those unattended, on
+    # a headless machine reached only over Wi-Fi, is the risk.
     ("Unattended-Upgrade::Remove-New-Unused-Dependencies", True, False,
-     "Remove-New-Unused-Dependencies off (u-u default True; autoremove "
-     "honours neither the blacklist nor apt-mark hold)"),
+     "Remove-New-Unused-Dependencies off (u-u default True, so this runs "
+     "unless it is set)"),
     # Allow-downgrade: :1708.
     ("Unattended-Upgrade::Allow-downgrade", False, False, "Allow-downgrade off"),
+    # The two should_stop() gates (:675, :685). Both default TRUE, and both
+    # return from main() having upgraded nothing. Neither is theoretical here:
+    # python3-gi IS installed, so the metered-connection branch is live, and a
+    # headless Wi-Fi-only host whose one link NetworkManager decides is metered
+    # stops every run silently. This is the same shape as the original defect
+    # the script was written for - it runs, it reports success, it does
+    # nothing. powermgmt-base is absent today, so the AC branch raises
+    # FileNotFoundError and is skipped, but installing it arms the gate.
+    ("Unattended-Upgrade::OnlyOnACPower", True, False,
+     "OnlyOnACPower off (u-u default True; a false battery reading stops "
+     "every run)"),
+    ("Unattended-Upgrade::Skip-Updates-On-Metered-Connections", True, False,
+     "Skip-Updates-On-Metered-Connections off (u-u default True; python3-gi "
+     "is installed, so a metered Wi-Fi link stops every run)"),
     # InstallOnShutdown: :2351. Would run dpkg during the deliberate reboots
     # this host's policy describes, unwatched, on an SD card.
     ("Unattended-Upgrade::InstallOnShutdown", False, False,
      "InstallOnShutdown off (dpkg during shutdown is unwatched)"),
-    # MinimalSteps: :2463, default True, ANDed with the misspelled key.
+    # MinimalSteps: :2464, default True, ANDed with the misspelled key below.
     # False makes the upgrade one uninterruptible transaction, which widens the
     # SD-corruption window and defeats the graceful-stop handler.
     ("Unattended-Upgrade::MinimalSteps", True, True, "MinimalSteps on"),
+    # :2463 - the MISSPELLED key, which u-u ANDs with the correct one at :2464.
     ("Unattended-Upgrades::MinimalSteps", True, True,
      "MinimalSteps on (u-u ANDs the misspelled key too)"),
     # SyslogEnable: :1622. No MTA here, so syslog is the only route by which a
@@ -164,22 +196,62 @@ KEY_ALIASES = {"o": "origin", "l": "label", "a": "archive", "suite": "archive",
                "n": "codename", "c": "component", "site": "site"}
 KNOWN_KEYS = frozenset(KEY_ALIASES.values()) | frozenset(KEY_ALIASES)
 
-#: apt's StringToBool: case-insensitive word lists, plus the integers 0 and 1;
-#: ANYTHING else silently returns the caller's default. Verified against
-#: apt_pkg.config.find_b on the host, not read off a doc page.
-_APT_TRUE = frozenset({"yes", "true", "with", "on", "enable", "1"})
-_APT_FALSE = frozenset({"no", "false", "without", "off", "disable", "0"})
+#: apt's StringToBool, in the order apt applies it: strtol(base 0) FIRST,
+#: accepted only if the whole string converts and the result is 0 or 1; then
+#: these case-insensitive word lists against the RAW string; then the caller's
+#: default. Measured against apt_pkg.config.find_b on the host - calling it
+#: twice with opposite defaults, so a value apt merely falls back on is
+#: distinguishable from one it actually recognises.
+_APT_TRUE = frozenset({"yes", "true", "with", "on", "enable"})
+_APT_FALSE = frozenset({"no", "false", "without", "off", "disable"})
+
+_DIGITS = {8: re.compile(r"[0-7]+\Z"), 10: re.compile(r"[0-9]+\Z"),
+           16: re.compile(r"[0-9a-fA-F]+\Z")}
+
+
+def _strtol_base0(text):
+    # type: (str) -> Optional[int]
+    """C strtol(text, &end, 0), returning None unless the WHOLE string
+    converted - which is the condition apt tests (`*ParseEnd == '\\0'`)."""
+    body = text.lstrip(" \t\n\r\f\v")     # strtol skips leading whitespace...
+    sign = 1
+    if body[:1] in ("+", "-"):
+        sign = -1 if body[0] == "-" else 1
+        body = body[1:]
+    if body[:2].lower() == "0x":
+        digits, base = body[2:], 16
+    elif len(body) > 1 and body[0] == "0":
+        digits, base = body[1:], 8
+    else:
+        digits, base = body, 10
+    # ...but NOT trailing whitespace, so "1 " does not convert while " 1" does.
+    if not _DIGITS[base].match(digits):
+        return None
+    return sign * int(digits, base)
 
 
 def apt_bool(raw, default):
     # type: (Optional[str], bool) -> bool
-    """Resolve an apt.conf scalar the way apt_pkg.config.find_b would."""
+    """Resolve an apt.conf scalar the way apt_pkg.config.find_b would.
+
+    Not a `strip().lower()` against a word list, which is what this used to be
+    and which is wrong in BOTH directions. apt accepts `01`, `0x1`, `+1` and
+    `-0` as booleans (strtol with base 0), and rejects `1 ` and `true ` because
+    strtol stops at the trailing space and the word compare is against the raw
+    string. That asymmetry is not cosmetic here: six of the checks below want
+    the value the vendor default already supplies, so anything this function
+    fails to recognise resolves to a guaranteed PASS - `Automatic-Reboot
+    "0x1"` reboots the host under a green report.
+    """
     if raw is None:
         return default
-    token = raw.strip().lower()
-    if token in _APT_TRUE:
+    parsed = _strtol_base0(raw)
+    if parsed in (0, 1):
+        return bool(parsed)
+    lowered = raw.lower()
+    if lowered in _APT_TRUE:
         return True
-    if token in _APT_FALSE:
+    if lowered in _APT_FALSE:
         return False
     return default
 
@@ -192,11 +264,29 @@ def parse_pattern(pat):
     # type: (str) -> Dict[str, str]
     """Token-parse one Origins-Pattern entry the way u-u's matcher reads it.
 
-    Deliberately as strict as match_whitelist_string() (:804-861): u-u raises
-    on a token with no `=` and on a token with two, and raises
-    UnknownMatcherError on a key it does not know. The previous version of this
-    function skipped all three, which is a parser/vendor disagreement in the
-    worst direction - the checker calls a config fine that u-u dies on.
+    Tracks match_whitelist_string() (:804-848) on the cases that matter, and
+    the divergences are deliberate and one-directional - this function is
+    stricter, never looser. u-u raises on a token with no `=` and on a token
+    with two, and raises UnknownMatcherError on a key it does not know; an
+    earlier version here skipped all three, which is a parser/vendor
+    disagreement in the worst direction: the checker calls a config fine that
+    u-u dies on.
+
+    Three traps found by review, all of which produced a GREEN report on a
+    config that does not work:
+
+    - The key is compared CASE-SENSITIVELY. `match_whitelist_string` tests
+      `what in ("o", "origin")` against the raw token, so `Origin=Raspbian`
+      raises UnknownMatcherError. Lowercasing here accepted it silently.
+    - A repeated key is NOT a later value overriding an earlier one. u-u does
+      `res = res and match` over every token without short-circuiting, so
+      `codename=trixie,codename=bookworm` requires the codename to fnmatch
+      BOTH and therefore matches nothing, forever. A dict keeps the last and
+      reports an intact release pin. Worse with `origin=*,origin=Raspbian`,
+      where the dropped token is the wildcard the next check looks for.
+    - An empty pattern is the one place this is stricter than u-u, which logs
+      a warning and returns False. A pattern that can never match is worth a
+      FAIL either way.
     """
     stripped = pat.strip()
     if not stripped:
@@ -212,11 +302,17 @@ def parse_pattern(pat):
                 "token %r has %d '=' (u-u raises ValueError unpacking it)"
                 % (token.replace("%2C", ","), len(parts) - 1))
         key, value = [p.strip().replace("%2C", ",") for p in parts]
-        key = key.lower()
         if key not in KNOWN_KEYS:
             raise PatternError(
-                "unknown matcher %r (u-u raises UnknownMatcherError)" % key)
-        out[KEY_ALIASES.get(key, key)] = value
+                "unknown matcher %r (u-u raises UnknownMatcherError; the "
+                "comparison is case-sensitive)" % key)
+        canonical = KEY_ALIASES.get(key, key)
+        if canonical in out:
+            raise PatternError(
+                "matcher %r given twice (u-u ANDs every token, so the second "
+                "does not override the first - it narrows to their "
+                "intersection)" % canonical)
+        out[canonical] = value
     return out
 
 
@@ -272,6 +368,9 @@ class PolicyState:
     holds: List[str] = field(default_factory=list)
     blacklist: List[str] = field(default_factory=list)
     whitelist: List[str] = field(default_factory=list)
+    #: Unattended-Upgrade::Update-Days. A list, not a scalar, so it cannot
+    #: ride in `conf` with the booleans.
+    update_days: List[str] = field(default_factory=list)
     #: Raw apt.conf scalars. None means the key is ABSENT, which is the case
     #: the vendor defaults exist to resolve.
     conf: Dict[str, Optional[str]] = field(default_factory=dict)
@@ -559,21 +658,27 @@ def reference_or(matcher, name, blacklist):
 def check_runtime(state, report):
     report.section("4. Does it actually run, and stay constrained?")
 
-    def conf(key, default=None):
-        return state.conf.get(key, default)
+    # No per-call default: collect_state writes every CONF_KEY explicitly,
+    # using None for absent, and the vendor defaults live in BOOL_POLICY. A
+    # second set of defaults here would be a second writer of the same fact,
+    # and the ones that were here were dead - every lookup already found the
+    # key present-and-None.
+    def conf(key):
+        return state.conf.get(key)
 
     # apt.systemd.daily reads APT::Periodic::Enable FIRST and exit 0s on "0",
     # before Update-Package-Lists or Unattended-Upgrade are ever consulted. One
     # line disables the whole mechanism and leaves both switches below reading
     # "1", which is how a green report and a machine that never upgrades again
-    # coexist.
+    # coexist. Absent means 1 (`AutoAptEnable=1  # default is yes`), so the
+    # test is against "0" rather than for "1".
     report.check("APT::Periodic::Enable is not 0 (0 makes apt.systemd.daily "
                  "exit before anything runs)",
-                 conf("APT::Periodic::Enable", "1") != "0", True)
+                 conf("APT::Periodic::Enable") != "0", True)
     report.check("APT::Periodic::Update-Package-Lists is on",
-                 conf("APT::Periodic::Update-Package-Lists", "0"), "1")
+                 conf("APT::Periodic::Update-Package-Lists"), "1")
     report.check("APT::Periodic::Unattended-Upgrade is on (master switch)",
-                 conf("APT::Periodic::Unattended-Upgrade", "0"), "1")
+                 conf("APT::Periodic::Unattended-Upgrade"), "1")
 
     # Same class of hole one layer down: apt.conf cannot tell you the timer
     # that invokes apt.systemd.daily has been masked.
@@ -582,6 +687,19 @@ def check_runtime(state, report):
         report.check("%s is enabled (masked or disabled is invisible from "
                      "apt.conf)" % unit,
                      state_word in RUNNING_TIMER_STATES, True)
+    # And one layer below THAT: masking the service leaves the timer enabled.
+    for unit in REQUIRED_SERVICES:
+        report.check("%s is not masked (the timer stays 'enabled' either way)"
+                     % unit,
+                     state.timers.get(unit, "") != "masked", True)
+
+    # is_update_day() (:1927) is the FIRST gate in u-u's main() (:2057) and
+    # returns UnattendedUpgradesResult(True) - a SUCCESS - having done nothing.
+    # `Update-Days { "Sun"; }` is six silent no-op days a week with every other
+    # check green.
+    report.check("no Update-Days restriction (a non-patch day exits as a "
+                 "SUCCESS having upgraded nothing)",
+                 list(state.update_days), [])
 
     # A strict whitelist that matches nothing upgrades nothing, forever. The
     # previous check asserted `not (strict and whitelist_empty)` - but an empty
@@ -602,20 +720,46 @@ def check_runtime(state, report):
 
 def check_matchers_agree(state, report, vendor_origin, vendor_blacklist):
     """Live-only: the reference matchers used by the off-host tests must still
-    agree with the vendor's own, on this host's real corpus."""
+    agree with the vendor's own, on this host's real corpus.
+
+    Every call is guarded per item, for the same reason section 3's are. Both
+    sides raise on exactly the configs sections 1 and 2 exist to report, and
+    an unguarded raise here escaped main() BEFORE the report was printed - so
+    a malformed Origins-Pattern produced a traceback and not one [FAIL] line,
+    which is the defect the guards were added to remove, surviving in the one
+    section they had not reached. Disagreement and "one side raised" are both
+    reported, and they are different rows.
+    """
     report.section("5. Reference matchers still agree with the vendor's")
-    origin_mismatch = [
-        (o.origin, o.component) for o in state.index_origins
-        if reference_is_allowed_origin(o, state.allowed_origins)
-        != vendor_origin(o, state.allowed_origins)]
+
+    def sweep(label, reference, vendor, items, describe, extra):
+        """Compare both matchers over a corpus, reporting the FIRST raise
+        rather than one row per item - a malformed pattern raises for every
+        package on the host, and 600 identical FAIL rows bury the report as
+        effectively as the traceback did."""
+        mismatched = []
+        for item in items:
+            try:
+                if reference(item, extra) != vendor(item, extra):
+                    mismatched.append(describe(item))
+            except Exception as exc:                   # noqa: BLE001
+                report.fail("%s: raised on %s" % (label, describe(item)),
+                            "%s: %s" % (type(exc).__name__, exc))
+                return None
+        return mismatched
+
     report.check("reference_is_allowed_origin agrees with u-u on every index",
-                 origin_mismatch, [])
-    name_mismatch = [
-        n for n in state.installed
-        if reference_is_pkgname_in_blacklist(n, state.blacklist)
-        != vendor_blacklist(n, state.blacklist)]
+                 sweep("index matcher", reference_is_allowed_origin,
+                       vendor_origin, state.index_origins,
+                       lambda o: "%s/%s" % (o.origin, o.component),
+                       state.allowed_origins),
+                 [])
     report.check("reference_is_pkgname_in_blacklist agrees with u-u on every "
-                 "installed package", name_mismatch, [])
+                 "installed package",
+                 sweep("blacklist matcher", reference_is_pkgname_in_blacklist,
+                       vendor_blacklist, state.installed, lambda n: n,
+                       state.blacklist),
+                 [])
     return report
 
 
@@ -704,7 +848,7 @@ def collect_state(uu):
         print("  [WARN] apt-mark showhold failed: %s" % exc, file=sys.stderr)
 
     timers = {}
-    for unit in REQUIRED_TIMERS:
+    for unit in REQUIRED_TIMERS + REQUIRED_SERVICES:
         proc = subprocess.run(["systemctl", "is-enabled", unit],
                               capture_output=True, text=True)
         timers[unit] = proc.stdout.strip()
@@ -731,6 +875,8 @@ def collect_state(uu):
             "Unattended-Upgrade::Package-Blacklist")),
         whitelist=list(apt_pkg.config.value_list(
             "Unattended-Upgrade::Package-Whitelist")),
+        update_days=list(apt_pkg.config.value_list(
+            "Unattended-Upgrade::Update-Days")),
         conf=conf,
         timers=timers,
     )
@@ -744,21 +890,37 @@ def main(argv=None):
                         help="print the collected state as JSON and exit")
     args = parser.parse_args(argv)
 
-    if args.state:
-        with open(args.state) as handle:
-            state = PolicyState.from_dict(json.load(handle))
-        report = run_checks(state)
-    else:
-        uu = load_vendor()
-        state = collect_state(uu)
-        if args.dump_state:
-            print(state.to_json())
-            return 0
-        report = run_checks(state, uu.is_allowed_origin,
-                            uu.is_pkgname_in_blacklist)
-        check_matchers_agree(state, report, uu.is_allowed_origin,
-                             uu.is_pkgname_in_blacklist)
+    # Capture is its own exit path, entirely outside the reporting below - its
+    # stdout is a fixture that gets parsed, so nothing else may be printed on
+    # it. (An earlier arrangement ran the report print in a `finally`, which
+    # appended a blank line to every captured state file.)
+    if args.dump_state and not args.state:
+        print(collect_state(load_vendor()).to_json())
+        return 0
 
+    # Built before anything can raise, and printed unconditionally afterwards.
+    # A check that dies must still leave behind the rows produced up to that
+    # point: printing only on the happy path is how a crash becomes "no [FAIL]
+    # lines at all", which is the failure mode this whole script exists to
+    # remove. No `finally` - the except below is a catch-all, so a `finally`
+    # would be a second mechanism for the same guarantee and neither would be
+    # exercised.
+    report = Report()
+    try:
+        if args.state:
+            with open(args.state) as handle:
+                state = PolicyState.from_dict(json.load(handle))
+            report = run_checks(state)
+        else:
+            uu = load_vendor()
+            state = collect_state(uu)
+            report = run_checks(state, uu.is_allowed_origin,
+                                uu.is_pkgname_in_blacklist)
+            check_matchers_agree(state, report, uu.is_allowed_origin,
+                                 uu.is_pkgname_in_blacklist)
+    except Exception as exc:                           # noqa: BLE001
+        report.fail("the check run itself completed",
+                    "%s: %s" % (type(exc).__name__, exc))
     print(report.text())
     print()
     if report.failures:
