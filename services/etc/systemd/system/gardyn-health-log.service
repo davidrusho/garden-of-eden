@@ -20,8 +20,18 @@ SyslogIdentifier=gardyn-health
 # the script reports `kuma_push=skipped_no_url` and Kuma's own interval turns
 # the resulting silence into a DOWN, which is the honest outcome anyway.
 #
-# Deploy as root:root 0640 with the `gardyn` group, or the unprivileged
-# ExecStart cannot read it and the push silently never happens.
+# Deployed 0640 root:gardyn. systemd reads EnvironmentFile= as root before
+# dropping to User=, so 0600 root:root should also work; 0640 is the belt to
+# that braces and costs nothing, since `gardyn` is the only non-root account.
+#
+# THE CONSUMING MONITOR'S INTERVAL IS PART OF THIS DESIGN and lives only in
+# Kuma's database, where nothing in this repo can assert it. Uptime Kuma
+# monitor 27 `service-gardyn-netwatch`, interval 900s, resend_interval 4.
+# It MUST stay above ~310s (this timer's 300s period + AccuracySec=10s + run
+# time) or a normal cycle reads as a missed heartbeat and the monitor flaps.
+# 900s = three periods, so two pushes can be lost without a false page. The
+# ceiling matters too: it is how long an unmeasurable probe stays silent
+# before Kuma calls it DOWN, since those paths push nothing at all.
 EnvironmentFile=-/etc/gardyn/kuma-netwatch.env
 
 # A diagnostic must never become the outage it monitors. Without this, the
@@ -52,14 +62,19 @@ LogLevelMax=notice
 # Required explicitly: per systemd.service(5) the start timeout is DISABLED by
 # default for Type=oneshot.
 #
-# Raised 30 -> 45 for T-479. The script's own bounds now sum to ~25s in the
-# worst case (vcgencmd 5 + nmcli 5 + two `systemctl show` 5 each + the Kuma
-# push 5), and 30s left no room above that for interpreter start on a
-# single-core ARMv6 host where even `python3 -c pass` costs 325ms. A timeout
-# that trips during a real network stall would kill the sample AND the
-# heartbeat at exactly the moment both are wanted. Still far inside the 300s
-# timer period.
-TimeoutStartSec=45
+# Raised 30 -> 60 for T-479. The first pass said 45 on the arithmetic
+# "vcgencmd 5 + nmcli 5 + two systemctl 5 + push 5 = 25s", and the push term
+# was wrong: per the Python docs urlopen's `timeout` bounds "blocking
+# operations like the connection attempt" INDIVIDUALLY, not the call as a
+# whole, so connect + send + read is up to 15s, not 5. Real worst case is
+# ~35s, plus interpreter start on a single-core ARMv6 host where even
+# `python3 -c pass` costs 325ms.
+#
+# Getting this wrong is not a slow sample, it is a LOST one: print(record)
+# runs after the push, so a SIGTERM here destroys the health sample as well
+# as the heartbeat, at exactly the moment both are worth having. 60s keeps a
+# ~25s margin and is still comfortably inside the 300s timer period.
+TimeoutStartSec=60
 TimeoutStopSec=10
 Nice=10
 IOSchedulingClass=idle

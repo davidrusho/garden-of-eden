@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # Reviewed: 2026-07-31 against 7d82d25 (T-473.2)
+# Reviewed: 2026-07-31 against 4e6edd0 (T-479) — that review found two real
+#   defects (a permanently-green freshness axis, a false page on timer re-arm)
+#   plus a discarded probe error; all three are fixed ABOVE that sha, so
+#   `git log 4e6edd0..HEAD -- bin/gardyn-health-log.py` is the un-re-reviewed
+#   delta. Each fix carries its own mutation in tests/mutate_health_log.py.
 """Periodic host-health sample for the Gardyn Pi (T-473.2).
 
 Emits ONE logfmt line per run to stdout, which systemd captures into the
@@ -31,12 +36,25 @@ Netwatch is the unit that reboots the Pi; its own service file says a watchdog
 must not become the outage, and putting an HTTP call inside the one unit whose
 job is to work while the network is down would be exactly that. This sampler
 is not safety-critical, already runs on a fixed cadence, and can read every
-failure mode that matters straight out of systemd:
+failure mode that matters straight out of systemd.
 
-    UnitFileState    -> disabled, masked, or the unit removed entirely
-    ActiveState      -> failed, or simply stopped
-    LastTriggerUSec* -> active but no longer firing (a wedged run)
-    Result           -> the last run itself failed
+What each axis ACTUALLY catches — corrected 2026-07-31 after review, because
+the first draft of this list was wrong in two places and the next reader will
+reason from it:
+
+    UnitFileState    -> disabled, masked, or the unit file removed
+    ActiveState      -> stopped; ALSO the case where gardyn-netwatch.SERVICE
+                        is masked or deleted, since timer_enter_running()'s
+                        failure path calls timer_enter_dead(TIMER_FAILURE_
+                        RESOURCES) and the timer lands in `failed`
+    Result           -> the run itself crashed or hit TimeoutStartSec=90.
+                        This is what catches a WEDGED run, not staleness --
+                        systemd stamps last_trigger when it QUEUES the job,
+                        so a run that never returns still looks fresh
+    LastTriggerUSec* -> a thinner net than it first appears, precisely because
+                        of the above: what is left to it is a wedged systemd
+                        manager, and a backwards clock jump on a host with no
+                        RTC. Kept for those, not for a hung netwatch
 
 The verdict is pushed to an Uptime Kuma push monitor, because the gap T-479
 exists to close is that a dead watchdog and a healthy network write the same
@@ -147,6 +165,31 @@ def parse_systemd_timespan(raw: str | None) -> float | None:
     return total
 
 
+def parse_monotonic_usec(raw: str | None) -> float | None:
+    """Seconds from a systemd *timestamp* property (raw microseconds).
+
+    Deliberately a SECOND parser, because one `systemctl show` response mixes
+    both renderings and assuming otherwise silently misreads one of them.
+    Measured on the host, same call, same moment:
+
+        LastTriggerUSecMonotonic=1h 24min 30.119177s     <- human span
+        ActiveEnterTimestampMonotonic=24738732           <- bare microseconds
+
+    systemd's bus-print-properties.c keeps an allowlist of properties printed
+    as timestamps; `LastTriggerUSecMonotonic` is not on it and falls through
+    to the timespan branch, while `ActiveEnterTimestampMonotonic` is a plain
+    uint64. A single parser would read `24738732` as 24.7 MILLION seconds.
+
+    0 means the unit has never been active; the caller decides what that means.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text or not text.isdigit():
+        return None
+    return int(text) / 1e6
+
+
 def parse_show_properties(raw: str | None) -> dict:
     """Parse `systemctl show -p ...` KEY=VALUE output into a dict.
 
@@ -206,20 +249,37 @@ def evaluate_netwatch(timer: dict, service: dict, uptime_s: float | None,
 
     last = parse_systemd_timespan(timer.get("LastTriggerUSecMonotonic"))
     if last is None or uptime_s is None:
-        # Enabled and active are still measurable and still say healthy; only
-        # the freshness axis is blind. Reporting UP with the blindness named
-        # beats manufacturing either verdict from a clock we cannot read.
-        return {**verdict, "ok": True, "reason": "age_unknown"}
+        # "Cannot measure", NOT "measured healthy" — and pushing UP here was a
+        # real defect, found in review. Every way this happens is PERMANENT,
+        # not transient: the property dropped from the -p list, systemd
+        # emitting the literal "infinity", a rendering change on upgrade, an
+        # unreadable /proc/uptime. Reporting UP would have retired the
+        # freshness axis silently and forever, with the only trace a word in
+        # the journal — the surface T-479 exists BECAUSE nobody reads it.
+        # Pushing nothing is the same call `probe_error` already makes, and
+        # Kuma's interval turns sustained blindness into a DOWN that someone
+        # will actually see and fix.
+        return {**verdict, "ok": None, "reason": "age_unknown"}
     if last == 0.0:
-        if uptime_s <= NETWATCH_MAX_AGE_S:
-            return {**verdict, "ok": True, "reason": "booting"}
+        # Never fired since boot. The grace period is keyed to how long the
+        # TIMER has been armed, not to host uptime: `systemctl enable --now`
+        # on a host up for days legitimately leaves this at 0 for a full
+        # period, and keying it to uptime paged for a working watchdog the
+        # moment anyone re-armed it. That case is not hypothetical — it is
+        # step 6 of this feature's own acceptance drill.
+        armed_since = parse_monotonic_usec(timer.get("ActiveEnterTimestampMonotonic"))
+        armed_for = uptime_s if not armed_since else uptime_s - armed_since
+        if armed_for <= NETWATCH_MAX_AGE_S:
+            return {**verdict, "ok": True, "reason": "recently_armed"}
         return {**verdict, "ok": False, "reason": "never_triggered"}
 
     age = uptime_s - last
     if age < 0:
-        # Monotonic clock ahead of /proc/uptime is not physically meaningful;
-        # treat it as an unreadable clock rather than a suspiciously fresh one.
-        return {**verdict, "ok": True, "reason": "age_unknown"}
+        # /proc/uptime is CLOCK_BOOTTIME and systemd's is CLOCK_MONOTONIC, so
+        # uptime >= monotonic always holds and this is effectively unreachable.
+        # If it is reached, the parse is wrong — which is "cannot measure", by
+        # the same argument as the branch above, not "suspiciously fresh".
+        return {**verdict, "ok": None, "reason": "age_unknown"}
     verdict["age_s"] = age
     if age > NETWATCH_MAX_AGE_S:
         return {**verdict, "ok": False, "reason": "stale"}
@@ -516,14 +576,20 @@ def main() -> int:
     # not exist, so a failure here really does mean the probe could not run.
     timer_out, timer_err = _run([
         "systemctl", "show", NETWATCH_TIMER,
-        "-p", "UnitFileState", "-p", "ActiveState", "-p", "LastTriggerUSecMonotonic",
+        "-p", "UnitFileState", "-p", "ActiveState",
+        "-p", "LastTriggerUSecMonotonic", "-p", "ActiveEnterTimestampMonotonic",
     ])
-    service_out, _ = _run(["systemctl", "show", NETWATCH_SERVICE, "-p", "Result"])
+    # The SERVICE probe's error is captured too. Discarding it (`service_out, _`)
+    # was a real defect: a second call that failed left Result="", which the
+    # `if result and ...` guard reads as healthy, so a crashed netwatch run
+    # pushed UP. Both probes are the same binary microseconds apart, so folding
+    # them into one probe_error loses nothing and keeps the axes symmetric.
+    service_out, service_err = _run(["systemctl", "show", NETWATCH_SERVICE, "-p", "Result"])
     netwatch = evaluate_netwatch(
         parse_show_properties(timer_out),
         parse_show_properties(service_out),
         uptime_s,
-        probe_error=timer_err,
+        probe_error=timer_err or service_err,
     )
 
     push = format_push(netwatch)
