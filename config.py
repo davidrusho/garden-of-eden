@@ -120,3 +120,71 @@ CAMERA_RESOLUTION = os.getenv("CAMERA_RESOLUTION", "640x480")
 UPPER_CAMERA_RESOLUTION = os.getenv("UPPER_CAMERA_RESOLUTION", CAMERA_RESOLUTION)
 LOWER_CAMERA_RESOLUTION = os.getenv("LOWER_CAMERA_RESOLUTION", CAMERA_RESOLUTION)
 IMAGE_INTERVAL_SECONDS = int(os.getenv("IMAGE_INTERVAL_SECONDS", "3600"))
+
+# JPEG quality for the camera captures, 1-100 (T-478).
+#
+# _capture_and_publish() invoked fswebcam with no --jpeg flag at all, so the
+# quality parameter was never set and fell through to an out-of-range default.
+# It is visible in the frames themselves: `file(1)` on both live captures
+# reported `quality = 255`, i.e. effectively maximum, which is why a 640x480
+# frame cost 326 KB.
+#
+# Measured on the Pi with identical -S 2 -F 2 flags, so the comparison is fair:
+#
+#   lower 640x480    no flag 325,070 | q95 151,093 | q85 83,003 | q75 66,197
+#   upper 1600x1200  no flag 440,713 | q95 187,254 | q85 90,381 | q75 76,754
+#
+# Per cycle that is ~748 KB against ~169 KB at q85 - a 4.4x reduction for no
+# visible loss on a plant camera. It matters because this burst every five
+# minutes is the only sustained TX load on a host whose uplink has collapsed to
+# 802.11b rates with a 13% tx-failure rate, and a blocking publish stalls all
+# MQTT processing including keepalive handling (see mqtt.py's flash_lights
+# note). 88 keep-alive timeouts and ~28 network outages a day are the symptom
+# this is a hypothesis for - unproven, but free and reversible.
+#
+# 85 rather than 95 because 95 only buys back half the saving. Resolution and
+# IMAGE_INTERVAL_SECONDS are deliberately NOT touched: the retired T-309
+# timelapse SHA-256 dedups consecutive frames, so a longer interval could dedup
+# away real growth, and quality has no such interaction.
+_JPEG_QUALITY_DEFAULT = 85
+
+
+def _load_jpeg_quality(var, default):
+    """Read a JPEG quality from env, falling back to `default` on anything unusable.
+
+    Deliberately does NOT raise, for the same reason _load_water_band() does
+    not: mqtt.py's systemd unit carries Restart=always with
+    StartLimitIntervalSec=0, so a ValueError here is not a loud failure but a
+    permanent crash loop that takes the lights and the cameras with it.
+
+    The range check is the point of the setting rather than defensive padding.
+    The bug being fixed IS an out-of-range value - the unset flag resolved to
+    255 - so accepting 255 from the environment would reinstate it through a
+    different door while looking configured.
+    """
+    import logging
+
+    raw = os.getenv(var)
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.getLogger(__name__).error(
+            "Unparseable %s=%r; using %s", var, raw, default)
+        return default
+    if not 1 <= value <= 100:
+        logging.getLogger(__name__).error(
+            "Refusing out-of-range %s=%r (must be 1-100); using %s",
+            var, raw, default)
+        return default
+    return value
+
+
+CAMERA_JPEG_QUALITY = _load_jpeg_quality("CAMERA_JPEG_QUALITY", _JPEG_QUALITY_DEFAULT)
+# Per-camera overrides; fall back to the shared CAMERA_JPEG_QUALITY when unset,
+# mirroring the resolution settings above so the two cameras can differ.
+UPPER_CAMERA_JPEG_QUALITY = _load_jpeg_quality(
+    "UPPER_CAMERA_JPEG_QUALITY", CAMERA_JPEG_QUALITY)
+LOWER_CAMERA_JPEG_QUALITY = _load_jpeg_quality(
+    "LOWER_CAMERA_JPEG_QUALITY", CAMERA_JPEG_QUALITY)

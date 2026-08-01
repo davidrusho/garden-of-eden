@@ -84,7 +84,12 @@ def _install_stubs():
         UPPER_CAMERA_DEVICE="/dev/video0", LOWER_CAMERA_DEVICE="/dev/video2",
         UPPER_IMAGE_PATH="/tmp/u.jpg", LOWER_IMAGE_PATH="/tmp/l.jpg",
         CAMERA_RESOLUTION="640x480", UPPER_CAMERA_RESOLUTION="640x480",
-        LOWER_CAMERA_RESOLUTION="640x480", IMAGE_INTERVAL_SECONDS=3600,
+        LOWER_CAMERA_RESOLUTION="640x480",
+        # Distinct per camera on purpose: a stub that gave both the same number
+        # could not tell "each camera got its own quality" apart from "one
+        # value was used twice".
+        UPPER_CAMERA_JPEG_QUALITY=85, LOWER_CAMERA_JPEG_QUALITY=70,
+        IMAGE_INTERVAL_SECONDS=3600,
     )
 
 

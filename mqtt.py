@@ -12,7 +12,7 @@ import json
 # import picamera
 # import cv2
 from time import sleep
-from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, WATER_VALID_MIN_CM, WATER_VALID_MAX_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, UPPER_CAMERA_RESOLUTION, LOWER_CAMERA_RESOLUTION, IMAGE_INTERVAL_SECONDS
+from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, WATER_VALID_MIN_CM, WATER_VALID_MAX_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, UPPER_CAMERA_RESOLUTION, LOWER_CAMERA_RESOLUTION, UPPER_CAMERA_JPEG_QUALITY, LOWER_CAMERA_JPEG_QUALITY, IMAGE_INTERVAL_SECONDS
 
 from gpiozero import Button  # Import gpiozero Button
 from gpiozero.pins.pigpio import PiGPIOFactory
@@ -811,17 +811,25 @@ def publish_pcb_temperature(client):
 #                          the water/level/get probe.
 
 
-def _capture_and_publish(client, label, device, resolution, image_path, topic):
+def _capture_and_publish(client, label, device, resolution, quality, image_path, topic):
     """Capture one camera and publish it independently.
 
     Each camera gets its own try/except so a failing camera (e.g. the lower
     camera's intermittent USB error-32) never blocks the other's publish, and
-    its own resolution so the healthy upper camera can run at a higher setting
-    than the flaky lower one.
+    its own resolution and quality so the healthy upper camera can run at a
+    different setting from the flaky lower one.
+
+    --jpeg is passed EXPLICITLY and is not optional (T-478). Omitting it does
+    not select a sane default - it leaves gd's quality parameter unset, and the
+    frames this unit produced carried `quality = 255` in their own JPEG
+    comment. That cost ~748 KB per five-minute cycle against ~169 KB at 85, on
+    a host whose only sustained TX load this is. Passing it as an argument
+    rather than reading a module global mirrors `resolution` and is what lets
+    the two cameras differ.
     """
     try:
         subprocess.check_call([
-            'fswebcam', '-d', device, '-r', resolution,
+            'fswebcam', '-d', device, '-r', resolution, '--jpeg', str(quality),
             '-S', '2', '-F', '2', '--no-banner', image_path
         ])
         with open(image_path, 'rb') as f:
@@ -836,9 +844,11 @@ def _capture_and_publish(client, label, device, resolution, image_path, topic):
 def publish_images(client):
     while True:
         _capture_and_publish(client, "upper", UPPER_CAMERA_DEVICE,
-                             UPPER_CAMERA_RESOLUTION, UPPER_IMAGE_PATH, "/image/upper_camera")
+                             UPPER_CAMERA_RESOLUTION, UPPER_CAMERA_JPEG_QUALITY,
+                             UPPER_IMAGE_PATH, "/image/upper_camera")
         _capture_and_publish(client, "lower", LOWER_CAMERA_DEVICE,
-                             LOWER_CAMERA_RESOLUTION, LOWER_IMAGE_PATH, "/image/lower_camera")
+                             LOWER_CAMERA_RESOLUTION, LOWER_CAMERA_JPEG_QUALITY,
+                             LOWER_IMAGE_PATH, "/image/lower_camera")
         sleep(IMAGE_INTERVAL_SECONDS)
 
 
