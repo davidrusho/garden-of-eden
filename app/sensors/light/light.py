@@ -1,3 +1,4 @@
+# Reviewed: 2026-07-31 against 469e3d2 (T-470 follow-on: light command attribution)
 import argparse
 from gpiozero import PWMLED
 from gpiozero.pins.pigpio import PiGPIOFactory
@@ -19,10 +20,18 @@ logger = logging.getLogger(__name__)
 # untested control on an appliance whose failures are silent is the exact
 # pattern this codebase keeps getting bitten by.
 #
-# Scoped to this module on purpose. A blanket INFO would also enable the
-# per-cycle read path and the camera chatter, writing continuously to an SD
-# card that is the single copy of this deployment; get_duty_cycle() below is
-# demoted to debug for the same reason.
+# Scoped to this module on purpose - for SIGNAL, not for disk wear. Measured on
+# the host before writing this: gardyn.log grows ~26 KB/day against 25 GB free,
+# and journald is capped at 64M, so volume was never the real argument. The
+# argument is that a blanket INFO buries four meaningful light events a day
+# under the camera path's ~576 lines. get_duty_cycle() below is demoted to
+# debug for that reason, and it is safe to demote because its value is
+# published as retained MQTT state on light/brightness/state immediately after
+# every command - HA's recorder holds it at better resolution than the log did.
+#
+# One residual, deliberately accepted: the log now records COMMANDED values,
+# never OBSERVED ones. If PWMLED silently fails to apply a duty cycle, the log
+# asserts a change that did not happen.
 #
 # This works despite the root sitting at WARNING because Logger.callHandlers
 # walks the ancestor chain and consults each HANDLER's level - never the

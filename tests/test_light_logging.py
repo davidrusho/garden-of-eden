@@ -89,9 +89,21 @@ class LightLoggingTestCase(unittest.TestCase):
         self.root.handlers = [self.handler]
         self.root.setLevel(logging.WARNING)
 
-        with patch("app.sensors.light.light.PWMLED"), \
-             patch("app.sensors.light.light.PiGPIOFactory"), \
-             patch("app.sensors.light.light.pigpio.pi"):
+        # patch.object, NOT patch("dotted.string"). A dotted target is
+        # re-resolved through sys.modules at call time, and test_water_interlock
+        # replaces sys.modules["app.sensors.light.light"] with a stub carrying
+        # only `Light` at module scope. Discovery imports every test module
+        # before running any test, so under `unittest discover` that stub always
+        # wins and a dotted patch raises AttributeError on PWMLED - silently
+        # turning this entire file inert in the only run that matters.
+        # Reclaim the sys.modules slot for the duration of this test, and put it
+        # back in tearDown so the stubbing module is unaffected either way.
+        self._saved_mod = sys.modules.get(_LIGHT_NAME)
+        sys.modules[_LIGHT_NAME] = light_mod
+
+        with patch.object(light_mod, "PWMLED"), \
+             patch.object(light_mod, "PiGPIOFactory"), \
+             patch.object(light_mod.pigpio, "pi"):
             self.light = Light(18)
             self.light.led.value = 0
 
@@ -101,6 +113,10 @@ class LightLoggingTestCase(unittest.TestCase):
     def tearDown(self):
         self.root.handlers = self._saved_handlers
         self.root.setLevel(self._saved_level)
+        if self._saved_mod is None:
+            sys.modules.pop(_LIGHT_NAME, None)
+        else:
+            sys.modules[_LIGHT_NAME] = self._saved_mod
 
     @property
     def captured(self):
@@ -135,8 +151,14 @@ class LightLoggingTestCase(unittest.TestCase):
         self.assertIn("Turning light off", self.captured)
 
     def test_noop_reassert_is_recorded_and_distinguishable(self):
-        """The /15 schedule re-assert must be distinguishable from a real
-        change - otherwise the log cannot tell a command from a no-op."""
+        """A no-op must be distinguishable from a real change.
+
+        NOTE on reach: this exercises the Flask/CLI surface, NOT the MQTT
+        service. mqtt.py never calls Light.on() - every path goes through
+        set_duty_cycle() or off(), and set_duty_cycle has no idempotence check,
+        so a schedule re-assert logs a full 'Setting light duty_cycle to N%'
+        unconditionally. Kept because the Flask app and bin/light.sh do reach
+        it; do not cite it as evidence about the service's re-assert path."""
         self.light.led.value = 0.5
         self.light.on()
         self.assertIn("Light already on, skipping", self.captured)
@@ -156,8 +178,13 @@ class LightLoggingTestCase(unittest.TestCase):
     # --- half 2: the read path stays quiet ---------------------------------
 
     def test_read_path_is_not_recorded_at_info(self):
-        """get_brightness() runs on every publish AND every camera capture.
-        At INFO it would write to the SD card continuously."""
+        """The read path must not add noise to the command record.
+
+        NOTE: an earlier draft justified this as 'runs on every publish and
+        every camera capture'. That is false - publish_light_state is called
+        from exactly four event-driven places and no publisher thread touches
+        the light, so there is no periodic floor. The real justification is
+        signal-to-noise around the four meaningful light events per day."""
         self.light.led.value = 0.5
         self.light.get_brightness()
         self.assertNotIn("duty_cycle is", self.captured)
