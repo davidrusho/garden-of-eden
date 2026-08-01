@@ -23,6 +23,31 @@ candidate explanations. Those two things are:
     vs gone from /proc/net/wireless entirely. Those imply different fixes and
     look identical from the outside once the host is unreachable.
 
+Watching the watchdog (T-479)
+----------------------------
+This sampler also carries the external heartbeat for `gardyn-netwatch.timer`,
+and it is deliberately THIS unit that carries it rather than netwatch itself.
+Netwatch is the unit that reboots the Pi; its own service file says a watchdog
+must not become the outage, and putting an HTTP call inside the one unit whose
+job is to work while the network is down would be exactly that. This sampler
+is not safety-critical, already runs on a fixed cadence, and can read every
+failure mode that matters straight out of systemd:
+
+    UnitFileState    -> disabled, masked, or the unit removed entirely
+    ActiveState      -> failed, or simply stopped
+    LastTriggerUSec* -> active but no longer firing (a wedged run)
+    Result           -> the last run itself failed
+
+The verdict is pushed to an Uptime Kuma push monitor, because the gap T-479
+exists to close is that a dead watchdog and a healthy network write the same
+thing to the journal: nothing. Only an OFF-host observer can tell silence
+from health. Kuma's own timeout covers the case where this sampler dies too.
+
+Timekeeping note: freshness is derived from LastTriggerUSecMonotonic against
+/proc/uptime, never the wall clock, for the same reason netwatch avoids it —
+this host has no RTC and runs fake-hwclock, so its wall clock is restored
+then corrected at boot and can jump arbitrarily once NTP lands.
+
 Design note: every parser here is a pure function over a string so the failure
 branches the real host cannot be made to produce on demand — a missing
 vcgencmd, a radio that has vanished from /proc/net/wireless, malformed hex —
@@ -30,9 +55,15 @@ are still covered by tests. main() is the only part that touches the system.
 """
 from __future__ import annotations
 
+import json
+import os
+import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 # Bit meanings per the official Raspberry Pi OS documentation
 # (raspberrypi.com/documentation/computers/os.html, "get_throttled").
@@ -51,6 +82,195 @@ THROTTLED_BITS = {
 }
 
 UNKNOWN = "unknown"
+
+# --- Watching the netwatch watchdog (T-479) ---------------------------------
+
+NETWATCH_TIMER = "gardyn-netwatch.timer"
+NETWATCH_SERVICE = "gardyn-netwatch.service"
+
+# Netwatch fires every 120s. This allows roughly three missed ticks before
+# calling it stale, which matters because the freshness test is the ONLY one
+# of the four that can produce a false alarm: a stopped, masked or disabled
+# timer is a categorical reading, while "how long since it last fired" has to
+# tolerate AccuracySec=10s, a slow run on a single-core ARMv6 host, and the
+# sampler happening to land immediately before a tick rather than after one.
+# Being generous here costs detection latency the categorical checks do not
+# need, and buys the monitor's credibility, which a single false page spends.
+NETWATCH_MAX_AGE_S = 420.0
+
+# The push URL carries a secret token, so it is supplied by the environment
+# (EnvironmentFile=-/etc/gardyn/kuma-netwatch.env) and never committed — this
+# repository is public. Absent, the sampler simply does not push, and Kuma's
+# own timeout is what reports the silence.
+PUSH_URL_ENV = "KUMA_PUSH_URL"
+PUSH_TIMEOUT_S = 5.0
+
+# systemd renders monotonic timestamps as a human-readable span rather than
+# raw microseconds ("1h 32.020246s", "15min 203.146ms", or a bare "0" for a
+# timer that has not fired this boot). Units per systemd's format_timespan();
+# `month` and `min` must precede `ms`/`m`-initial alternatives so the longest
+# unit wins at each position.
+_TIMESPAN_UNITS = {
+    "y": 31557600.0, "month": 2629800.0, "w": 604800.0, "d": 86400.0,
+    "h": 3600.0, "min": 60.0, "s": 1.0, "ms": 1e-3, "us": 1e-6,
+}
+_TIMESPAN_TOKEN = re.compile(r"(\d+(?:\.\d+)?)\s*(y|month|w|d|h|min|ms|us|s)")
+
+
+def parse_systemd_timespan(raw: str | None) -> float | None:
+    """Seconds from a systemd-rendered timespan, or None if untrustworthy.
+
+    Strict on purpose. A lenient parser that ignored trailing junk would turn
+    "infinity" or a future systemd's new rendering into a plausible number,
+    and a wrong freshness reading is worse than an admitted unknown: it either
+    pages for a healthy watchdog or, far worse, reports a dead one as fresh.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    if text == "0":
+        # Not "zero seconds ago" — systemd's way of saying it never fired
+        # during this boot. The caller decides whether that is a fault, since
+        # it is perfectly normal for the first two minutes after a reboot.
+        return 0.0
+    total = 0.0
+    pos = 0
+    for match in _TIMESPAN_TOKEN.finditer(text):
+        if text[pos:match.start()].strip():
+            return None
+        total += float(match.group(1)) * _TIMESPAN_UNITS[match.group(2)]
+        pos = match.end()
+    if pos == 0 or text[pos:].strip():
+        return None
+    return total
+
+
+def parse_show_properties(raw: str | None) -> dict:
+    """Parse `systemctl show -p ...` KEY=VALUE output into a dict.
+
+    Values may legitimately contain "=", so split once only. A missing key is
+    reported as absent rather than defaulted, because `systemctl show` prints
+    an EMPTY UnitFileState for a unit that does not exist and still exits 0 —
+    so "the key came back blank" and "the unit is gone" are the same reading
+    and both have to reach the caller intact.
+    """
+    out: dict = {}
+    for line in (raw or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            out[key.strip()] = value.strip()
+    return out
+
+
+def evaluate_netwatch(timer: dict, service: dict, uptime_s: float | None,
+                      probe_error: str | None = None) -> dict:
+    """Decide whether the netwatch watchdog is actually running.
+
+    Returns {"ok": True|False|None, "reason": str, "age_s": float|None, ...}.
+
+    The three-valued `ok` is the same distinction netwatch itself draws
+    between "no" and "don't know". None means the probe could not be RUN, and
+    the caller must then push NOTHING — inventing an UP laundries a real fault
+    green, inventing a DOWN pages for a broken `systemctl`. Silence is honest,
+    and Kuma's interval already converts sustained silence into a DOWN.
+    """
+    enabled = timer.get("UnitFileState", "")
+    active = timer.get("ActiveState", "")
+    result = service.get("Result", "")
+    verdict = {"enabled": enabled or None, "active": active or None,
+               "result": result or None, "age_s": None}
+
+    if probe_error:
+        return {**verdict, "ok": None, "reason": f"probe_{probe_error}"}
+
+    # Ordered most-categorical first, so the reason names the actual fault
+    # rather than a downstream symptom of it.
+    if not enabled:
+        return {**verdict, "ok": False, "reason": "timer_absent"}
+    if enabled not in ("enabled", "enabled-runtime"):
+        # Covers masked, disabled, static and anything a future systemd adds.
+        # An allowlist rather than a list of known-bad states on purpose: a
+        # state nobody anticipated must read as "not running", never as
+        # healthy-by-default. There was a dedicated `masked` branch above this
+        # one until mutation testing showed it was dead code emitting the same
+        # string this line already produces.
+        return {**verdict, "ok": False, "reason": f"timer_{enabled}"}
+    if active != "active":
+        return {**verdict, "ok": False, "reason": f"timer_{active or UNKNOWN}"}
+    if result and result != "success":
+        # The timer is fine; the run it triggered is not. Distinct fault,
+        # distinct fix, so it must not be collapsed into "stale" below.
+        return {**verdict, "ok": False, "reason": f"run_{result}"}
+
+    last = parse_systemd_timespan(timer.get("LastTriggerUSecMonotonic"))
+    if last is None or uptime_s is None:
+        # Enabled and active are still measurable and still say healthy; only
+        # the freshness axis is blind. Reporting UP with the blindness named
+        # beats manufacturing either verdict from a clock we cannot read.
+        return {**verdict, "ok": True, "reason": "age_unknown"}
+    if last == 0.0:
+        if uptime_s <= NETWATCH_MAX_AGE_S:
+            return {**verdict, "ok": True, "reason": "booting"}
+        return {**verdict, "ok": False, "reason": "never_triggered"}
+
+    age = uptime_s - last
+    if age < 0:
+        # Monotonic clock ahead of /proc/uptime is not physically meaningful;
+        # treat it as an unreadable clock rather than a suspiciously fresh one.
+        return {**verdict, "ok": True, "reason": "age_unknown"}
+    verdict["age_s"] = age
+    if age > NETWATCH_MAX_AGE_S:
+        return {**verdict, "ok": False, "reason": "stale"}
+    return {**verdict, "ok": True, "reason": "ok"}
+
+
+def format_push(verdict: dict) -> tuple[str, str] | None:
+    """Map a verdict onto (status, msg) for Kuma, or None to push nothing."""
+    if verdict.get("ok") is None:
+        return None
+    status = "up" if verdict["ok"] else "down"
+    msg = f"netwatch {verdict['reason']}"
+    age = verdict.get("age_s")
+    if age is not None:
+        msg += f" (last run {int(age)}s ago)"
+    return status, msg
+
+
+def push_kuma(url: str | None, status: str, msg: str,
+              timeout: float = PUSH_TIMEOUT_S) -> str:
+    """Push one heartbeat. Returns an outcome token and NEVER raises.
+
+    Three traps this homelab has already paid for, all avoided here:
+
+      * A push URL copied out of Kuma's UI carries a `?status=up&msg=OK&ping=`
+        template. Appending more parameters to it produces duplicate keys,
+        which Kuma stringifies as "[object Object]" while returning HTTP 200 —
+        silent corruption. The query string is stripped before rebuilding.
+
+      * Kuma answers a REJECTED push with HTTP 200 and `{"ok":false}`, so the
+        status code is necessary but nowhere near sufficient; the body decides.
+
+      * The URL contains the push token. Only the exception's class name is
+        ever reported — HTTPError's str() would put the full URL, token and
+        all, into a journal that is now persistent.
+    """
+    if not url:
+        return "skipped_no_url"
+    base = url.partition("?")[0]
+    query = urllib.parse.urlencode({"status": status, "msg": msg, "ping": ""})
+    try:
+        with urllib.request.urlopen(f"{base}?{query}", timeout=timeout) as response:
+            body = response.read(512).decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001 - a sampler must still print its line
+        return f"failed_{type(exc).__name__}"
+    try:
+        if json.loads(body).get("ok") is True:
+            return "ok"
+    except (ValueError, AttributeError):
+        return "failed_bad_body"
+    return "failed_not_ok"
 
 
 def parse_throttled(raw: str | None) -> dict:
@@ -207,7 +427,9 @@ def _fmt(value) -> str:
 def format_record(throttled: dict, temp_c: float | None, wireless: dict,
                   nm_state: str, uptime_s: float | None = None,
                   mem_avail_mb: float | None = None,
-                  nm_error: str | None = None) -> str:
+                  nm_error: str | None = None,
+                  netwatch: dict | None = None,
+                  push_outcome: str | None = None) -> str:
     """Render one logfmt line. Key order is stable so the output greps well."""
     parts = [
         ("nm_state", nm_state),
@@ -219,6 +441,15 @@ def format_record(throttled: dict, temp_c: float | None, wireless: dict,
         ("uptime_s", None if uptime_s is None else int(uptime_s)),
         ("mem_avail_mb", None if mem_avail_mb is None else round(mem_avail_mb, 1)),
     ]
+    if netwatch is not None:
+        age = netwatch.get("age_s")
+        parts += [
+            ("netwatch_ok", netwatch.get("ok")),
+            ("netwatch_reason", netwatch.get("reason")),
+            ("netwatch_age_s", None if age is None else int(age)),
+        ]
+    if push_outcome:
+        parts.append(("kuma_push", push_outcome))
     if nm_error:
         parts.append(("nm_error", nm_error))
     # Only surface the throttle flags that are actually SET. A line of eight
@@ -279,14 +510,38 @@ def main() -> int:
 
     nm_out, nm_err = _run(["nmcli", "-t", "-f", "STATE", "general"])
 
+    uptime_s = parse_uptime(_read("/proc/uptime"))
+
+    # T-479: watch the watchdog. `systemctl show` exits 0 for a unit that does
+    # not exist, so a failure here really does mean the probe could not run.
+    timer_out, timer_err = _run([
+        "systemctl", "show", NETWATCH_TIMER,
+        "-p", "UnitFileState", "-p", "ActiveState", "-p", "LastTriggerUSecMonotonic",
+    ])
+    service_out, _ = _run(["systemctl", "show", NETWATCH_SERVICE, "-p", "Result"])
+    netwatch = evaluate_netwatch(
+        parse_show_properties(timer_out),
+        parse_show_properties(service_out),
+        uptime_s,
+        probe_error=timer_err,
+    )
+
+    push = format_push(netwatch)
+    if push is None:
+        push_outcome = "skipped_unmeasurable"
+    else:
+        push_outcome = push_kuma(os.environ.get(PUSH_URL_ENV), *push)
+
     record = format_record(
         throttled=throttled,
         temp_c=parse_soc_temp(_read("/sys/class/thermal/thermal_zone0/temp")),
         wireless=parse_proc_net_wireless(_read("/proc/net/wireless")),
         nm_state=parse_nmcli_state(nm_out),
-        uptime_s=parse_uptime(_read("/proc/uptime")),
+        uptime_s=uptime_s,
         mem_avail_mb=parse_mem_available_mb(_read("/proc/meminfo")),
         nm_error=nm_err,
+        netwatch=netwatch,
+        push_outcome=push_outcome,
     )
     print(record, flush=True)
     return 0

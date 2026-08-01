@@ -14,6 +14,16 @@ User=gardyn
 ExecStart=/usr/bin/python3 /home/gardyn/garden-of-eden/bin/gardyn-health-log.py
 SyslogIdentifier=gardyn-health
 
+# T-479: the Uptime Kuma push URL, which carries a secret token and therefore
+# lives outside this PUBLIC repository. The leading `-` makes the file
+# optional, so a checkout without it still starts and simply does not push -
+# the script reports `kuma_push=skipped_no_url` and Kuma's own interval turns
+# the resulting silence into a DOWN, which is the honest outcome anyway.
+#
+# Deploy as root:root 0640 with the `gardyn` group, or the unprivileged
+# ExecStart cannot read it and the push silently never happens.
+EnvironmentFile=-/etc/gardyn/kuma-netwatch.env
+
 # A diagnostic must never become the outage it monitors. Without this, the
 # kernel's OOM killer scores by RSS and would reap the long-lived mqtt.py -
 # the grow-light and pump controller - in preference to this short-lived
@@ -41,12 +51,24 @@ LogLevelMax=notice
 # Bounded so a wedged binary cannot leave the unit running into the next tick.
 # Required explicitly: per systemd.service(5) the start timeout is DISABLED by
 # default for Type=oneshot.
-TimeoutStartSec=30
+#
+# Raised 30 -> 45 for T-479. The script's own bounds now sum to ~25s in the
+# worst case (vcgencmd 5 + nmcli 5 + two `systemctl show` 5 each + the Kuma
+# push 5), and 30s left no room above that for interpreter start on a
+# single-core ARMv6 host where even `python3 -c pass` costs 325ms. A timeout
+# that trips during a real network stall would kill the sample AND the
+# heartbeat at exactly the moment both are wanted. Still far inside the 300s
+# timer period.
+TimeoutStartSec=45
 TimeoutStopSec=10
 Nice=10
 IOSchedulingClass=idle
 
-# Read-only diagnostic; it needs no privileges, no write access and no network.
+# Read-only diagnostic; it needs no privileges and no write access. It DOES
+# now make one outbound HTTP request (T-479), which needs no capability as an
+# unprivileged user, so CapabilityBoundingSet= stays empty. The push target is
+# a bare IP, deliberately: a hostname would put a DNS resolver on the path of
+# the one signal that has to survive a sick network.
 # NOTE: ProtectHome= in ANY form breaks ExecStart, because the script lives
 # under /home/gardyn.
 NoNewPrivileges=yes

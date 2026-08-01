@@ -324,10 +324,16 @@ class TestMainEndToEnd(unittest.TestCase):
     changed separator or a lost quote is caught rather than tolerated.
     """
 
-    def _run_main(self, runs, reads):
+    def _run_main(self, runs, reads, push=None):
         buf = io.StringIO()
+        # push_kuma is stubbed for EVERY main() test, not just the ones that
+        # care. Left real, a developer with KUMA_PUSH_URL exported in their
+        # shell would have the suite fire live heartbeats at the production
+        # monitor and quietly hold it green - a test suite that falsifies the
+        # very signal it is testing.
         with mock.patch.object(hl, "_run", side_effect=lambda cmd, timeout=5.0: runs(cmd)), \
              mock.patch.object(hl, "_read", side_effect=reads), \
+             mock.patch.object(hl, "push_kuma", side_effect=push or (lambda *a, **k: "ok")), \
              contextlib.redirect_stdout(buf):
             rc = hl.main()
         return rc, buf.getvalue()
@@ -394,3 +400,272 @@ class TestMainEndToEnd(unittest.TestCase):
         self.assertEqual(rec["soc_temp_c"], "-")
         self.assertEqual(rec["throttled"], "0x50005")
         self.assertEqual(rec["undervolt_since_boot"], "true")
+
+
+class TestParseSystemdTimespan(unittest.TestCase):
+    """systemd 252 renders monotonic timestamps as a span, not raw microseconds.
+
+    Every literal below was copied from the live Pi's `systemctl show --value
+    -p LastTriggerUSecMonotonic` output rather than invented, because the whole
+    risk in this parser is assuming a format the vendor does not actually emit.
+    """
+
+    def test_hours_and_seconds_live_sample(self):
+        # gardyn-netwatch.timer, 2026-07-31. Note systemd OMITS a zero minutes
+        # component, which is precisely what breaks a naive positional parser.
+        self.assertAlmostEqual(hl.parse_systemd_timespan("1h 32.020246s"), 3632.020246)
+
+    def test_minutes_and_milliseconds_live_sample(self):
+        # systemd-tmpfiles-clean.timer, same host and moment.
+        self.assertAlmostEqual(hl.parse_systemd_timespan("15min 203.146ms"), 900.203146)
+
+    def test_bare_zero_means_never_fired_this_boot(self):
+        # Every idle timer on the host reads exactly this.
+        self.assertEqual(hl.parse_systemd_timespan("0"), 0.0)
+
+    def test_min_is_not_confused_with_ms(self):
+        # The one genuinely ambiguous pair: both units begin with "m", and
+        # getting it backwards is a 60,000x error in the safe-looking direction.
+        self.assertEqual(hl.parse_systemd_timespan("5min"), 300.0)
+        self.assertAlmostEqual(hl.parse_systemd_timespan("5ms"), 0.005)
+
+    def test_us_is_not_confused_with_s(self):
+        self.assertAlmostEqual(hl.parse_systemd_timespan("500us"), 0.0005)
+
+    def test_full_ladder(self):
+        self.assertEqual(hl.parse_systemd_timespan("1d 2h 3min 4s"), 93784.0)
+
+    def test_untrustworthy_input_is_none_not_a_guess(self):
+        for raw in (None, "", "   ", "infinity", "banana", "1h banana",
+                    "1h 30", "-5s", "h", "1hh"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(hl.parse_systemd_timespan(raw),
+                                  f"{raw!r} must not parse to a number")
+
+
+class TestParseShowProperties(unittest.TestCase):
+    def test_live_sample(self):
+        raw = ("LastTriggerUSec=Fri 2026-07-31 21:00:03 MDT\n"
+               "LastTriggerUSecMonotonic=1h 32.020246s\n"
+               "ActiveState=active\n"
+               "UnitFileState=enabled\n")
+        got = hl.parse_show_properties(raw)
+        self.assertEqual(got["UnitFileState"], "enabled")
+        self.assertEqual(got["LastTriggerUSecMonotonic"], "1h 32.020246s")
+
+    def test_value_containing_equals_survives(self):
+        got = hl.parse_show_properties("Environment=FOO=bar=baz\n")
+        self.assertEqual(got["Environment"], "FOO=bar=baz")
+
+    def test_missing_unit_yields_blank_not_absent_key(self):
+        # `systemctl show` on a unit that does not exist exits 0 and prints an
+        # EMPTY UnitFileState. That blank IS the signal, so it must survive.
+        got = hl.parse_show_properties("UnitFileState=\nActiveState=inactive\n")
+        self.assertEqual(got["UnitFileState"], "")
+        self.assertIn("UnitFileState", got)
+
+    def test_no_output(self):
+        self.assertEqual(hl.parse_show_properties(None), {})
+
+
+class TestEvaluateNetwatch(unittest.TestCase):
+    """The four failure modes T-479 names, plus the three-valued verdict.
+
+    None of these can be produced on the live Pi without disabling the real
+    watchdog, so this class is the only place most of them are ever exercised.
+    """
+
+    HEALTHY_TIMER = {"UnitFileState": "enabled", "ActiveState": "active",
+                     "LastTriggerUSecMonotonic": "1h 32.020246s"}
+    OK_SERVICE = {"Result": "success"}
+    UP = 3685.70  # /proc/uptime at the moment the timer sample above was taken
+
+    def test_healthy_host(self):
+        got = hl.evaluate_netwatch(self.HEALTHY_TIMER, self.OK_SERVICE, self.UP)
+        self.assertIs(got["ok"], True)
+        self.assertEqual(got["reason"], "ok")
+        self.assertAlmostEqual(got["age_s"], 53.679754, places=3)
+
+    def test_timer_disabled(self):
+        got = hl.evaluate_netwatch({**self.HEALTHY_TIMER, "UnitFileState": "disabled",
+                                    "ActiveState": "inactive"},
+                                   self.OK_SERVICE, self.UP)
+        self.assertIs(got["ok"], False)
+        self.assertEqual(got["reason"], "timer_disabled")
+
+    def test_timer_masked(self):
+        got = hl.evaluate_netwatch({**self.HEALTHY_TIMER, "UnitFileState": "masked"},
+                                   self.OK_SERVICE, self.UP)
+        self.assertIs(got["ok"], False)
+        self.assertEqual(got["reason"], "timer_masked")
+
+    def test_timer_removed_entirely(self):
+        got = hl.evaluate_netwatch({"UnitFileState": "", "ActiveState": "inactive"},
+                                   {}, self.UP)
+        self.assertIs(got["ok"], False)
+        self.assertEqual(got["reason"], "timer_absent")
+
+    def test_timer_stopped_but_still_enabled(self):
+        got = hl.evaluate_netwatch({**self.HEALTHY_TIMER, "ActiveState": "inactive"},
+                                   self.OK_SERVICE, self.UP)
+        self.assertIs(got["ok"], False)
+        self.assertEqual(got["reason"], "timer_inactive")
+
+    def test_timer_failed(self):
+        got = hl.evaluate_netwatch({**self.HEALTHY_TIMER, "ActiveState": "failed"},
+                                   self.OK_SERVICE, self.UP)
+        self.assertIs(got["ok"], False)
+        self.assertEqual(got["reason"], "timer_failed")
+
+    def test_last_run_failed_is_its_own_reason(self):
+        # The timer is fine and firing; the run it triggers is not. Collapsing
+        # this into "stale" would point the fix at the wrong unit.
+        got = hl.evaluate_netwatch(self.HEALTHY_TIMER, {"Result": "timeout"}, self.UP)
+        self.assertIs(got["ok"], False)
+        self.assertEqual(got["reason"], "run_timeout")
+
+    def test_active_but_no_longer_firing(self):
+        # A wedged run: systemd still lists the timer as active, but the last
+        # trigger is far older than the 2-minute cadence. The ONLY axis that
+        # catches this, and the reason freshness is measured at all.
+        got = hl.evaluate_netwatch({**self.HEALTHY_TIMER,
+                                    "LastTriggerUSecMonotonic": "10min"},
+                                   self.OK_SERVICE, 1200.0)
+        self.assertIs(got["ok"], False)
+        self.assertEqual(got["reason"], "stale")
+
+    def test_just_inside_the_freshness_bound_is_healthy(self):
+        got = hl.evaluate_netwatch({**self.HEALTHY_TIMER,
+                                    "LastTriggerUSecMonotonic": "419s"},
+                                   self.OK_SERVICE, 838.0)
+        self.assertIs(got["ok"], True)
+
+    def test_never_fired_is_forgiven_only_during_boot(self):
+        booting = hl.evaluate_netwatch({**self.HEALTHY_TIMER,
+                                        "LastTriggerUSecMonotonic": "0"},
+                                       self.OK_SERVICE, 60.0)
+        self.assertIs(booting["ok"], True)
+        self.assertEqual(booting["reason"], "booting")
+
+        settled = hl.evaluate_netwatch({**self.HEALTHY_TIMER,
+                                        "LastTriggerUSecMonotonic": "0"},
+                                       self.OK_SERVICE, 9000.0)
+        self.assertIs(settled["ok"], False)
+        self.assertEqual(settled["reason"], "never_triggered")
+
+    def test_unreadable_clock_reports_up_with_the_blindness_named(self):
+        # Enabled and active still say healthy; only freshness is blind. Both
+        # directions are wrong here - a fabricated DOWN pages for a working
+        # watchdog, a silent UP hides that one axis went dark.
+        for timer, uptime in (({**self.HEALTHY_TIMER,
+                               "LastTriggerUSecMonotonic": "infinity"}, self.UP),
+                              (self.HEALTHY_TIMER, None),
+                              ({**self.HEALTHY_TIMER,
+                                "LastTriggerUSecMonotonic": "9h"}, 100.0)):
+            with self.subTest(timer=timer, uptime=uptime):
+                got = hl.evaluate_netwatch(timer, self.OK_SERVICE, uptime)
+                self.assertIs(got["ok"], True)
+                self.assertEqual(got["reason"], "age_unknown")
+                self.assertIsNone(got["age_s"])
+
+    def test_probe_failure_is_dont_know_not_no(self):
+        # `systemctl` itself unrunnable. Neither verdict is honest, so the
+        # caller must push nothing and let Kuma's timeout speak.
+        got = hl.evaluate_netwatch({}, {}, self.UP, probe_error="not_installed")
+        self.assertIsNone(got["ok"])
+        self.assertEqual(got["reason"], "probe_not_installed")
+
+
+class TestFormatPush(unittest.TestCase):
+    def test_healthy_becomes_up_with_the_age(self):
+        status, msg = hl.format_push({"ok": True, "reason": "ok", "age_s": 53.7})
+        self.assertEqual(status, "up")
+        self.assertEqual(msg, "netwatch ok (last run 53s ago)")
+
+    def test_fault_becomes_down_and_names_it(self):
+        status, msg = hl.format_push({"ok": False, "reason": "timer_masked",
+                                      "age_s": None})
+        self.assertEqual(status, "down")
+        self.assertEqual(msg, "netwatch timer_masked")
+
+    def test_unmeasurable_pushes_nothing(self):
+        self.assertIsNone(hl.format_push({"ok": None, "reason": "probe_timeout"}))
+
+    def test_message_is_ascii(self):
+        # The homelab's shared kuma_push() helper URL-encodes only spaces, so a
+        # non-ASCII character 400s the push and drops the heartbeat silently.
+        # This sender encodes properly, but the constraint is kept so the
+        # message stays portable to that helper.
+        for reason in ("ok", "timer_masked", "run_timeout", "never_triggered"):
+            _, msg = hl.format_push({"ok": False, "reason": reason, "age_s": 1.0})
+            msg.encode("ascii")
+
+
+class TestPushKuma(unittest.TestCase):
+    class _Response:
+        def __init__(self, body):
+            self._body = body.encode()
+
+        def read(self, n=None):
+            return self._body[:n] if n else self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _push(self, body="{\"ok\":true}", url="http://kuma.example/api/push/TOKEN",
+              raises=None):
+        seen = {}
+
+        def fake_urlopen(target, timeout=None):
+            seen["url"] = target
+            if raises is not None:
+                raise raises
+            return self._Response(body)
+
+        with mock.patch.object(hl.urllib.request, "urlopen", fake_urlopen):
+            outcome = hl.push_kuma(url, "up", "netwatch ok")
+        return outcome, seen.get("url")
+
+    def test_accepted_push(self):
+        outcome, url = self._push()
+        self.assertEqual(outcome, "ok")
+        self.assertIn("status=up", url)
+
+    def test_no_url_configured_is_a_skip_not_a_failure(self):
+        self.assertEqual(hl.push_kuma(None, "up", "x"), "skipped_no_url")
+        self.assertEqual(hl.push_kuma("", "up", "x"), "skipped_no_url")
+
+    def test_http_200_with_ok_false_is_a_failure(self):
+        # Kuma answers a REJECTED push with 200 and {"ok":false}. Trusting the
+        # status code alone is the documented way this goes silently wrong.
+        outcome, _ = self._push(body='{"ok":false,"msg":"Monitor not found"}')
+        self.assertEqual(outcome, "failed_not_ok")
+
+    def test_unparseable_body_is_a_failure(self):
+        outcome, _ = self._push(body="<html>502 Bad Gateway</html>")
+        self.assertEqual(outcome, "failed_bad_body")
+
+    def test_baked_in_template_query_is_stripped(self):
+        # Kuma's UI shows the push URL complete with ?status=up&msg=OK&ping=.
+        # Stored verbatim and appended to, the duplicate keys make Kuma record
+        # msg="[object Object]" while returning 200 the whole time.
+        _, url = self._push(url="http://kuma.example/api/push/TOKEN?status=up&msg=OK&ping=")
+        self.assertEqual(url.count("status="), 1)
+        self.assertEqual(url.count("msg="), 1)
+
+    def test_transport_failure_never_leaks_the_token(self):
+        # HTTPError.__str__ embeds the full URL. The journal on this host is
+        # persistent, so a leaked token would survive reboots.
+        outcome, _ = self._push(
+            raises=hl.urllib.error.HTTPError(
+                "http://kuma.example/api/push/SUPERSECRETTOKEN", 404,
+                "Not Found", {}, None))
+        self.assertEqual(outcome, "failed_HTTPError")
+        self.assertNotIn("SUPERSECRETTOKEN", outcome)
+
+    def test_network_down_is_reported_not_raised(self):
+        outcome, _ = self._push(raises=OSError("Network is unreachable"))
+        self.assertEqual(outcome, "failed_OSError")
