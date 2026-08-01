@@ -1,5 +1,6 @@
 # config.py
 #
+# Reviewed: 2026-08-01 against 3181aac (T-478)
 # Reviewed: 2026-07-31 against b0f8f92 (T-472)
 import math
 import os
@@ -121,13 +122,28 @@ UPPER_CAMERA_RESOLUTION = os.getenv("UPPER_CAMERA_RESOLUTION", CAMERA_RESOLUTION
 LOWER_CAMERA_RESOLUTION = os.getenv("LOWER_CAMERA_RESOLUTION", CAMERA_RESOLUTION)
 IMAGE_INTERVAL_SECONDS = int(os.getenv("IMAGE_INTERVAL_SECONDS", "3600"))
 
-# JPEG quality for the camera captures, 1-100 (T-478).
+# JPEG quality for the camera captures, 0-95 (T-478).
 #
-# _capture_and_publish() invoked fswebcam with no --jpeg flag at all, so the
-# quality parameter was never set and fell through to an out-of-range default.
-# It is visible in the frames themselves: `file(1)` on both live captures
-# reported `quality = 255`, i.e. effectively maximum, which is why a 640x480
-# frame cost 326 KB.
+# The range is fswebcam's, not ours. Its man page: "--jpeg <factor>  Set JPEG as
+# the output image format. The compression factor is a value between 0 and 95,
+# or -1 for automatic. This is the default format, with a factor of -1."
+#
+# _capture_and_publish() invoked fswebcam with no --jpeg flag, so it took that
+# documented -1 default - and on this hardware -1 does NOT mean "automatic". In
+# fswebcam.c the field is `char compression;` (line 180), set to -1 at line 785
+# and passed straight to gdImageJpeg() at line 507 with no validation. Plain
+# `char` is UNSIGNED on ARM, so -1 stores as 255, gd never takes its
+# quality-is-negative "use the default" branch, and hands 255 to libjpeg, which
+# clamps it to 100. Maximum quality, on every frame.
+#
+# The frames say so themselves: `file(1)` on both live captures reports
+# `CREATOR: gd-jpeg v1.0 (using IJG JPEG v62), quality = 255` - gd prints the
+# value it was handed, which is why the artefact names the bug exactly. That is
+# why a 640x480 frame cost 326 KB.
+#
+# Passing an explicit in-range value sidesteps the whole thing. -1 is therefore
+# NOT an accepted value here even though fswebcam documents it: "automatic" is
+# the bug.
 #
 # Measured on the Pi with identical -S 2 -F 2 flags, so the comparison is fair:
 #
@@ -147,20 +163,29 @@ IMAGE_INTERVAL_SECONDS = int(os.getenv("IMAGE_INTERVAL_SECONDS", "3600"))
 # timelapse SHA-256 dedups consecutive frames, so a longer interval could dedup
 # away real growth, and quality has no such interaction.
 _JPEG_QUALITY_DEFAULT = 85
+# fswebcam's own documented bounds. See the docstring below before widening.
+_JPEG_QUALITY_MIN = 0
+_JPEG_QUALITY_MAX = 95
 
 
 def _load_jpeg_quality(var, default):
     """Read a JPEG quality from env, falling back to `default` on anything unusable.
 
+    The range check is the point of the setting rather than defensive padding,
+    and it is fswebcam's documented 0-95 rather than a guess. fswebcam does no
+    validation of its own - `config->compression = atoi(options)` straight into
+    gdImageJpeg() - so anything this module lets through is passed to libgd
+    unchecked. Both ends matter:
+
+    - Above 95 is outside the documented range. libjpeg would clamp to 100,
+      which is the maximum-quality behaviour this ticket exists to stop.
+    - -1 is documented and legal, and is REFUSED anyway: it selects the
+      "automatic" path that stores as 255 on ARM and produces the bug.
+
     Deliberately does NOT raise, for the same reason _load_water_band() does
     not: mqtt.py's systemd unit carries Restart=always with
     StartLimitIntervalSec=0, so a ValueError here is not a loud failure but a
     permanent crash loop that takes the lights and the cameras with it.
-
-    The range check is the point of the setting rather than defensive padding.
-    The bug being fixed IS an out-of-range value - the unset flag resolved to
-    255 - so accepting 255 from the environment would reinstate it through a
-    different door while looking configured.
     """
     import logging
 
@@ -173,10 +198,10 @@ def _load_jpeg_quality(var, default):
         logging.getLogger(__name__).error(
             "Unparseable %s=%r; using %s", var, raw, default)
         return default
-    if not 1 <= value <= 100:
+    if not _JPEG_QUALITY_MIN <= value <= _JPEG_QUALITY_MAX:
         logging.getLogger(__name__).error(
-            "Refusing out-of-range %s=%r (must be 1-100); using %s",
-            var, raw, default)
+            "Refusing out-of-range %s=%r (fswebcam accepts %s-%s); using %s",
+            var, raw, _JPEG_QUALITY_MIN, _JPEG_QUALITY_MAX, default)
         return default
     return value
 

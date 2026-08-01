@@ -1,5 +1,6 @@
 # mqtt.py
 #
+# Reviewed: 2026-08-01 against 3181aac (T-475, T-478)
 # Reviewed: 2026-07-31 against b0f8f92 (T-472)
 import math
 import subprocess
@@ -149,10 +150,19 @@ RETIRED_STATE_TOPICS = [
 #                                  not energise anything. Its answer now goes to
 #                                  the log rather than to a topic.
 #
-# temperature/get and humidity/get are GONE. temperature_sensor and
-# humidity_sensor are None on this unit, so those handlers could only ever raise
-# AttributeError into on_message's catch-all - a subscription whose sole effect
-# was a logged traceback.
+# temperature/get and humidity/get are dropped from this list. temperature_sensor
+# and humidity_sensor are None on this unit, so those handlers could only ever
+# raise AttributeError into on_message's catch-all - a subscription whose sole
+# effect was a logged traceback.
+#
+# Note what removing them from this list does NOT do. The session is durable
+# (clean_session=False with a stable client_id), so the broker still holds the
+# subscriptions it was given on earlier connects; subscribe() only ever adds,
+# and nothing here calls unsubscribe(). Those two topics therefore keep being
+# delivered until the session is reset. That is harmless - the handlers are
+# gone, so the elif chain falls through and the message is ignored, which is
+# strictly better than the AttributeError it used to raise - but this list
+# describes the CLIENT's intent, not the broker's state.
 COMMAND_SUBSCRIPTIONS = [
     (BASE_TOPIC + "/light/command", 1),
     (BASE_TOPIC + "/light/brightness/set", 1),
@@ -254,7 +264,12 @@ def clear_retired_entities(client):
         # every later one, so HA re-creates the entity on its next restart and
         # the clear looks like it worked.
         client.publish(topic, "", retain=True)
-    logger.warning(
+    # INFO, not WARNING. This fires on every connect - roughly 25 times a day,
+    # forever - for what is a no-op after the first one. The logging policy at
+    # the top of this file is a deliberate trade that demoted the periodic
+    # publishers to debug so ~576 camera lines a day could not bury four
+    # meaningful light events; a WARNING here would spend that budget again.
+    logger.info(
         f"Cleared {len(RETIRED_DISCOVERY_TOPICS)} retired discovery configs "
         f"and {len(RETIRED_STATE_TOPICS)} retained state topics"
     )
@@ -820,12 +835,16 @@ def _capture_and_publish(client, label, device, resolution, quality, image_path,
     different setting from the flaky lower one.
 
     --jpeg is passed EXPLICITLY and is not optional (T-478). Omitting it does
-    not select a sane default - it leaves gd's quality parameter unset, and the
-    frames this unit produced carried `quality = 255` in their own JPEG
-    comment. That cost ~748 KB per five-minute cycle against ~169 KB at 85, on
-    a host whose only sustained TX load this is. Passing it as an argument
-    rather than reading a module global mirrors `resolution` and is what lets
-    the two cameras differ.
+    not select a sane default: fswebcam's documented default factor is -1
+    ("automatic"), it holds that in a `char`, and plain `char` is UNSIGNED on
+    ARM - so on this Pi -1 becomes 255, libgd's use-the-default branch is never
+    taken, and libjpeg clamps 255 to maximum quality. The frames name the bug
+    themselves, carrying `quality = 255` in their own JPEG comment. That cost
+    ~748 KB per five-minute cycle against ~169 KB at 85, on a host where this
+    burst is the only sustained TX load.
+
+    Passing quality as an argument rather than reading a module global mirrors
+    `resolution` and is what lets the two cameras differ.
     """
     try:
         subprocess.check_call([

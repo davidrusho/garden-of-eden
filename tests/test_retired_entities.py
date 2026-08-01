@@ -122,13 +122,25 @@ class RecordingClient:
 
     def __init__(self):
         self.calls = []
+        self.subscriptions = []
 
     def publish(self, topic, payload=None, qos=0, retain=False, properties=None):
         self.calls.append(Publication(topic, payload, qos, retain))
         return MagicMock()
 
-    def subscribe(self, *args, **kwargs):
-        return None
+    def subscribe(self, topic, qos=0, options=None, properties=None):
+        # Recorded, not swallowed. This double returned None and kept no record
+        # at first, and a mutant deleting the whole
+        # `client.subscribe(COMMAND_SUBSCRIPTIONS)` line SURVIVED - every
+        # "topic X is no longer published" assertion stayed green while the
+        # light command, the pump command and water/low/cm/set were all silent
+        # on the wire. Asserting membership of COMMAND_SUBSCRIPTIONS proves
+        # only that the module agrees with itself; nothing connected the
+        # constant to the client until this recorded it.
+        if isinstance(topic, list):
+            self.subscriptions.extend(topic)
+        else:
+            self.subscriptions.append((topic, qos))
 
     # --- read helpers -------------------------------------------------------
 
@@ -313,6 +325,38 @@ class TestConnectSequencing(RetiredEntitiesTestBase):
                 self.assertEqual(len(self.client.to(topic)), 1)
         self.assertEqual(len(self.client.to("gardyn/light/state")), 1)
         self._threads.assert_called_once()
+
+    def test_connect_actually_subscribes_the_command_topics(self):
+        # Asserted against LITERALS and against what reached the client, not
+        # against COMMAND_SUBSCRIPTIONS. Deleting the subscribe call silences
+        # every inbound command - including water/low/cm/set, the only runtime
+        # path to the interlock's threshold - while leaving all the
+        # absence-assertions in this file perfectly green.
+        self._connect()
+        subscribed = [t for t, _ in self.client.subscriptions]
+        for topic in ("gardyn/light/command", "gardyn/light/brightness/set",
+                      "gardyn/pump/command", "gardyn/pump/speed/set",
+                      "gardyn/water/low/cm/set", "gardyn/water/level/get",
+                      "gardyn/pcb/temperature/get"):
+            with self.subTest(topic=topic):
+                self.assertIn(topic, subscribed)
+
+    def test_connect_does_not_subscribe_the_retired_get_topics(self):
+        self._connect()
+        subscribed = [t for t, _ in self.client.subscriptions]
+        self.assertNotIn("gardyn/temperature/get", subscribed)
+        self.assertNotIn("gardyn/humidity/get", subscribed)
+
+    def test_commands_are_subscribed_at_qos_1_so_the_broker_queues_them(self):
+        # QoS 1 paired with the durable session is what lets a command survive
+        # a brief drop. At QoS 0 the broker discards it silently.
+        self._connect()
+        qos = dict(self.client.subscriptions)
+        for topic in ("gardyn/light/command", "gardyn/light/brightness/set",
+                      "gardyn/pump/command", "gardyn/pump/speed/set",
+                      "gardyn/water/low/cm/set"):
+            with self.subTest(topic=topic):
+                self.assertEqual(qos[topic], 1)
 
     def test_connect_announces_the_device_online(self):
         self._connect()

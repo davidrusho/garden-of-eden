@@ -124,10 +124,12 @@ class WaterTestBase(unittest.TestCase):
         mqtt_mod.distance_sensor = self.sensor
         mqtt_mod.client = self.client
         mqtt_mod.pump = MagicMock()
-        # Real number, not a bare Mock: publish_pump_state() compares get_speed()
-        # against 0, and a Mock there raises a TypeError that on_message's
-        # catch-all swallows - which would let these tests pass while the state
-        # publish they are meant to exercise never runs.
+        # Real number, not a bare Mock. on_message's pump/speed/set branch and
+        # toggle_pump() both compare get_speed() against 0, and a Mock there
+        # raises a TypeError that the catch-all swallows - which would let
+        # these tests pass while the code they exercise never runs. (The
+        # original reason named publish_pump_state(), which T-475 deleted; the
+        # two remaining comparisons keep the requirement alive.)
         mqtt_mod.pump.get_speed.return_value = 0
         mqtt_mod.light = MagicMock()
         mqtt_mod.light.get_brightness.return_value = 0

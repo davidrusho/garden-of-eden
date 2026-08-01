@@ -32,6 +32,22 @@ from tests.test_water_interlock import mqtt_mod
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _is_git_checkout():
+    """Ask git, rather than looking for a .git DIRECTORY.
+
+    In a linked worktree `.git` is a file containing a gitdir pointer, so an
+    isdir() test reports "not a checkout" and silently skips a test that should
+    have run.
+    """
+    import subprocess as sp
+    try:
+        return sp.run(["git", "rev-parse", "--is-inside-work-tree"],
+                      cwd=_REPO_ROOT, stdout=sp.DEVNULL,
+                      stderr=sp.DEVNULL).returncode == 0
+    except (OSError, sp.SubprocessError):
+        return False
+
+
 class TestFswebcamArgv(unittest.TestCase):
     """What actually reaches the fswebcam process."""
 
@@ -179,19 +195,32 @@ class TestQualityConfigLoading(unittest.TestCase):
         )
 
     def test_255_is_refused(self):
-        # The exact value the unset flag resolved to. Accepting it from the
+        # The exact value the frames reported. Accepting it from the
         # environment would reinstate the bug through a different door while
         # looking configured.
         self.assertEqual(self._load(CAMERA_JPEG_QUALITY="255"), (85, 85, 85))
 
-    def test_out_of_range_values_are_refused(self):
-        for bad in ("0", "-1", "101", "1000"):
+    def test_minus_one_is_refused_even_though_fswebcam_documents_it(self):
+        # fswebcam's man page lists -1 as legal ("automatic"), and -1 is
+        # precisely the bug: it is the default the missing flag selected, and
+        # it becomes 255 in an unsigned char on ARM.
+        self.assertEqual(self._load(CAMERA_JPEG_QUALITY="-1")[0], 85)
+
+    def test_values_above_fswebcams_range_are_refused(self):
+        # fswebcam(1): "The compression factor is a value between 0 and 95".
+        # It validates nothing itself - atoi() straight into gdImageJpeg - so
+        # 96-100 would reach libjpeg and clamp to maximum quality, which is the
+        # behaviour this ticket removes.
+        for bad in ("96", "100", "101", "1000"):
             with self.subTest(value=bad):
                 self.assertEqual(self._load(CAMERA_JPEG_QUALITY=bad)[0], 85)
 
-    def test_the_range_edges_are_accepted(self):
-        self.assertEqual(self._load(CAMERA_JPEG_QUALITY="1")[0], 1)
-        self.assertEqual(self._load(CAMERA_JPEG_QUALITY="100")[0], 100)
+    def test_the_documented_range_edges_are_accepted(self):
+        # 0 and 95 are fswebcam's stated bounds. 0 is useless in practice but
+        # it is legal, and inventing a narrower range here would be this
+        # module second-guessing the tool it drives.
+        self.assertEqual(self._load(CAMERA_JPEG_QUALITY="0")[0], 0)
+        self.assertEqual(self._load(CAMERA_JPEG_QUALITY="95")[0], 95)
 
     def test_unparseable_values_fall_back_instead_of_raising(self):
         # An exception here is not a loud failure: mqtt.service carries
@@ -216,16 +245,31 @@ class TestEnvTemplateShipsTheSetting(unittest.TestCase):
     configured, and no secret scan complains.
     """
 
-    def test_the_template_is_tracked_and_documents_the_quality(self):
-        import subprocess as sp
-        tracked = sp.run(["git", "ls-files", ".env-dist"], cwd=_REPO_ROOT,
-                         stdout=sp.PIPE, text=True).stdout.strip()
-        self.assertEqual(tracked, ".env-dist",
-                         ".env-dist is not tracked - a fresh checkout has no "
-                         "template to copy")
+    def test_the_template_documents_the_quality(self):
         with open(os.path.join(_REPO_ROOT, ".env-dist")) as fh:
             body = fh.read()
         self.assertIn("CAMERA_JPEG_QUALITY=85", body)
+
+    @unittest.skipUnless(_is_git_checkout(),
+                         "not a git checkout - nothing to ask git about")
+    def test_the_template_is_git_tracked(self):
+        # Skipped rather than failed outside a checkout. This ran as a hard
+        # assertion first and produced a FALSE RED inside a `git archive` copy,
+        # which is the worst outcome for a test whose whole job is to make a
+        # packaging mistake visible.
+        #
+        # The skip predicate ASKS GIT rather than looking for a .git directory.
+        # First attempt used os.path.isdir(".git") and skipped in this repo's
+        # own worktree, where .git is a FILE pointing at the real gitdir - a
+        # test that silently opts out is barely better than one that is absent.
+        import subprocess as sp
+        proc = sp.run(["git", "ls-files", ".env-dist"], cwd=_REPO_ROOT,
+                      stdout=sp.PIPE, stderr=sp.PIPE, text=True)
+        # Checked separately, so "git failed" cannot masquerade as "untracked".
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), ".env-dist",
+                         ".env-dist is not tracked - a fresh clone would have "
+                         "no template to copy, and no secret scan would notice")
 
 
 if __name__ == "__main__":

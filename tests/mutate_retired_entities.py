@@ -156,6 +156,28 @@ MUTANTS = [
      '    raise RuntimeError("clear exploded")\n'
      "    for topic in RETIRED_DISCOVERY_TOPICS + RETIRED_STATE_TOPICS:"),
 
+    # Added after review: the first two SURVIVED the original battery, because
+    # the suite asserted membership of COMMAND_SUBSCRIPTIONS - the module
+    # agreeing with itself - while the fake client's subscribe() swallowed its
+    # argument. Deleting the call silences every inbound command, including the
+    # only runtime path to the interlock's threshold, and every
+    # absence-assertion in the suite stayed green.
+    ("delete client.subscribe() - silences every command, publishes nothing wrong",
+     "    client.subscribe(COMMAND_SUBSCRIPTIONS)\n",
+     ""),
+
+    ("subscribe to an EMPTY list instead of the command topics",
+     "    client.subscribe(COMMAND_SUBSCRIPTIONS)",
+     "    client.subscribe([])"),
+
+    ("drop the interlock's threshold topic from the subscriptions",
+     '    (BASE_TOPIC + "/water/low/cm/set", 1),\n',
+     ""),
+
+    ("downgrade the commands to QoS 0, so the broker discards them when offline",
+     '    (BASE_TOPIC + "/pump/command", 1),',
+     '    (BASE_TOPIC + "/pump/command", 0),'),
+
     ("delete a SURVIVING discovery block (the light)",
      "    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)\n\n"
      "    # The Pump discovery block stood here (T-475).",

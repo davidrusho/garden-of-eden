@@ -79,13 +79,18 @@ MUTANTS = [
 
     (CONFIG,
      "drop the range check, so 255 is accepted from the environment",
-     "    if not 1 <= value <= 100:",
+     "    if not _JPEG_QUALITY_MIN <= value <= _JPEG_QUALITY_MAX:",
      "    if False:"),
 
     (CONFIG,
-     "widen the range to admit 0, the fully-degraded end",
-     "    if not 1 <= value <= 100:",
-     "    if not 0 <= value <= 255:"),
+     "widen the ceiling past fswebcam's documented 95",
+     "_JPEG_QUALITY_MAX = 95",
+     "_JPEG_QUALITY_MAX = 100"),
+
+    (CONFIG,
+     "admit -1, the 'automatic' factor that IS the bug on ARM",
+     "_JPEG_QUALITY_MIN = 0",
+     "_JPEG_QUALITY_MIN = -1"),
 
     (CONFIG,
      "raise on an unparseable value instead of falling back (crash loop)",
