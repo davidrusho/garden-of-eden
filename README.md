@@ -395,6 +395,13 @@ Two USB cameras.
 
 Uses the ultrasonic distance sensor DYP-A01-V2.0.
 
+> **Minimum measuring distance is 28 cm.** Per DYP, the A01A series has a 28 cm
+> dead zone, and anything closer is reported as 28 cm rather than as an error.
+> If the sensor sits closer than 28 cm to the water at any fill level, it keeps
+> returning 28 cm instead of a value that would show something is wrong. Mount
+> it high enough to clear the dead zone across the full range, or use a sensor
+> with a shorter minimum for a shallow reservoir.
+
 #### Pins
 
 - [GPIO-19 | PIN-35](https://pinout.xyz/pinout/pin35_gpio19/): water level in (trigger)
@@ -402,12 +409,13 @@ Uses the ultrasonic distance sensor DYP-A01-V2.0.
 
 #### Method
 
-- Uses time between the echo and response to deterine the distances.
+- Uses time between the echo and response to determine the distances.
 
 #### References
 
+- [DYP-A01 product page](https://www.dypcn.com/high-performance-ultrasonic-precision-rangefinder-dyp-a01-product/):
+  measuring range 280 mm to 7500 mm, 28 cm dead zone
 - <https://www.google.com/search?q=DYP-A01-V2.0>
-- <https://www.dypcn.com/uploads/A02-Datasheet.pdf>
 
 ### Momentary Button
 
