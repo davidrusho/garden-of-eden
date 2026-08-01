@@ -265,4 +265,7 @@ create_bash_script_symlinks
 #Note: pigpiod will be started by mqtt.service
 #enable_pigpiod_service
 
-install_systemd_units
+# `|| exit 1` rather than a bare call: this happens to be the last line today,
+# so setup.sh's exit status would be the function's by position alone, and
+# anything appended below would silently swallow a failed unit install.
+install_systemd_units || exit 1

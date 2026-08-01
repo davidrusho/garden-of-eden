@@ -82,13 +82,13 @@ EOF
 MUTANTS = [
     ("i1", "make the install a no-op - no unit ever reaches systemd",
      INSTALLER,
-     'sudo install -m 0644 "$src" "$dest" || fail "failed to install $u to $dest"',
-     'true "$src" "$dest"'),
+     '    if sudo install -m 0644 "$src" "$dest"; then',
+     '    if true; then'),
 
-    ("i2", "swallow an install failure instead of aborting",
+    ("i2", "swallow an install failure instead of recording it",
      INSTALLER,
-     '|| fail "failed to install $u to $dest"',
-     '|| true'),
+     '        record_failure "failed to install $u to $dest"',
+     '        :'),
 
     ("i3", "drop the mode, letting units land at whatever umask gives",
      INSTALLER,
@@ -97,23 +97,23 @@ MUTANTS = [
 
     ("i4", "restart on every run, bouncing the controller during a no-op setup",
      INSTALLER,
-     '    if is_changed "$u"; then',
+     '    if in_list "$u" ${changed[@]+"${changed[@]}"}; then',
      '    if true; then'),
 
     ("i5", "never restart, so a changed unit file is installed but not applied",
      INSTALLER,
-     'sudo systemctl restart "$u" || fail "systemctl restart $u failed"',
-     'sudo systemctl start "$u" || fail "systemctl start $u failed"'),
+     '        if sudo systemctl restart "$u"; then',
+     '        if sudo systemctl start "$u"; then'),
 
     ("i6", "drop the daemon-reload",
      INSTALLER,
-     'sudo systemctl daemon-reload || fail "systemctl daemon-reload failed"',
+     'sudo systemctl daemon-reload || record_failure "systemctl daemon-reload failed"',
      'true'),
 
     ("i7", "enable everything, including the two units with no [Install]",
      INSTALLER,
-     '    if ! grep -q \'^\\[Install\\]\' "$UNIT_SRC_DIR/$u"; then',
-     '    if false; then'),
+     "    grep -q '^\\[Install\\]' \"$UNIT_SRC_DIR/$u\"\n    case $? in\n        0) ;;",
+     "    grep -q '^\\[Install\\]' \"$UNIT_SRC_DIR/$u\"\n    case 0 in\n        0) ;;"),
 
     ("i8", "remove the empty-directory guard (the clean-zero failure)",
      INSTALLER,
@@ -132,18 +132,78 @@ MUTANTS = [
 
     ("i11", "swallow an enable failure",
      INSTALLER,
-     'sudo systemctl enable "$u" || fail "systemctl enable $u failed"',
-     'sudo systemctl enable "$u" || true'),
+     '        record_failure "systemctl enable $u failed"',
+     '        :'),
 
     ("i12", "install everything in the directory, unit file or not",
      INSTALLER,
-     'for f in "$UNIT_SRC_DIR"/*.service "$UNIT_SRC_DIR"/*.timer; do',
-     'for f in "$UNIT_SRC_DIR"/*; do'),
+     '         "$UNIT_SRC_DIR"/*.slice; do',
+     '         "$UNIT_SRC_DIR"/*; do'),
 
-    ("i13", "drop the ExecStart-path preflight warning",
+    ("i24", "narrow the glob back, silently dropping other unit types",
      INSTALLER,
-     '            [ -e "$token" ] || log_warn "$unit: ExecStart path does not exist on this host: $token"',
-     '            :'),
+     '         "$UNIT_SRC_DIR"/*.socket "$UNIT_SRC_DIR"/*.path \\\n',
+     ''),
+
+    ("i25", "let the ExecStart split glob against the cwd",
+     INSTALLER,
+     '    set -f\n    while IFS= read -r line; do',
+     '    while IFS= read -r line; do'),
+
+    ("i13", "drop the ExecStart-path check inside the can-this-run gate",
+     INSTALLER,
+     '            if [ ! -e "$token" ]; then',
+     '            if false; then'),
+
+    ("i14", "drop the mask (symlink destination) guard",
+     INSTALLER,
+     '    if [ -L "$dest" ]; then',
+     '    if false; then'),
+
+    ("i15", "drop the directory-destination guard",
+     INSTALLER,
+     '    if [ -d "$dest" ]; then',
+     '    if false; then'),
+
+    ("i16", "drop the can-this-unit-run gate, arming a watchdog that cannot run",
+     INSTALLER,
+     '    if ! unit_can_run "$u"; then',
+     '    if false; then'),
+
+    ("i17", "judge a .timer on itself, so every timer passes the gate",
+     INSTALLER,
+     '                unit_can_run "${unit%.timer}.service" || return 1',
+     '                :'),
+
+    ("i18", "abort on the first enable failure, stranding the later units",
+     INSTALLER,
+     '        record_failure "systemctl enable $u failed"',
+     '        fail "systemctl enable $u failed"'),
+
+    ("i19", "abort on the first restart failure, stranding the later units",
+     INSTALLER,
+     '            record_failure "systemctl restart $u failed"',
+     '            fail "systemctl restart $u failed"'),
+
+    ("i20", "drop the drop-in directory refusal",
+     INSTALLER,
+     '        *.d) fail "drop-in directory not supported by this installer: $(basename "$f")" ;;',
+     '        *.d) ;;'),
+
+    ("i21", "collect the failures and then exit 0 anyway",
+     INSTALLER,
+     'if [ ${#failures[@]} -gt 0 ]; then',
+     'if false; then'),
+
+    ("i22", "drop the nothing-was-installed guard",
+     INSTALLER,
+     'if [ ${#installed[@]} -eq 0 ]; then',
+     'if false; then'),
+
+    ("i23", "report an ordinary first install as an unreadable destination",
+     INSTALLER,
+     '    if [ ! -e "$dest" ]; then',
+     '    if false; then'),
 
     ("s1", "REINTRODUCE the heredoc that overwrites the tracked unit file",
      SETUP,
@@ -152,8 +212,18 @@ MUTANTS = [
 
     ("s2", "stop calling the installer from main",
      SETUP,
-     '\ninstall_systemd_units\n',
-     '\n#install_systemd_units\n'),
+     '\ninstall_systemd_units || exit 1\n',
+     '\n#install_systemd_units || exit 1\n'),
+
+    ("s3", "let setup.sh swallow the installer's failure",
+     SETUP,
+     'install_systemd_units || exit 1',
+     'install_systemd_units'),
+
+    ("s4", "return success from a failed unit install",
+     SETUP,
+     '        log_error "systemd unit installation failed."\n        return 1',
+     '        log_error "systemd unit installation failed."\n        return 0'),
 
     ("m1", "drop StartLimitIntervalSec=0 (half the T-471 boot fix)",
      MQTT_UNIT,

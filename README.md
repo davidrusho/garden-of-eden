@@ -110,11 +110,23 @@ To redeploy the units without re-running the whole setup:
 ./bin/install-systemd-units.sh
 ```
 
-It installs every `*.service` and `*.timer` in that directory — the list is
-derived from the directory, so a new unit needs no edit to the script — enables
-the ones that carry an `[Install]` section, and restarts only the units whose
-file actually changed. Units with no `[Install]` section are `Type=oneshot`
-jobs started by their timer, so they are installed but never enabled directly.
+It installs every unit file in that directory — the list is derived from the
+directory, so a new unit needs no edit to the script — enables the ones that
+carry an `[Install]` section, and restarts only the units whose file actually
+changed. Units with no `[Install]` section are `Type=oneshot` jobs started by
+their timer, so they are installed but never enabled directly.
+
+Because it restarts only on a unit-file change, a pull that changes **only**
+Python still needs `sudo systemctl restart mqtt.service` to take effect.
+
+> **The shipped units are written for one specific deployment.** They hardcode
+> `User=gardyn` and `/home/gardyn/garden-of-eden`, and `gardyn-netwatch` is a
+> watchdog that reconnects Wi-Fi and can **reboot the host**, aimed at fixed
+> LAN addresses in `bin/gardyn-netwatch.py`. The installer will not enable a
+> unit whose `ExecStart` path does not exist on the machine, so a checkout
+> somewhere else gets the files but nothing armed. That guard is not enough if
+> your paths happen to match: edit `TARGETS`, `TCP_PROBE_HOST` and `WLAN_UUID`,
+> or delete the two `gardyn-netwatch` units, before running setup.
 
 ## Usage
 

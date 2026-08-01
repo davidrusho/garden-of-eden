@@ -21,15 +21,34 @@
 #      things that exist to make the next outage answerable and recoverable.
 #
 # The unit list is DERIVED FROM THE DIRECTORY, not hand-maintained, because a
-# hand-maintained list is how (3) happened: a new *.service or *.timer dropped
-# into the source directory is deployed by the next run with no edit here.
-# What gets ENABLED is derived from the presence of an `[Install]` section, so
-# the two Type=oneshot units driven by timers are installed but never enabled
-# directly - `systemctl enable` fails on a unit with no [Install].
+# hand-maintained list is how (3) happened: a new unit file dropped into the
+# source directory is deployed by the next run with no edit here. What gets
+# ENABLED is derived from the presence of an `[Install]` section, so the two
+# Type=oneshot units driven by timers are installed but never enabled directly.
+# (`systemctl enable` on a unit with no [Install] does not fail - per
+# systemctl(1) it "shows a warning" - so this grep is what makes the intent
+# explicit rather than what avoids an error.)
+#
+# NOTHING IS ENABLED THAT CANNOT RUN. A unit whose ExecStart names a path that
+# does not exist on this host is installed but not enabled, and the run exits
+# non-zero. That matters because this is a PUBLIC repository: gardyn-netwatch
+# is a watchdog that can REBOOT the host and is hardcoded for one specific LAN,
+# so a checkout somewhere else must not quietly end up with it armed. The gate
+# is not sufficient for a fork that happens to match these paths - see the
+# README - but it makes the common case safe.
 #
 # Safe to re-run. A unit whose deployed copy already matches is re-installed
 # (cheap, idempotent) but NOT restarted, so routine setup runs do not bounce
 # the grow-light controller.
+#
+# KNOWN LIMIT. The restart decision compares the source file to the DEPLOYED
+# FILE, not to what systemd currently has loaded. A run killed outright (^C,
+# SIGKILL) between the install and the restart therefore leaves the new file on
+# disk and the old definition running, and the next run sees no difference and
+# does not restart. Every failure this script HANDLES is collected rather than
+# aborted on, precisely so that window stays closed for the failures that can
+# be anticipated; a hard kill cannot be covered from inside the script. If a
+# run is interrupted, `sudo systemctl restart mqtt.service` by hand.
 #
 # Environment seams, both defaulted for real use and overridden only by tests:
 #   SYSTEMD_UNIT_DIR      where units are installed  (default /etc/systemd/system)
@@ -39,21 +58,33 @@
 # unbound-variable error. Failures are handled explicitly instead.
 set -o pipefail
 
-GRN="\e[32m"
-RED="\e[31m"
-YLW="\e[33m"
-GRY="\e[90m"
-LGY="\e[37m"
-RST="\e[0m"
+# \033 rather than \e: bash 3.2's builtin echo does not expand \e, and this
+# script is run by its shebang, so it gets whatever /bin/bash is.
+GRN="\033[32m"
+RED="\033[31m"
+YLW="\033[33m"
+GRY="\033[90m"
+LGY="\033[37m"
+RST="\033[0m"
 
 function log_error { echo -e "[${RED}ERROR${RST}]: $*" >&2; }
 function log_warn  { echo -e "[${YLW}WARN${RST}]: $*" >&2; }
 function log_pass  { echo -e "[${GRN}PASS${RST}]: $*"; }
 function log_info  { echo -e "[${GRY}INFO${RST}]: ${LGY}$*${RST}" >&2; }
 
+# An unrecoverable problem: nothing has been installed and nothing can be.
 function fail {
     log_error "$*"
     exit 1
+}
+
+# A problem that must not stop the remaining units being installed and armed.
+# Aborting mid-sequence is what leaves a unit installed but not activated, so
+# these are collected and reported together at the end.
+failures=()
+function record_failure {
+    log_error "$*"
+    failures+=("$*")
 }
 
 # Portable, and deliberately not `readlink -f` / `realpath`: this script is
@@ -71,12 +102,19 @@ UNIT_DEST_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 units=()
 strays=()
 shopt -s nullglob
-for f in "$UNIT_SRC_DIR"/*.service "$UNIT_SRC_DIR"/*.timer; do
+for f in "$UNIT_SRC_DIR"/*.service "$UNIT_SRC_DIR"/*.timer \
+         "$UNIT_SRC_DIR"/*.socket "$UNIT_SRC_DIR"/*.path \
+         "$UNIT_SRC_DIR"/*.target "$UNIT_SRC_DIR"/*.mount \
+         "$UNIT_SRC_DIR"/*.slice; do
     units+=("$(basename "$f")")
 done
 for f in "$UNIT_SRC_DIR"/*; do
     case "$f" in
-        *.service|*.timer) ;;
+        *.service|*.timer|*.socket|*.path|*.target|*.mount|*.slice) ;;
+        # A drop-in directory is a real override mechanism, and this script has
+        # no way to deploy one. Silently leaving it behind is the exact class of
+        # bug this script was written to remove, so refuse instead.
+        *.d) fail "drop-in directory not supported by this installer: $(basename "$f")" ;;
         *) strays+=("$(basename "$f")") ;;
     esac
 done
@@ -87,90 +125,184 @@ shopt -u nullglob
 # installs nothing and reports success - the deployment equivalent of a scan
 # that cannot fail.
 if [ ${#units[@]} -eq 0 ]; then
-    fail "no *.service or *.timer files found in $UNIT_SRC_DIR - refusing to report success for a run that installed nothing"
+    fail "no unit files found in $UNIT_SRC_DIR - refusing to report success for a run that installed nothing"
 fi
 
 if [ ${#strays[@]} -gt 0 ]; then
-    log_warn "not a unit file, NOT installed: ${strays[*]}"
+    log_warn "not a systemd unit file, NOT installed: ${strays[*]}"
 fi
 
-# --- preflight: do the units point at paths that exist on this host? ---------
+# --- can this unit actually run on this host? --------------------------------
 #
-# The shipped units carry absolute paths for the deployment they were written
-# for. A checkout under a different user or directory installs cleanly and then
-# fails at start time with nothing in the setup output to explain it, so name
-# the mismatch here. A warning, not an error: the operator may be installing
-# units for a path that is about to exist.
-function warn_on_missing_exec_paths {
-    local unit="$1"
-    local line token
+# Returns 0 when every absolute path named by an ExecStart line exists. The
+# shipped units carry absolute paths for the deployment they were written for,
+# so this is what distinguishes "installing onto the host these were written
+# for" from "installing onto some other machine".
+#
+# Known gaps, all in the direction of NOT warning: a quoted ExecStart argument,
+# a backslash continuation line, and a relative executable resolved from $PATH.
+function unit_can_run {
+    local unit="$1" line token ok=0
+
+    # A .timer has no ExecStart of its own - it arms the .service of the same
+    # name. Judging it on its own contents would pass every timer, which is
+    # exactly backwards for gardyn-netwatch.timer: the timer is what arms the
+    # watchdog, and the unrunnable thing is the service behind it.
+    case "$unit" in
+        *.timer)
+            if [ -f "$UNIT_SRC_DIR/${unit%.timer}.service" ]; then
+                unit_can_run "${unit%.timer}.service" || return 1
+            fi
+            ;;
+    esac
+
     # Word-split the ExecStart value but do NOT glob it: an unquoted expansion
     # would otherwise let a `*` in a unit file expand against the cwd.
     set -f
     while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"     # strip leading whitespace
         for token in ${line#ExecStart=}; do
+            # systemd allows a run of prefix characters before the path.
+            while [ -n "$token" ]; do
+                case "$token" in
+                    [-+!@:]*) token="${token:1}" ;;
+                    *) break ;;
+                esac
+            done
             case "$token" in
-                -/*|+/*|@/*|!/*) token="${token:1}" ;;
                 /*) ;;
                 *) continue ;;
             esac
-            [ -e "$token" ] || log_warn "$unit: ExecStart path does not exist on this host: $token"
+            if [ ! -e "$token" ]; then
+                log_warn "$unit: ExecStart path does not exist on this host: $token"
+                ok=1
+            fi
         done
-    done < <(grep '^ExecStart=' "$UNIT_SRC_DIR/$unit")
+    done < <(grep -E '^[[:space:]]*ExecStart=' "$UNIT_SRC_DIR/$unit")
     set +f
+    return $ok
 }
-
-for u in "${units[@]}"; do
-    warn_on_missing_exec_paths "$u"
-done
 
 # --- install -----------------------------------------------------------------
 changed=()
+installed=()
 for u in "${units[@]}"; do
     src="$UNIT_SRC_DIR/$u"
     dest="$UNIT_DEST_DIR/$u"
 
-    if cmp -s "$src" "$dest"; then
-        log_info "$u already matches the deployed copy"
-    else
+    # A symlink here is almost always `systemctl mask` (a link to /dev/null),
+    # and GNU install unlinks the destination before writing - so installing
+    # over it silently unmasks the unit. Refuse and say so.
+    if [ -L "$dest" ]; then
+        record_failure "$u: destination is a symlink (masked?): $dest -> $(readlink "$dest")"
+        continue
+    fi
+    if [ -d "$dest" ]; then
+        # `install SOURCE DIRECTORY` is a valid second form and exits 0, copying
+        # INTO the directory. The `|| fail` guard cannot see that.
+        record_failure "$u: destination is a directory, not a unit file: $dest"
+        continue
+    fi
+
+    if [ ! -e "$dest" ]; then
+        # The ordinary first-install case. `cmp` reports this as rc 2, the same
+        # code it uses for "could not read", so checking first keeps a routine
+        # install from emitting an alarming warning.
         changed+=("$u")
+    else
+        cmp -s "$src" "$dest"
+        case $? in
+            0) log_info "$u already matches the deployed copy" ;;
+            1) changed+=("$u") ;;
+            *) log_warn "$u: cannot compare with $dest - treating as changed"
+               changed+=("$u") ;;
+        esac
     fi
 
     # 0644 root:root, matching what is deployed. `install` under sudo already
     # produces root ownership, so -o/-g would be redundant - and would break
     # the test harness, which runs the real command unprivileged.
-    sudo install -m 0644 "$src" "$dest" || fail "failed to install $u to $dest"
+    if sudo install -m 0644 "$src" "$dest"; then
+        installed+=("$u")
+    else
+        record_failure "failed to install $u to $dest"
+    fi
 done
 
-sudo systemctl daemon-reload || fail "systemctl daemon-reload failed"
+if [ ${#installed[@]} -eq 0 ]; then
+    log_error "no unit was installed"
+    exit 1
+fi
 
-function is_changed {
-    local needle="$1" c
-    for c in ${changed[@]+"${changed[@]}"}; do
+sudo systemctl daemon-reload || record_failure "systemctl daemon-reload failed"
+
+function in_list {
+    local needle="$1"; shift
+    local c
+    for c in "$@"; do
         [ "$c" = "$needle" ] && return 0
     done
     return 1
 }
 
-# --- enable and start --------------------------------------------------------
-for u in "${units[@]}"; do
-    if ! grep -q '^\[Install\]' "$UNIT_SRC_DIR/$u"; then
-        log_info "$u has no [Install] section - installed, not enabled (its timer starts it)"
+# --- enable ------------------------------------------------------------------
+#
+# Every enable happens before any start. Interleaving them meant a failure to
+# start the first unit aborted before the later units were ever enabled - and
+# the later units are the health sampler and the network watchdog, the two this
+# script exists to stop losing. Enablement is what survives a reboot, so it is
+# the half to secure first.
+enableable=()
+for u in ${installed[@]+"${installed[@]}"}; do
+    grep -q '^\[Install\]' "$UNIT_SRC_DIR/$u"
+    case $? in
+        0) ;;
+        1) log_info "$u has no [Install] section - installed, not enabled (its timer starts it)"
+           continue ;;
+        *) record_failure "$u: could not read $UNIT_SRC_DIR/$u to look for an [Install] section"
+           continue ;;
+    esac
+
+    if ! unit_can_run "$u"; then
+        record_failure "$u: NOT enabled - it names a path that does not exist on this host. These units are written for one specific deployment; see the README before running this elsewhere."
         continue
     fi
 
-    sudo systemctl enable "$u" || fail "systemctl enable $u failed"
-
-    if is_changed "$u"; then
-        # The unit file changed, so a plain `start` would leave the running
-        # instance on the old definition.
-        sudo systemctl restart "$u" || fail "systemctl restart $u failed"
-        log_pass "$u installed (changed), enabled and restarted"
+    if sudo systemctl enable "$u"; then
+        enableable+=("$u")
     else
-        sudo systemctl start "$u" || fail "systemctl start $u failed"
-        log_pass "$u enabled and running (unit file unchanged, not restarted)"
+        record_failure "systemctl enable $u failed"
     fi
 done
+
+# --- start / restart ---------------------------------------------------------
+for u in ${enableable[@]+"${enableable[@]}"}; do
+    if in_list "$u" ${changed[@]+"${changed[@]}"}; then
+        # The unit file changed, so a plain `start` would leave the running
+        # instance on the old definition.
+        if sudo systemctl restart "$u"; then
+            log_pass "$u installed (changed), enabled and restarted"
+        else
+            record_failure "systemctl restart $u failed"
+        fi
+    else
+        if sudo systemctl start "$u"; then
+            log_pass "$u enabled and running (unit file unchanged, not restarted)"
+        else
+            record_failure "systemctl start $u failed"
+        fi
+    fi
+done
+
+# --- report ------------------------------------------------------------------
+if [ ${#failures[@]} -gt 0 ]; then
+    log_error "${#failures[@]} problem(s):"
+    for f in "${failures[@]}"; do
+        log_error "  - $f"
+    done
+    log_error "A unit may be installed on disk without the running service having picked it up. Re-run this script; if it then reports no changes, restart the affected units by hand."
+    exit 1
+fi
 
 if [ ${#changed[@]} -eq 0 ]; then
     log_pass "${#units[@]} units installed; none changed"

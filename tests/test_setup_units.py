@@ -25,8 +25,11 @@ a bad `systemctl` invocation with an EMPTY stdout, one line on stderr and rc 1,
 and GNU `install` likewise (stdout empty, `install: cannot stat ...`, rc 1). A
 double whose error branch is a bare `exit 1` with no output hides real bugs.
 
-`sudo` is faked as `exec "$@"` and `install` is NOT faked, so the tests exercise
-the real `install -m 0644` invocation the Pi will run.
+For the installer tests `sudo` is faked as `exec "$@"` and `install` is NOT
+faked, so they exercise the real `install -m 0644` invocation the Pi will run.
+The end-to-end setup.sh case at the bottom uses a LOGGING NO-OP `sudo` instead -
+setup.sh writes to /boot/config.txt, /etc/modules and /usr/local/bin, and under
+`exec` those would land on the machine running the tests.
 """
 import os
 import shutil
@@ -78,9 +81,22 @@ exit 0
 
 
 class Sandbox:
-    """A disposable repo layout the installer can be run against for real."""
+    """A disposable repo layout the installer can be run against for real.
 
-    def __init__(self, units=None):
+    `runnable` rewrites the deployment prefix the shipped units hardcode
+    (`/home/gardyn/garden-of-eden`) to a directory inside the sandbox, and
+    creates the files their ExecStart lines name. Without it the installer's
+    can-this-unit-run gate refuses to enable anything, which is a real
+    behaviour with its own test - but it is not the state a healthy Pi is in,
+    so the happy-path cases have to reproduce a host where the paths exist.
+    """
+
+    PI_PREFIX = "/home/gardyn/garden-of-eden"
+    # The paths the shipped units name under that prefix.
+    PI_FILES = ("venv/bin/python", "bin/gardyn-health-log.py",
+                "bin/gardyn-netwatch.py", "mqtt.py")
+
+    def __init__(self, units=None, runnable=True):
         self.root = tempfile.mkdtemp(prefix="t477-")
         self.repo = os.path.join(self.root, "repo")
         self.src = os.path.join(self.repo, "services", "etc", "systemd", "system")
@@ -96,10 +112,20 @@ class Sandbox:
         shutil.copy(INSTALLER, os.path.join(self.repo, "bin",
                                             "install-systemd-units.sh"))
 
+        self.fakeroot = os.path.join(self.root, "fakeroot")
+        if runnable:
+            for rel in self.PI_FILES:
+                path = os.path.join(self.fakeroot, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open(path, "w").close()
+
         if units is None:
             for name in os.listdir(UNIT_SRC):
-                shutil.copy(os.path.join(UNIT_SRC, name),
-                            os.path.join(self.src, name))
+                text = read(os.path.join(UNIT_SRC, name)).decode()
+                if runnable:
+                    text = text.replace(self.PI_PREFIX, self.fakeroot)
+                with open(os.path.join(self.src, name), "w") as fh:
+                    fh.write(text)
         else:
             for name, content in units.items():
                 with open(os.path.join(self.src, name), "w") as fh:
@@ -208,7 +234,10 @@ class SetupScriptTests(unittest.TestCase):
 
     def test_setup_delegates_to_the_installer(self):
         self.assertIn("install-systemd-units.sh", self.text)
-        self.assertRegex(self.text, r"(?m)^install_systemd_units\s*$")
+        # `|| exit 1`, not a bare call. The call is currently the last line, so
+        # a bare call would make setup.sh's exit status correct by position
+        # alone and silently wrong the moment anything is appended.
+        self.assertRegex(self.text, r"(?m)^install_systemd_units \|\| exit 1\s*$")
 
     def test_installer_script_is_executable(self):
         self.assertTrue(os.access(INSTALLER, os.X_OK))
@@ -289,6 +318,12 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(read(self.box.src_path("mqtt.service")),
                          read(self.box.dest_path("mqtt.service")))
 
+    def test_a_first_install_is_not_reported_as_uncomparable(self):
+        """`cmp` returns 2 both for "could not read" and for "destination does
+        not exist", and the second is the ordinary case."""
+        proc = self.box.run()
+        self.assertNotIn("cannot compare", proc.stderr)
+
     def test_deleted_unit_is_restored(self):
         """Acceptance criterion 4 - prove the installer can actually fail."""
         self.box.run()
@@ -312,7 +347,7 @@ class InstallerFailureTests(unittest.TestCase):
         self.addCleanup(box.cleanup)
         proc = box.run()
         self.assertNotEqual(0, proc.returncode)
-        self.assertIn("no *.service or *.timer files", proc.stderr)
+        self.assertIn("no unit files found", proc.stderr)
         self.assertEqual([], box.systemctl_calls())
 
     def test_missing_unit_source_directory_is_fatal(self):
@@ -342,31 +377,43 @@ class InstallerFailureTests(unittest.TestCase):
         self.assertIn("failed to install", proc.stderr)
         self.assertEqual([], box.systemctl_calls())
 
-    def test_daemon_reload_failure_is_fatal(self):
+    def test_daemon_reload_failure_is_reported_without_abandoning_the_rest(self):
         box = Sandbox()
         self.addCleanup(box.cleanup)
         proc = box.run(fail_on="daemon-reload")
         self.assertNotEqual(0, proc.returncode)
         self.assertIn("daemon-reload failed", proc.stderr)
-        # Nothing was enabled on the back of a reload that did not happen.
-        self.assertFalse([c for c in box.systemctl_calls()
-                          if c.startswith("enable ")])
+        # Aborting here is what leaves a unit installed on disk with the old
+        # definition still running and no signal. Carry on and report instead.
+        enabled = {c.split()[-1] for c in box.systemctl_calls()
+                   if c.startswith("enable ")}
+        self.assertEqual(ENABLEABLE, enabled)
 
-    def test_enable_failure_is_fatal(self):
+    def test_one_unit_failing_to_enable_does_not_strand_the_others(self):
+        """The regression that mattered: mqtt is processed first."""
         box = Sandbox()
         self.addCleanup(box.cleanup)
         proc = box.run(fail_on="enable mqtt.service")
         self.assertNotEqual(0, proc.returncode)
         self.assertIn("enable mqtt.service failed", proc.stderr)
+        enabled = {c.split()[-1] for c in box.systemctl_calls()
+                   if c.startswith("enable ")}
+        # The health sampler and the network watchdog are the two units this
+        # script exists to stop losing; they must still be armed.
+        self.assertIn("gardyn-health-log.timer", enabled)
+        self.assertIn("gardyn-netwatch.timer", enabled)
 
-    def test_restart_failure_is_fatal(self):
+    def test_a_failed_restart_does_not_strand_the_later_units(self):
         box = Sandbox()
         self.addCleanup(box.cleanup)
         proc = box.run(fail_on="restart mqtt.service")
         self.assertNotEqual(0, proc.returncode)
         self.assertIn("restart mqtt.service failed", proc.stderr)
+        calls = box.systemctl_calls()
+        self.assertIn("restart gardyn-health-log.timer", calls)
+        self.assertIn("restart gardyn-netwatch.timer", calls)
 
-    def test_start_failure_is_fatal(self):
+    def test_start_failure_is_reported(self):
         box = Sandbox()
         self.addCleanup(box.cleanup)
         box.run()
@@ -375,20 +422,103 @@ class InstallerFailureTests(unittest.TestCase):
         self.assertNotEqual(0, proc.returncode)
         self.assertIn("start mqtt.service failed", proc.stderr)
 
+    def test_a_masked_destination_is_refused_and_left_intact(self):
+        """`systemctl mask` links the unit to /dev/null; GNU install would
+        unlink it and silently unmask the unit."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        dest = box.dest_path("mqtt.service")
+        os.symlink("/dev/null", dest)
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("destination is a symlink", proc.stderr)
+        self.assertTrue(os.path.islink(dest))
+        self.assertEqual("/dev/null", os.readlink(dest))
+        calls = box.systemctl_calls()
+        self.assertNotIn("enable mqtt.service", calls)
+        # The other four are still installed and armed.
+        self.assertIn("enable gardyn-netwatch.timer", calls)
+
+    def test_a_directory_destination_is_refused(self):
+        """`install SOURCE DIRECTORY` is a valid second form that exits 0 and
+        copies INTO the directory, so `|| fail` cannot see it."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        dest = box.dest_path("mqtt.service")
+        os.makedirs(dest)
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("destination is a directory", proc.stderr)
+        self.assertEqual([], os.listdir(dest))
+
+    def test_a_unit_that_cannot_run_here_is_installed_but_not_enabled(self):
+        """A public repo: gardyn-netwatch can reboot the host and is wired to
+        one LAN, so a checkout elsewhere must not end up with it armed."""
+        box = Sandbox(runnable=False)
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("NOT enabled", proc.stderr)
+        for name in EXPECTED_UNITS:
+            self.assertTrue(os.path.exists(box.dest_path(name)), name)
+        self.assertFalse([c for c in box.systemctl_calls()
+                          if c.startswith(("enable ", "start ", "restart "))])
+
+    def test_a_drop_in_directory_is_refused_rather_than_silently_skipped(self):
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        os.makedirs(os.path.join(box.src, "mqtt.service.d"))
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("drop-in directory not supported", proc.stderr)
+        self.assertEqual([], box.systemctl_calls())
+
+    def test_other_unit_types_are_installed_too(self):
+        """The list is derived from the directory - that promise has to hold
+        for unit types this project does not ship yet."""
+        box = Sandbox(units={
+            "api.socket": "[Socket]\nListenStream=8080\n\n[Install]\n"
+                          "WantedBy=sockets.target\n",
+            "watch.path": "[Path]\nPathExists=/tmp\n\n[Install]\n"
+                          "WantedBy=multi-user.target\n",
+        })
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertTrue(os.path.exists(box.dest_path("api.socket")))
+        self.assertTrue(os.path.exists(box.dest_path("watch.path")))
+
 
 class InstallerPreflightTests(unittest.TestCase):
 
     UNIT = ("[Unit]\nDescription=probe\n\n[Service]\nType=oneshot\n"
             "ExecStart=%s\n\n[Install]\nWantedBy=multi-user.target\n")
 
-    def test_warns_when_an_execstart_path_does_not_exist(self):
+    def test_a_missing_execstart_path_names_the_path_and_blocks_the_enable(self):
         box = Sandbox(units={"probe.service":
                              self.UNIT % "/nowhere/at/all/probe.py"})
         self.addCleanup(box.cleanup)
         proc = box.run()
-        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertNotEqual(0, proc.returncode)
         self.assertIn("ExecStart path does not exist", proc.stderr)
         self.assertIn("/nowhere/at/all/probe.py", proc.stderr)
+        self.assertEqual(["daemon-reload"], box.systemctl_calls())
+
+    def test_a_timer_is_judged_on_the_service_it_arms(self):
+        """A .timer has no ExecStart, so judging it alone passes every timer -
+        and the timer is what arms gardyn-netwatch's reboot ladder."""
+        box = Sandbox(units={
+            "probe.service": ("[Unit]\nDescription=probe\n\n[Service]\n"
+                              "Type=oneshot\nExecStart=/nowhere/probe.py\n"),
+            "probe.timer": ("[Unit]\nDescription=probe timer\n\n[Timer]\n"
+                            "OnCalendar=*:0/5\n\n[Install]\n"
+                            "WantedBy=timers.target\n"),
+        })
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertTrue(os.path.exists(box.dest_path("probe.timer")))
+        self.assertNotIn("enable probe.timer", box.systemctl_calls())
 
     def test_no_warning_when_the_execstart_path_exists(self):
         box = Sandbox(units={"probe.service": self.UNIT % "/bin/sh"})
@@ -396,6 +526,15 @@ class InstallerPreflightTests(unittest.TestCase):
         proc = box.run()
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertNotIn("ExecStart path does not exist", proc.stderr)
+
+    def test_an_execstart_path_is_not_globbed_against_the_cwd(self):
+        """`/etc/host*` must be checked literally. Let the shell expand it and
+        it resolves to a file that exists, so the warning silently vanishes."""
+        box = Sandbox(units={"probe.service": self.UNIT % "/etc/host*"})
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("/etc/host*", proc.stderr)
 
     def test_non_unit_files_are_reported_and_not_installed(self):
         box = Sandbox()
@@ -406,6 +545,128 @@ class InstallerPreflightTests(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("README.md", proc.stderr)
         self.assertFalse(os.path.exists(box.dest_path("README.md")))
+
+
+FAKE_NOOP_SUDO = """#!/bin/bash
+# A LOGGING NO-OP, not `exec "$@"`. setup.sh runs `sudo sed -i /boot/config.txt`,
+# `sudo tee -a /etc/modules` and `sudo ln -fs ... /usr/local/bin/light`; under
+# `exec` those would take effect on the machine running the tests.
+printf '%s\\n' "$*" >> "$SUDO_LOG"
+exit 0
+"""
+
+FAKE_TRUE = """#!/bin/bash
+exit 0
+"""
+
+
+class SetupScriptEndToEndTests(unittest.TestCase):
+    """Acceptance criterion 1, executed rather than grepped.
+
+    The text assertions in SetupScriptTests are necessary but not sufficient:
+    they pin the one shape the old bug had. A setup.sh that wrote to the
+    tracked unit by any other route - a variable, a glob, a sed -i - would
+    satisfy every one of them. So run the real script against a real git
+    checkout and read `git status`.
+
+    Every privileged command is neutered: `sudo` is a logging no-op, so nothing
+    setup.sh does with root escapes the sandbox. That also means the installer
+    cannot actually install, which is why the run is EXPECTED to exit non-zero.
+    That is not incidental - it is the propagation check, and it is the mutant
+    (`return 1` -> `return 0`) the text tests cannot kill.
+    """
+
+    FAKES = ("apt", "apt-get", "i2cdetect", "raspi-config", "lsmod",
+             "modprobe", "getent", "usermod", "python3", "pip3", "systemctl")
+
+    def _checkout(self):
+        root = tempfile.mkdtemp(prefix="t477-e2e-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        repo = os.path.join(root, "repo")
+        os.makedirs(repo)
+
+        listing = subprocess.run(["git", "ls-files", "-z"], cwd=REPO,
+                                 stdout=subprocess.PIPE, check=True)
+        for rel in listing.stdout.decode().split("\0"):
+            if not rel:
+                continue
+            dst = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(os.path.join(REPO, rel), dst)
+
+        for cmd in (["git", "init", "-q"],
+                    ["git", "add", "-A"],
+                    ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                     "commit", "-qm", "baseline"]):
+            subprocess.run(cmd, cwd=repo, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                               stdout=subprocess.PIPE, text=True, check=True)
+        self.assertEqual("", dirty.stdout, "baseline checkout is not clean")
+
+        fakebin = os.path.join(root, "fakebin")
+        os.makedirs(fakebin)
+        Sandbox._write_exec(os.path.join(fakebin, "sudo"), FAKE_NOOP_SUDO)
+        for name in self.FAKES:
+            Sandbox._write_exec(os.path.join(fakebin, name), FAKE_TRUE)
+        return root, repo, fakebin
+
+    def _run_setup(self, root, repo, fakebin):
+        env = dict(os.environ)
+        env["PATH"] = fakebin + os.pathsep + env.get("PATH", "")
+        # A bad INSTALL_DIR would send setup.sh's `cd` to $HOME; keep $HOME
+        # inside the sandbox so even that failure cannot escape.
+        env["HOME"] = root
+        env["SUDO_LOG"] = os.path.join(root, "sudo.log")
+        env["SYSTEMD_UNIT_DIR"] = root
+        return subprocess.run(["bash", os.path.join(repo, "bin", "setup.sh")],
+                              cwd=repo, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, timeout=120)
+
+    @staticmethod
+    def _status(repo):
+        return subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                              stdout=subprocess.PIPE, text=True,
+                              check=True).stdout
+
+    def setUp(self):
+        for tool in ("readlink -f /", "realpath /"):
+            if subprocess.run(["bash", "-c", f"{tool} >/dev/null 2>&1"]).returncode:
+                self.skipTest(f"`{tool}` unavailable; setup.sh needs it")
+
+    def test_a_setup_run_leaves_the_working_tree_clean(self):
+        root, repo, fakebin = self._checkout()
+        self._run_setup(root, repo, fakebin)
+        self.assertEqual("", self._status(repo),
+                         "setup.sh dirtied the working tree")
+
+    def test_setup_exits_non_zero_when_the_unit_install_fails(self):
+        root, repo, fakebin = self._checkout()
+        proc = self._run_setup(root, repo, fakebin)
+        # `sudo` is inert, so nothing reaches the unit directory and the real
+        # units name /home/gardyn paths this machine does not have. Either way
+        # the installer fails, and what is under test is that setup.sh says so
+        # in its own voice rather than exiting 0.
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("systemd unit installation failed", proc.stderr)
+
+    def test_setup_exits_zero_when_the_unit_install_succeeds(self):
+        """The inverse, so the check above cannot pass by always failing."""
+        root, repo, fakebin = self._checkout()
+        Sandbox._write_exec(os.path.join(repo, "bin",
+                                         "install-systemd-units.sh"), FAKE_TRUE)
+        proc = self._run_setup(root, repo, fakebin)
+        self.assertEqual(0, proc.returncode, proc.stderr[-2000:])
+
+    def test_setup_propagates_an_installer_failure(self):
+        root, repo, fakebin = self._checkout()
+        Sandbox._write_exec(os.path.join(repo, "bin",
+                                         "install-systemd-units.sh"),
+                            "#!/bin/bash\nexit 7\n")
+        proc = self._run_setup(root, repo, fakebin)
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("systemd unit installation failed", proc.stderr)
 
 
 if __name__ == "__main__":
