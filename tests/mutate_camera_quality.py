@@ -105,6 +105,41 @@ MUTANTS = [
      "ignore the per-camera override, collapsing both to the shared value",
      '    "LOWER_CAMERA_JPEG_QUALITY", CAMERA_JPEG_QUALITY)',
      '    "CAMERA_JPEG_QUALITY", CAMERA_JPEG_QUALITY)'),
+
+    # --- the per-camera isolation (T-491) -----------------------------------
+    #
+    # A battery is evidence only for the code it MUTATES, and every mutant
+    # above is about --jpeg. _capture_and_publish's docstring makes a second,
+    # load-bearing claim - that a failing camera cannot block the other's
+    # publish - and nothing scored it: replacing both except bodies with a bare
+    # `raise` left all three suites green.
+    (MQTT,
+     "let a subprocess failure propagate, taking the other camera down with it",
+     '        logger.error(f"{label} camera capture failed ({device}): {e}")',
+     "        raise"),
+
+    (MQTT,
+     "let an UNEXPECTED error propagate - the catch-all branch",
+     '        logger.exception(f"Unexpected error during {label} image capture/publish")',
+     "        raise"),
+
+    (MQTT,
+     "swallow a failing camera silently, so an outage leaves no record",
+     '    except subprocess.CalledProcessError as e:\n'
+     '        logger.error(f"{label} camera capture failed ({device}): {e}")',
+     "    except subprocess.CalledProcessError as e:\n"
+     "        pass"),
+
+    (MQTT,
+     "capture the flaky lower camera FIRST, so a failure there is the one that "
+     "blocks the healthy one",
+     '        _capture_and_publish(client, "upper", UPPER_CAMERA_DEVICE,',
+     '        _capture_and_publish(client, "lower", UPPER_CAMERA_DEVICE,'),
+
+    (MQTT,
+     "publish an empty body rather than the captured frame",
+     "            client.publish(BASE_TOPIC + topic, payload=f.read(), qos=0, retain=False)",
+     "            client.publish(BASE_TOPIC + topic, payload=b'', qos=0, retain=False)"),
 ]
 
 
@@ -140,6 +175,40 @@ def sha(path):
 def main():
     sources = {MQTT: open(MQTT).read(), CONFIG: open(CONFIG).read()}
     shas = {p: sha(p) for p in sources}
+    try:
+        return _run(sources, shas)
+    finally:
+        _restore(sources)
+
+
+def _restore(sources):
+    """Put every mutated file back, whatever happened.
+
+    Without this a battery killed part-way through - ^C, a timeout, an
+    exception in the harness itself - leaves a mutant applied in the working
+    tree, which is a silent and entirely plausible-looking change to shipping
+    code. mqtt.py is the file that runs the garden.
+    """
+    errors = []
+    for path, text in sources.items():
+        # Each file independently: one loop abandons the rest the moment one
+        # raises, and it raises out of a `finally`, so the second file stays
+        # mutated with nothing reporting it.
+        try:
+            if sha(path) == hashlib.sha256(text.encode()).hexdigest():
+                continue
+        except OSError:
+            pass
+        try:
+            with open(path, "w") as fh:
+                fh.write(text)
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+    if errors:
+        raise OSError("could not restore: " + "; ".join(errors))
+
+
+def _run(sources, shas):
 
     print("=" * 70)
     print("CONTROL A - clean tree must be GREEN")

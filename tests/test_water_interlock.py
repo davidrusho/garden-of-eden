@@ -34,12 +34,65 @@ sys.path.append(_REPO_ROOT)
 
 
 # --- stub the hardware and broker modules mqtt.py imports at module scope ---
+#
+# THE STUBS ARE WITHDRAWN AGAIN AS SOON AS `import mqtt` HAS RUN. They only have
+# to exist while that import executes; mqtt.py binds every name it needs with
+# `from X import Y` at module scope, so the module object goes on working once
+# sys.modules has been put back.
+#
+# Leaving them in place is a whole-suite regression rather than an untidiness.
+# `python -m unittest` - the invocation the README documents - discovers modules
+# alphabetically, and this file is pulled in early by tests/test_camera_quality.py
+# ("c" sorts before "d", "l" and "p"). Every later module that wants a REAL
+# app.sensors.* then gets a MagicMock instead, and it does not fail as a missing
+# import: tests/test_distance.py turned one honest ImportError into six
+# `InvalidSpecError: Cannot autospec attr 'DistanceSensor' ... already mocked`.
+#
+# _install_stubs() records everything it displaces, including the modules
+# the import machinery loaded WHILE the stubs were active (mqtt itself, and the
+# real distance driver, which is bound to a mocked gpiozero and must not be
+# handed to a later test as if it were clean).
+
+_STUB_ROOTS = ("gpiozero", "paho", "app", "config", "mqtt")
+
+# name -> the sys.modules entry displaced by the stub install, or None if the
+# name was not present. Populated by _install_stubs(), consumed by
+# _withdraw_stubs().
+_displaced = {}
+
+
+def _owned(name):
+    return name.split(".")[0] in _STUB_ROOTS
+
 
 def _install_stubs():
+    # A snapshot rather than only the names mod() sets: importing mqtt drags in
+    # submodules nobody stubbed, and those are the ones a later test would
+    # silently inherit.
+    #
+    # Then EVICT them. Overwriting the stubbed names is not enough: `mqtt` and
+    # the real distance driver are never mod()-ed, so if either is already in
+    # sys.modules - tests/test_api.py sorts first and imports the app tree on
+    # any host with flask - the `import mqtt` below is a no-op that hands back
+    # the pre-existing module and the whole stub apparatus is bypassed with no
+    # error. The file's promise of a config independent of the developer's .env
+    # would then quietly not hold.
+    _displaced.clear()
+    for name, module in list(sys.modules.items()):
+        if _owned(name):
+            _displaced[name] = module
+            del sys.modules[name]
+
     def mod(name, **attrs):
         m = types.ModuleType(name)
         for k, v in attrs.items():
             setattr(m, k, v)
+        # sys.modules.get(name), not None: mod() is only ever called on names
+        # under _STUB_ROOTS today, which the loop above has already recorded -
+        # but a stub added under some other root would otherwise be recorded as
+        # "was absent" and DELETED at withdrawal instead of restored. The
+        # correctness of the restore should not depend on a list elsewhere.
+        _displaced.setdefault(name, sys.modules.get(name))
         sys.modules[name] = m
         return m
 
@@ -93,11 +146,43 @@ def _install_stubs():
     )
 
 
+def _withdraw_stubs():
+    """Put sys.modules back exactly as _install_stubs() found it.
+
+    Anything under a stubbed root that was NOT there beforehand is dropped -
+    that covers `mqtt` and the distance driver, both of which were imported
+    against mocked hardware and would poison the next test module.
+
+    The sweep is scoped to _STUB_ROOTS on purpose. Deleting every name the
+    import added would also evict stdlib modules this import happened to be the
+    first to load, and `mqtt_mod` still holds references to those - a later
+    `import math` would then build a SECOND math module rather than reuse the
+    one the code under test is bound to. tests/test_suite_isolation.py measures
+    the full delta and requires everything outside these roots to be stdlib, so
+    the narrower sweep is checked rather than assumed.
+    """
+    for name in [n for n in sys.modules if _owned(n)]:
+        if name not in _displaced:
+            del sys.modules[name]
+    for name, module in _displaced.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+
 _install_stubs()
 import mqtt as mqtt_mod  # noqa: E402
+# Imported as a MODULE, not only for its names: the driver-level tests patch
+# attributes on it, and a string target ("app.sensors.distance.distance.sleep")
+# would go back through sys.modules - which no longer holds it once the stubs
+# are withdrawn, so it would re-import the real driver against real gpiozero and
+# patch a different object from the one mqtt.py is using.
+import app.sensors.distance.distance as distance_mod  # noqa: E402
 from app.sensors.distance.distance import (  # noqa: E402
     Distance, MeasurementError,
 )
+_withdraw_stubs()
 
 _MeasurementError = MeasurementError
 
@@ -435,8 +520,8 @@ class TestDistanceDriver(unittest.TestCase):
     """Driver-level behaviour: the bounded read and the sample-count signal."""
 
     def _make(self):
-        with patch("app.sensors.distance.distance.DistanceSensor") as sensor_cls, \
-             patch("app.sensors.distance.distance.PiGPIOFactory"):
+        with patch.object(distance_mod, "DistanceSensor") as sensor_cls, \
+             patch.object(distance_mod, "PiGPIOFactory"):
             d = Distance()
         return d, sensor_cls
 
@@ -487,7 +572,7 @@ class TestDistanceDriver(unittest.TestCase):
         # same number ten times and average nothing.
         d, _ = self._make()
         d.sensor.distance = 0.10
-        with patch("app.sensors.distance.distance.sleep") as slept:
+        with patch.object(distance_mod, "sleep") as slept:
             d.measure(samples=4, interval=0.07)
         self.assertEqual(slept.call_count, 3)  # n-1 gaps, no trailing sleep
         self.assertEqual({c.args[0] for c in slept.call_args_list}, {0.07})
@@ -496,7 +581,7 @@ class TestDistanceDriver(unittest.TestCase):
         d, _ = self._make()
         values = iter([0.10] * 5 + [0.20] * 5)
         type(d.sensor).distance = property(lambda _self: next(values))
-        with patch("app.sensors.distance.distance.sleep"):
+        with patch.object(distance_mod, "sleep"):
             self.assertAlmostEqual(d.measure(), 15.0, places=5)
 
     def test_measure_survives_individual_sample_failures(self):
@@ -508,7 +593,7 @@ class TestDistanceDriver(unittest.TestCase):
                 raise v
             return v
         type(d.sensor).distance = property(nxt)
-        with patch("app.sensors.distance.distance.sleep"):
+        with patch.object(distance_mod, "sleep"):
             self.assertAlmostEqual(d.measure(samples=3), 10.0, places=5)
 
     def test_measure_raises_when_no_sample_succeeds(self):
@@ -516,7 +601,7 @@ class TestDistanceDriver(unittest.TestCase):
         type(d.sensor).distance = property(
             lambda self: (_ for _ in ()).throw(RuntimeError("no echo"))
         )
-        with patch("app.sensors.distance.distance.sleep"):
+        with patch.object(distance_mod, "sleep"):
             with self.assertRaises(MeasurementError):
                 d.measure()
 

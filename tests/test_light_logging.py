@@ -41,11 +41,22 @@ def _load_real_light_module():
     it from executing; the leaf module is then loaded from its file under its
     true dotted name. The name matters beyond tidiness - it IS the logger name
     under test, so loading it as anything else would test the wrong logger.
+
+    EVERY STUB IS WITHDRAWN BEFORE THIS RETURNS. They are only needed while the
+    exec_module() below runs, and leaving them installed breaks every later
+    module `python -m unittest` discovers: a stub `app` with an empty __path__
+    turns tests/test_pump.py's honest "No module named 'flask'" into
+    "No module named 'app.sensors.pump'", which reads as a missing package
+    rather than as this file's doing. The `pigpio` stub is the same hazard on
+    the Pi, where that module is real.
     """
+    displaced = {}
+
     def mod(name, **attrs):
         m = types.ModuleType(name)
         for k, v in attrs.items():
             setattr(m, k, v)
+        displaced.setdefault(name, sys.modules.get(name))
         sys.modules[name] = m
         return m
 
@@ -62,8 +73,16 @@ def _load_real_light_module():
     path = os.path.join(_REPO_ROOT, "app", "sensors", "light", "light.py")
     spec = importlib.util.spec_from_file_location(_LIGHT_NAME, path)
     module = importlib.util.module_from_spec(spec)
+    displaced.setdefault(_LIGHT_NAME, sys.modules.get(_LIGHT_NAME))
     sys.modules[_LIGHT_NAME] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        for name, previous in displaced.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
     return module
 
 
@@ -90,14 +109,13 @@ class LightLoggingTestCase(unittest.TestCase):
         self.root.setLevel(logging.WARNING)
 
         # patch.object, NOT patch("dotted.string"). A dotted target is
-        # re-resolved through sys.modules at call time, and test_water_interlock
-        # replaces sys.modules["app.sensors.light.light"] with a stub carrying
-        # only `Light` at module scope. Discovery imports every test module
-        # before running any test, so under `unittest discover` that stub always
-        # wins and a dotted patch raises AttributeError on PWMLED - silently
-        # turning this entire file inert in the only run that matters.
-        # Reclaim the sys.modules slot for the duration of this test, and put it
-        # back in tearDown so the stubbing module is unaffected either way.
+        # re-resolved through sys.modules at call time, and this module's real
+        # light.py is not the only thing that has ever occupied that slot -
+        # tests/test_water_interlock.py builds a stub carrying only `Light`,
+        # and discovery imports every test module before running any test. Both
+        # files now withdraw their stubs at import time, so the collision is
+        # gone at source; the object-based patch and the slot reclaim below stay
+        # because neither depends on that remaining true.
         self._saved_mod = sys.modules.get(_LIGHT_NAME)
         sys.modules[_LIGHT_NAME] = light_mod
 

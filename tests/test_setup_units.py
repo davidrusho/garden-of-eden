@@ -59,8 +59,24 @@ EXPECTED_UNITS = {
 # two Type=oneshot units are started by their timers.
 ENABLEABLE = {"mqtt.service", "gardyn-health-log.timer", "gardyn-netwatch.timer"}
 
+# Logs the command line, then RUNS it. The log is what lets a test assert on
+# how a privileged write was issued - e.g. that the manifest goes through a
+# temporary name and a rename rather than being truncated in place - which is
+# not visible from the resulting file.
 FAKE_SUDO = """#!/bin/bash
+printf '%s\\n' "$*" >> "$SUDO_LOG"
 exec "$@"
+"""
+
+# A LOGGING NO-OP, not `exec "$@"`. Used by the end-to-end setup.sh cases, which
+# run a script that writes to /boot/config.txt, /etc/modules and /usr/local/bin -
+# and by the one installer case that lets SYSTEMD_UNIT_DIR fall through to its
+# production default, where on a Linux host the destination is the real
+# /etc/systemd/system. Under `exec` either of those would take effect on the
+# machine running the tests.
+FAKE_NOOP_SUDO = """#!/bin/bash
+printf '%s\\n' "$*" >> "$SUDO_LOG"
+exit 0
 """
 
 # Mirrors the real failure shape observed on the Pi (systemd 252):
@@ -103,12 +119,19 @@ class Sandbox:
         self.src = os.path.join(self.repo, "services", "etc", "systemd", "system")
         self.dest = os.path.join(self.root, "etc")
         self.fakebin = os.path.join(self.root, "fakebin")
+        # A SECOND fake bin whose `sudo` only logs. The installer's production
+        # default for SYSTEMD_UNIT_DIR can only be exercised by letting the
+        # script use it, and on a Linux host that directory is the real one -
+        # so that one test runs with every privileged call inert.
+        self.noopbin = os.path.join(self.root, "noopbin")
         self.log = os.path.join(self.root, "systemctl.log")
+        self.sudo_log = os.path.join(self.root, "sudo.log")
 
         os.makedirs(os.path.join(self.repo, "bin"))
         os.makedirs(self.src)
         os.makedirs(self.dest)
         os.makedirs(self.fakebin)
+        os.makedirs(self.noopbin)
 
         shutil.copy(INSTALLER, os.path.join(self.repo, "bin",
                                             "install-systemd-units.sh"))
@@ -134,6 +157,8 @@ class Sandbox:
 
         self._write_exec(os.path.join(self.fakebin, "sudo"), FAKE_SUDO)
         self._write_exec(os.path.join(self.fakebin, "systemctl"), FAKE_SYSTEMCTL)
+        self._write_exec(os.path.join(self.noopbin, "sudo"), FAKE_NOOP_SUDO)
+        self._write_exec(os.path.join(self.noopbin, "systemctl"), FAKE_SYSTEMCTL)
 
     @staticmethod
     def _write_exec(path, content):
@@ -141,14 +166,21 @@ class Sandbox:
             fh.write(content)
         os.chmod(path, 0o755)
 
-    def run(self, fail_on="", dest=None):
+    def run(self, fail_on="", dest=None, args=(), unset_dest=False,
+            noop_sudo=False):
         env = dict(os.environ)
-        env["PATH"] = self.fakebin + os.pathsep + env.get("PATH", "")
-        env["SYSTEMD_UNIT_DIR"] = dest if dest is not None else self.dest
+        binpath = self.noopbin if noop_sudo else self.fakebin
+        env["PATH"] = binpath + os.pathsep + env.get("PATH", "")
+        if unset_dest:
+            env.pop("SYSTEMD_UNIT_DIR", None)
+        else:
+            env["SYSTEMD_UNIT_DIR"] = dest if dest is not None else self.dest
         env["SYSTEMCTL_LOG"] = self.log
         env["SYSTEMCTL_FAIL_ON"] = fail_on
+        env["SUDO_LOG"] = self.sudo_log
         return subprocess.run(
-            ["bash", os.path.join(self.repo, "bin", "install-systemd-units.sh")],
+            ["bash", os.path.join(self.repo, "bin", "install-systemd-units.sh")]
+            + list(args),
             env=env, cwd=self.root, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True,
         )
@@ -159,15 +191,74 @@ class Sandbox:
         with open(self.log) as fh:
             return [line.strip() for line in fh if line.strip()]
 
+    def sudo_calls(self):
+        if not os.path.exists(self.sudo_log):
+            return []
+        with open(self.sudo_log) as fh:
+            return [line.strip() for line in fh if line.strip()]
+
     def clear_log(self):
         if os.path.exists(self.log):
             os.remove(self.log)
+
+    def git_init(self):
+        """Make the sandbox repo a real checkout, so the installer's
+        code-moved check has a revision to read."""
+        for cmd in (["git", "init", "-q"],
+                    ["git", "add", "-A"],
+                    ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                     "commit", "-qm", "baseline"]):
+            subprocess.run(cmd, cwd=self.repo, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return self.head()
+
+    def git_commit_python_only(self):
+        """A commit that touches no unit file - the deploy shape that changes
+        the running code while leaving every unit byte-identical."""
+        path = os.path.join(self.repo, "mqtt.py")
+        with open(path, "a") as fh:
+            fh.write("# a python-only change\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-qm", "python only"], cwd=self.repo,
+                       check=True, stdout=subprocess.DEVNULL)
+        return self.head()
+
+    def head(self):
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                              stdout=subprocess.PIPE, text=True,
+                              check=True).stdout.strip()
 
     def src_path(self, name):
         return os.path.join(self.src, name)
 
     def dest_path(self, name):
         return os.path.join(self.dest, name)
+
+    def marker_path(self, name):
+        return os.path.join(self.dest, f".{name}.needs-restart")
+
+    def manifest_path(self):
+        return os.path.join(self.dest, ".gardyn-installed-units")
+
+    def manifest(self):
+        if not os.path.exists(self.manifest_path()):
+            return []
+        with open(self.manifest_path()) as fh:
+            return [line.strip() for line in fh if line.strip()]
+
+    def revision_path(self):
+        return os.path.join(self.dest, ".gardyn-source-revision")
+
+    def recorded_revision(self):
+        if not os.path.exists(self.revision_path()):
+            return None
+        with open(self.revision_path()) as fh:
+            return fh.read().strip()
+
+    def markers(self):
+        return sorted(n for n in os.listdir(self.dest)
+                      if n.endswith(".needs-restart"))
 
     def cleanup(self):
         # A test may have made the destination read-only to force a failure.
@@ -238,7 +329,17 @@ class SetupScriptTests(unittest.TestCase):
         # `|| exit 1`, not a bare call. The call is currently the last line, so
         # a bare call would make setup.sh's exit status correct by position
         # alone and silently wrong the moment anything is appended.
-        self.assertRegex(self.text, r"(?m)^install_systemd_units \|\| exit 1\s*$")
+        self.assertRegex(self.text,
+                         r'(?m)^install_systemd_units "\$@" \|\| exit 1\s*$')
+
+    def test_setup_forwards_its_arguments_to_the_installer(self):
+        """Without the passthrough the installer's documented escape hatch is
+        unreachable from the documented entrypoint: a Python-only pull makes
+        the installer exit non-zero by design, setup.sh propagates that, and
+        `./bin/setup.sh --restart-on-code-change` still runs it bare."""
+        self.assertRegex(
+            self.code,
+            r'"\$BIN_DIR/install-systemd-units\.sh" "\$@"')
 
     def test_the_installer_uses_escape_sequences_bash_3_2_understands(self):
         """macOS ships bash 3.2 as /bin/bash, and the installer runs under its
@@ -249,6 +350,28 @@ class SetupScriptTests(unittest.TestCase):
 
     def test_installer_script_is_executable(self):
         self.assertTrue(os.access(INSTALLER, os.X_OK))
+
+    def test_the_production_unit_directory_default_is_pinned(self):
+        """Every behavioural test below sets SYSTEMD_UNIT_DIR, which means the
+        value a real deploy uses was asserted by nothing: changing the default
+        to /tmp/WRONG-UNIT-DIR left the whole suite green.
+
+        The regex is anchored to the whole assignment, so a default that merely
+        STARTS with the right path (/etc/systemd/system-old) fails too."""
+        text = read(INSTALLER).decode()
+        self.assertRegex(
+            text,
+            r'(?m)^UNIT_DEST_DIR="\$\{SYSTEMD_UNIT_DIR:-/etc/systemd/system\}"$')
+
+    def test_the_source_directory_default_is_pinned(self):
+        """The other half of the same gap. This one IS exercised behaviourally
+        (the sandbox lets it fall through), but only as <repo>/services/... -
+        nothing pins which subdirectory of the repo that is."""
+        text = read(INSTALLER).decode()
+        self.assertRegex(
+            text,
+            r'(?m)^UNIT_SRC_DIR="\$\{GARDYN_UNIT_SRC_DIR:'
+            r'-\$INSTALL_DIR/services/etc/systemd/system\}"$')
 
 
 class InstallerTests(unittest.TestCase):
@@ -648,13 +771,571 @@ class InstallerPreflightTests(unittest.TestCase):
         self.assertFalse(os.path.exists(box.dest_path("README.md")))
 
 
-FAKE_NOOP_SUDO = """#!/bin/bash
-# A LOGGING NO-OP, not `exec "$@"`. setup.sh runs `sudo sed -i /boot/config.txt`,
-# `sudo tee -a /etc/modules` and `sudo ln -fs ... /usr/local/bin/light`; under
-# `exec` those would take effect on the machine running the tests.
-printf '%s\\n' "$*" >> "$SUDO_LOG"
-exit 0
-"""
+class ProductionDefaultTests(unittest.TestCase):
+    """The value a real deploy uses, exercised rather than grepped.
+
+    Every other case here overrides SYSTEMD_UNIT_DIR, so the default was
+    covered by nothing at all - the suite stayed at 48/48 green with the
+    default changed to /tmp/WRONG-UNIT-DIR.
+
+    Letting the script use its own default means the destination on a Linux
+    host is the REAL /etc/systemd/system, so this case runs with a `sudo` that
+    only logs. Nothing privileged executes: no install, no daemon-reload, no
+    enable. The two assertions come from the two shapes that gives -
+    a machine without that directory refuses by name, and a machine with one
+    logs the install destination it was about to use.
+    """
+
+    def test_the_default_directory_is_the_one_the_script_actually_uses(self):
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        proc = box.run(unset_dest=True, noop_sudo=True)
+
+        # Whatever happened, the sandbox destination must not have been used -
+        # that is what proves the default was consulted at all.
+        trace = proc.stdout + proc.stderr + "\n".join(box.sudo_calls())
+        self.assertNotIn(box.dest, trace)
+
+        if os.path.isdir("/etc/systemd/system"):
+            # Anchored to the unit name so a default of /etc/systemd/system-old
+            # cannot satisfy it.
+            self.assertIn(f"install -m 0644 {box.src_path('mqtt.service')} "
+                          "/etc/systemd/system/mqtt.service", box.sudo_calls())
+            # `sudo` is inert, so nothing was written and the run must fail.
+            self.assertNotEqual(0, proc.returncode)
+        else:
+            self.assertEqual([], box.sudo_calls())
+            self.assertNotEqual(0, proc.returncode)
+            self.assertRegex(
+                proc.stderr,
+                r"(?m)systemd unit directory not found: /etc/systemd/system$")
+
+    def test_no_unit_reached_a_real_systemd_directory(self):
+        """The safety assertion for the case above, stated separately so it
+        cannot be lost in a later edit: with an inert `sudo`, the run must
+        touch neither systemd nor any file outside the sandbox."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        box.run(unset_dest=True, noop_sudo=True)
+        self.assertEqual([], box.systemctl_calls())
+        for call in box.sudo_calls():
+            self.assertTrue(call.startswith("install -m 0644 "), call)
+
+
+class OptionParsingTests(unittest.TestCase):
+
+    def test_an_unknown_option_is_refused(self):
+        """A typo in --remove-retired doing nothing quietly is the safe
+        direction; the same typo in --restart-on-code-change is not. Refuse."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        proc = box.run(args=["--remove-retried"])
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("unknown option: --remove-retried", proc.stderr)
+        self.assertEqual([], box.systemctl_calls())
+        self.assertFalse(os.path.exists(box.dest_path("mqtt.service")))
+
+    def test_help_exits_zero_without_installing_anything(self):
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        proc = box.run(args=["--help"])
+        self.assertEqual(0, proc.returncode)
+        self.assertIn("--remove-retired", proc.stdout)
+        self.assertIn("--restart-on-code-change", proc.stdout)
+        self.assertEqual([], box.systemctl_calls())
+
+
+class PendingMarkerLifecycleTests(unittest.TestCase):
+    """A marker that is written and never removed is worse than no marker.
+
+    The two Type=oneshot services have no [Install] section, so they are
+    skipped by the enable loop and never reach the `rm -f` in the restart
+    loop. Their markers were therefore PERMANENT: every later run called them
+    changed, and the "none changed" summary was unreachable.
+    """
+
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+
+    def test_no_marker_survives_a_healthy_run(self):
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual([], self.box.markers())
+
+    def test_a_second_run_reports_that_nothing_changed(self):
+        """The branch a leaked marker made unreachable."""
+        self.box.run()
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("none changed", proc.stdout)
+        self.assertNotIn("changed:", proc.stdout)
+
+    def test_a_oneshot_service_is_not_restarted_when_its_marker_is_cleared(self):
+        """Clearing the marker must not turn into starting the unit. These are
+        oneshots: their timer runs them, and starting them here would fire the
+        job on every deploy."""
+        self.box.run()
+        for name in ("gardyn-health-log.service", "gardyn-netwatch.service"):
+            for verb in ("start", "restart", "enable"):
+                self.assertNotIn(f"{verb} {name}", self.box.systemctl_calls())
+
+    def test_a_oneshot_marker_survives_a_failed_daemon_reload(self):
+        """A failed reload means systemd is still holding the old definition,
+        so the pending state has to cross runs exactly as it does for a unit
+        whose restart failed."""
+        proc = self.box.run(fail_on="daemon-reload")
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn(".gardyn-health-log.service.needs-restart",
+                      self.box.markers())
+        self.assertIn("still pending", proc.stderr)
+        # …and a healthy run afterwards clears it.
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual([], self.box.markers())
+
+    def test_a_changed_oneshot_is_reported_as_changed_once_and_not_again(self):
+        self.box.run()
+        with open(self.box.src_path("gardyn-health-log.service"), "a") as fh:
+            fh.write("\n# a new definition\n")
+        proc = self.box.run()
+        self.assertIn("changed: gardyn-health-log.service", proc.stdout)
+        proc = self.box.run()
+        self.assertIn("none changed", proc.stdout)
+
+
+class RetiredUnitTests(unittest.TestCase):
+    """A unit deleted from the repository stays deployed and enabled forever.
+
+    Nothing else in this script can see it: every loop is driven by what the
+    source directory holds now, so a removed unit simply stops being mentioned.
+    That is the deployment twin of a retained MQTT message outliving the code
+    that published it - and the unit most likely to be retired is the watchdog
+    that can reboot the host.
+
+    Removal is opt-in and fail-closed: only names in the manifest THIS script
+    writes are eligible, so a host that has never run it can lose nothing, and
+    a unit belonging to another package can never be selected.
+    """
+
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.box.run()                       # establishes the manifest
+        os.remove(self.box.src_path("gardyn-netwatch.timer"))
+        os.remove(self.box.src_path("gardyn-netwatch.service"))
+        self.box.clear_log()
+
+    def test_the_manifest_records_what_was_installed(self):
+        self.assertEqual(sorted(EXPECTED_UNITS), sorted(self.box.manifest()))
+
+    def test_the_manifest_is_written_through_a_temporary_file(self):
+        """A `tee` truncated by ENOSPC or a kill leaves a SHORT manifest, and a
+        short manifest silently un-claims whatever fell off the end - in the
+        reassuring direction, because nothing is deleted and the warning simply
+        stops. Staging and renaming means a reader sees the old file or the new
+        one. Asserted on the commands issued, not on the resulting file, which
+        looks identical either way."""
+        calls = self.box.sudo_calls()
+        manifest = self.box.manifest_path()
+        self.assertIn(f"tee {manifest}.new", calls)
+        self.assertIn(f"mv -f {manifest}.new {manifest}", calls)
+        self.assertFalse(os.path.exists(manifest + ".new"))
+
+    def test_a_manifest_with_no_trailing_newline_keeps_its_last_entry(self):
+        """`while read` drops a final line with no newline, which would un-claim
+        that unit permanently - it leaves the manifest and can never be retired
+        or warned about again."""
+        entries = self.box.manifest()
+        self.assertIn("gardyn-netwatch.timer", entries)
+        with open(self.box.manifest_path(), "w") as fh:
+            fh.write("\n".join(entries))          # no trailing newline
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("gardyn-netwatch.timer is deployed but the repository no "
+                      "longer ships it", proc.stderr)
+
+    def test_removal_is_deferred_when_the_run_has_already_failed(self):
+        """`disable --now` acts on systemd's current picture. A failed
+        daemon-reload means that picture is known to be out of date, and the
+        deletion is the one step here that cannot be undone by re-running."""
+        proc = self.box.run(args=["--remove-retired"], fail_on="daemon-reload")
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("removal is deferred", proc.stderr)
+        self.assertTrue(os.path.exists(self.box.dest_path("gardyn-netwatch.timer")))
+        self.assertNotIn("disable --now gardyn-netwatch.timer",
+                         self.box.systemctl_calls())
+
+    def test_removal_is_deferred_when_an_earlier_unit_failed(self):
+        proc = self.box.run(args=["--remove-retired"],
+                            fail_on="enable mqtt.service")
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("removal is deferred", proc.stderr)
+        self.assertTrue(os.path.exists(self.box.dest_path("gardyn-netwatch.timer")))
+
+    def test_a_removal_is_followed_by_a_daemon_reload(self):
+        """systemd is left holding a definition whose file has just been
+        deleted until something reloads it."""
+        self.box.clear_log()
+        self.box.run(args=["--remove-retired"])
+        calls = self.box.systemctl_calls()
+        self.assertIn("disable --now gardyn-netwatch.timer", calls)
+        self.assertGreater(calls.index("daemon-reload", 1),
+                           calls.index("disable --now gardyn-netwatch.timer"),
+                           f"no daemon-reload after the removals: {calls}")
+
+    def test_a_directory_at_a_retired_destination_is_refused(self):
+        """The other half of the not-a-plain-file guard. Only the symlink half
+        was covered, so narrowing the guard to `-L` alone stayed green."""
+        dest = self.box.dest_path("gardyn-netwatch.timer")
+        os.remove(dest)
+        os.makedirs(dest)
+        proc = self.box.run(args=["--remove-retired"])
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("refusing to remove", proc.stderr)
+        self.assertTrue(os.path.isdir(dest))
+        self.assertNotIn("disable --now gardyn-netwatch.timer",
+                         self.box.systemctl_calls())
+
+    def test_a_retired_unit_is_reported_and_left_alone_by_default(self):
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("gardyn-netwatch.timer is deployed but the repository no "
+                      "longer ships it", proc.stderr)
+        self.assertTrue(os.path.exists(self.box.dest_path("gardyn-netwatch.timer")))
+        self.assertNotIn("disable --now gardyn-netwatch.timer",
+                         self.box.systemctl_calls())
+
+    def test_the_warning_repeats_until_the_unit_is_dealt_with(self):
+        """A one-shot warning is no warning. The manifest keeps claiming a
+        retired unit for as long as it is still on disk."""
+        self.box.run()
+        proc = self.box.run()
+        self.assertIn("no longer ships it", proc.stderr)
+        self.assertIn("gardyn-netwatch.timer", self.box.manifest())
+
+    def test_the_flag_disables_and_deletes_the_retired_units(self):
+        proc = self.box.run(args=["--remove-retired"])
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        calls = self.box.systemctl_calls()
+        for name in ("gardyn-netwatch.timer", "gardyn-netwatch.service"):
+            self.assertIn(f"disable --now {name}", calls)
+            self.assertFalse(os.path.exists(self.box.dest_path(name)), name)
+        # The units still shipped are untouched.
+        self.assertTrue(os.path.exists(self.box.dest_path("mqtt.service")))
+        self.assertNotIn("disable --now mqtt.service", calls)
+
+    def test_a_removed_unit_leaves_the_manifest(self):
+        self.box.run(args=["--remove-retired"])
+        self.assertEqual(sorted(EXPECTED_UNITS - {"gardyn-netwatch.timer",
+                                                  "gardyn-netwatch.service"}),
+                         sorted(self.box.manifest()))
+
+    def test_the_pending_marker_of_a_removed_unit_goes_with_it(self):
+        marker = self.box.marker_path("gardyn-netwatch.timer")
+        open(marker, "w").close()
+        self.box.run(args=["--remove-retired"])
+        self.assertFalse(os.path.exists(marker))
+
+    def test_a_masked_retired_unit_is_refused_rather_than_deleted(self):
+        """A symlink here is `systemctl mask`. Deleting it would silently
+        unmask a unit the operator deliberately turned off."""
+        dest = self.box.dest_path("gardyn-netwatch.timer")
+        os.remove(dest)
+        os.symlink("/dev/null", dest)
+        proc = self.box.run(args=["--remove-retired"])
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("refusing to remove", proc.stderr)
+        self.assertTrue(os.path.islink(dest))
+        self.assertNotIn("disable --now gardyn-netwatch.timer",
+                         self.box.systemctl_calls())
+
+    def test_a_failed_disable_leaves_the_unit_file_in_place(self):
+        proc = self.box.run(args=["--remove-retired"],
+                            fail_on="disable --now gardyn-netwatch.timer")
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("left in place", proc.stderr)
+        self.assertTrue(os.path.exists(self.box.dest_path("gardyn-netwatch.timer")))
+
+    def test_a_unit_already_gone_from_disk_is_not_warned_about(self):
+        os.remove(self.box.dest_path("gardyn-netwatch.timer"))
+        os.remove(self.box.dest_path("gardyn-netwatch.service"))
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertNotIn("no longer ships it", proc.stderr)
+        self.assertNotIn("gardyn-netwatch.timer", self.box.manifest())
+
+
+class RetiredUnitFailClosedTests(unittest.TestCase):
+    """Removal must be incapable of selecting anything this script did not
+    install. Both cases here are the ones that would be unrecoverable."""
+
+    def test_a_host_with_no_manifest_removes_nothing(self):
+        """The upgrade case: a Pi running the previous installer has no
+        manifest, so the first run of this one has no ownership record and
+        must delete nothing at all."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        box.run()
+        os.remove(box.manifest_path())
+        foreign = box.dest_path("someone-elses.service")
+        open(foreign, "w").close()
+        os.remove(box.src_path("gardyn-netwatch.timer"))
+        proc = box.run(args=["--remove-retired"])
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertTrue(os.path.exists(box.dest_path("gardyn-netwatch.timer")))
+        self.assertTrue(os.path.exists(foreign))
+
+    def test_a_unit_whose_install_failed_is_not_claimed(self):
+        """The manifest is the ONLY thing standing between --remove-retired and
+        a file this script never wrote, so it must record what was installed -
+        not what the source directory happens to hold.
+
+        The scenario is not exotic: a foreign unit of the same name is already
+        deployed, the `install` over it fails (ENOSPC, a read-only remount, an
+        SD-card read error, `chattr +i`), and the repo later drops the name.
+        Claiming it on the strength of shipping it would make that foreign file
+        removable.
+        """
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        foreign = box.dest_path("gardyn-netwatch.service")
+        with open(foreign, "w") as fh:
+            fh.write("[Unit]\nDescription=not ours\n")
+        # Make the source unreadable so `install` fails for this unit only.
+        # No addCleanup for the chmod - the file is deleted later in this test,
+        # and cleanup runs after that. Sandbox.cleanup() removes the tree.
+        os.chmod(box.src_path("gardyn-netwatch.service"), 0o000)
+
+        proc = box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertNotIn("gardyn-netwatch.service", box.manifest())
+        # …and it stays unclaimed, so a later run cannot remove it.
+        os.chmod(box.src_path("gardyn-netwatch.service"), 0o644)
+        os.remove(box.src_path("gardyn-netwatch.service"))
+        os.remove(box.src_path("gardyn-netwatch.timer"))
+        box.clear_log()
+        proc = box.run(args=["--remove-retired"])
+        self.assertTrue(os.path.exists(foreign))
+        self.assertEqual("[Unit]\nDescription=not ours\n",
+                         read(foreign).decode())
+        self.assertNotIn("disable --now gardyn-netwatch.service",
+                         box.systemctl_calls())
+
+    def test_a_still_shipped_unit_keeps_its_claim_across_a_failed_install(self):
+        """The inverse of the case above: a transient failure on a unit we DO
+        still ship must not drop the ownership we already had, or the next run
+        would treat a unit we installed as somebody else's."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        box.run()
+        self.assertIn("gardyn-netwatch.service", box.manifest())
+        os.chmod(box.src_path("gardyn-netwatch.service"), 0o000)
+        self.addCleanup(os.chmod, box.src_path("gardyn-netwatch.service"), 0o644)
+        box.run()
+        self.assertIn("gardyn-netwatch.service", box.manifest())
+
+    def test_a_unit_this_script_never_installed_is_never_removed(self):
+        """A neighbouring unit in the same directory is not ours. It is absent
+        from the source directory by definition, which is exactly the shape of
+        a retired unit - the manifest is the only thing telling them apart."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        box.run()
+        foreign = box.dest_path("someone-elses.service")
+        open(foreign, "w").close()
+        proc = box.run(args=["--remove-retired"])
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertTrue(os.path.exists(foreign))
+        self.assertNotIn("someone-elses.service", box.manifest())
+        self.assertNotIn("disable --now someone-elses.service",
+                         box.systemctl_calls())
+
+
+class CodeRevisionTests(unittest.TestCase):
+    """`git pull && ./bin/install-systemd-units.sh` is the deploy, and a pull
+    that touches only Python changes no unit file - so the restart decision
+    correctly finds nothing to do and the run prints a column of PASS lines
+    over a service still executing the previous revision.
+
+    The recorded revision is written only when the service is actually
+    restarted, which is what makes the warning survive a run that only warned.
+    """
+
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.base = self.box.git_init()
+
+    def test_the_revision_is_recorded_when_the_service_is_restarted(self):
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("restart mqtt.service", self.box.systemctl_calls())
+        self.assertEqual(self.base, self.box.recorded_revision())
+
+    def test_a_python_only_change_is_not_reported_as_success(self):
+        self.box.run()
+        moved = self.box.git_commit_python_only()
+        self.box.clear_log()
+        proc = self.box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("has NOT taken effect", proc.stderr)
+        self.assertIn(moved, proc.stderr)
+        self.assertNotIn("units installed;", proc.stdout)
+        # Nothing was restarted - that IS the defect being reported.
+        self.assertNotIn("restart mqtt.service", self.box.systemctl_calls())
+
+    def test_a_run_that_only_warned_does_not_advance_the_recorded_revision(self):
+        """Recording it would silence the warning on the next run while the
+        service is still on the old code - the leaked-marker bug again."""
+        self.box.run()
+        self.box.git_commit_python_only()
+        self.box.run()
+        self.assertEqual(self.base, self.box.recorded_revision())
+        proc = self.box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("has NOT taken effect", proc.stderr)
+
+    def test_the_flag_restarts_the_service_and_records_the_new_revision(self):
+        self.box.run()
+        moved = self.box.git_commit_python_only()
+        self.box.clear_log()
+        proc = self.box.run(args=["--restart-on-code-change"])
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("restart mqtt.service", self.box.systemctl_calls())
+        self.assertEqual(moved, self.box.recorded_revision())
+        # …and the run after that has nothing left to say.
+        self.box.clear_log()
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertNotIn("restart mqtt.service", self.box.systemctl_calls())
+
+    def test_a_failed_restart_under_the_flag_is_a_failure(self):
+        self.box.run()
+        self.box.git_commit_python_only()
+        proc = self.box.run(args=["--restart-on-code-change"],
+                            fail_on="restart mqtt.service")
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("restart mqtt.service failed", proc.stderr)
+        self.assertEqual(self.base, self.box.recorded_revision())
+
+    def test_the_error_does_not_prescribe_a_remedy_that_cannot_clear_it(self):
+        """A restart issued out of band is invisible here - the revision is
+        recorded only by the run that performs the restart - so telling the
+        operator to restart by hand would leave the deploy permanently red
+        while the service was in fact current."""
+        self.box.run()
+        self.box.git_commit_python_only()
+        proc = self.box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("--restart-on-code-change", proc.stderr)
+        self.assertNotIn("Run 'sudo systemctl restart", proc.stderr)
+
+    def test_the_revision_is_written_through_a_temporary_file(self):
+        self.box.run()
+        rev = self.box.revision_path()
+        self.assertIn(f"tee {rev}.new", self.box.sudo_calls())
+        self.assertIn(f"mv -f {rev}.new {rev}", self.box.sudo_calls())
+        self.assertFalse(os.path.exists(rev + ".new"))
+
+    def test_a_unit_file_change_restarts_and_re_records_in_one_run(self):
+        """The ordinary case: both the code and a unit moved. The restart the
+        unit change causes is the same restart the code needs."""
+        self.box.run()
+        with open(self.box.src_path("mqtt.service"), "a") as fh:
+            fh.write("\n# a new definition\n")
+        moved = self.box.git_commit_python_only()
+        self.box.clear_log()
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("restart mqtt.service", self.box.systemctl_calls())
+        self.assertEqual(moved, self.box.recorded_revision())
+
+
+class ExistingDeploymentTests(unittest.TestCase):
+    """The host that matters: a Pi where the units are already deployed and
+    byte-identical, running an installer that has never recorded a revision.
+
+    Nothing here restarts a unit, so the revision was never written - and the
+    check that exists to catch a Python-only deploy stayed dormant forever
+    while every run printed `none changed` and exited 0. The feature was
+    silently OFF on the only machine it was written for.
+    """
+
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+        # Deploy WITHOUT git, so no revision can be recorded, then make it a
+        # checkout - exactly the shape of upgrading the installer in place.
+        self.box.run()
+        self.assertIsNone(self.box.recorded_revision())
+        self.base = self.box.git_init()
+        self.box.clear_log()
+
+    def test_the_first_run_on_a_settled_host_records_a_baseline(self):
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        # Nothing changed, so nothing was restarted…
+        self.assertFalse([c for c in self.box.systemctl_calls()
+                          if c.startswith("restart ")])
+        # …and yet the baseline is now recorded, which is what arms the check.
+        self.assertEqual(self.base, self.box.recorded_revision())
+
+    def test_the_baseline_is_taken_out_loud(self):
+        """Recording a revision nobody confirmed is an assumption, and a silent
+        assumption is indistinguishable from a verified one."""
+        proc = self.box.run()
+        self.assertIn("no revision was recorded", proc.stderr)
+        self.assertIn("--restart-on-code-change", proc.stderr)
+
+    def test_the_check_is_armed_from_that_point_on(self):
+        self.box.run()
+        self.box.git_commit_python_only()
+        proc = self.box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("has NOT taken effect", proc.stderr)
+
+    def test_the_flag_can_seed_a_host_that_has_no_revision_recorded(self):
+        """Ordered the other way, the empty-revision branch swallows the run
+        and the flag's restart is unreachable - so the documented escape hatch
+        does nothing on the host that needs it."""
+        moved = self.box.git_commit_python_only()
+        proc = self.box.run(args=["--restart-on-code-change"])
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("restart mqtt.service", self.box.systemctl_calls())
+        self.assertEqual(moved, self.box.recorded_revision())
+
+
+class NonGitCheckoutTests(unittest.TestCase):
+
+    def test_a_checkout_with_no_git_metadata_skips_the_check(self):
+        """Fail-open, and deliberately: an unversioned copy is not a reason to
+        refuse a deploy. It has to SAY it skipped, though - a silent skip is
+        indistinguishable from a clean result."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("cannot tell whether the code moved", proc.stderr)
+        self.assertIsNone(box.recorded_revision())
+
+    def test_a_repo_nested_inside_another_checkout_is_not_read(self):
+        """`git rev-parse` walks UP. Reading an enclosing repository's HEAD
+        would make the advisory fire forever on a revision that has nothing to
+        do with the deployed code."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        for cmd in (["git", "init", "-q"],
+                    ["git", "add", "-A"],
+                    ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                     "commit", "-qm", "outer"]):
+            subprocess.run(cmd, cwd=box.root, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("cannot tell whether the code moved", proc.stderr)
+        self.assertIsNone(box.recorded_revision())
+
 
 FAKE_TRUE = """#!/bin/bash
 exit 0

@@ -38,6 +38,7 @@ Mechanics that have bitten this repo before, all handled here:
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -110,8 +111,8 @@ MUTANTS = [
 
     ("i6", "drop the daemon-reload",
      INSTALLER,
-     'sudo systemctl daemon-reload || record_failure "systemctl daemon-reload failed"',
-     'true'),
+     'sudo systemctl daemon-reload || {\n    reload_ok=0',
+     'true || {\n    reload_ok=0'),
 
     ("i7", "enable everything, including the two units with no [Install]",
      INSTALLER,
@@ -205,8 +206,8 @@ MUTANTS = [
 
     ("i23", "report an ordinary first install as an unreadable destination",
      INSTALLER,
-     '    if [ ! -e "$dest" ]; then',
-     '    if false; then'),
+     '    if [ ! -e "$dest" ]; then\n        # The ordinary first-install case.',
+     '    if false; then\n        # The ordinary first-install case.'),
 
     ("i26", "drop the pending-restart marker, losing an interrupted run's state",
      INSTALLER,
@@ -264,18 +265,18 @@ MUTANTS = [
 
     ("s1", "REINTRODUCE the heredoc that overwrites the tracked unit file",
      SETUP,
-     'function install_systemd_units {\n    if ! "$BIN_DIR/install-systemd-units.sh"; then\n        log_error "systemd unit installation failed."\n        return 1\n',
+     'function install_systemd_units {\n    if ! "$BIN_DIR/install-systemd-units.sh" "$@"; then\n        log_error "systemd unit installation failed."\n        return 1\n',
      OLD_GENERATOR),
 
     ("s2", "stop calling the installer from main",
      SETUP,
-     '\ninstall_systemd_units || exit 1\n',
-     '\n#install_systemd_units || exit 1\n'),
+     '\ninstall_systemd_units "$@" || exit 1\n',
+     '\n#install_systemd_units "$@" || exit 1\n'),
 
     ("s3", "let setup.sh swallow the installer's failure",
      SETUP,
-     'install_systemd_units || exit 1',
-     'install_systemd_units'),
+     'install_systemd_units "$@" || exit 1',
+     'install_systemd_units "$@"'),
 
     ("s4", "return success from a failed unit install",
      SETUP,
@@ -296,6 +297,199 @@ MUTANTS = [
      MQTT_UNIT,
      'Wants=network-online.target\nAfter=network-online.target pigpiod.service',
      'After=network.target pigpiod.service'),
+
+    # --- the production default (T-491) -------------------------------------
+    #
+    # Covered by nothing before this: every case overrides SYSTEMD_UNIT_DIR, so
+    # the suite stayed 48/48 green with the default pointed at /tmp.
+    ("p1", "point the production default at the wrong directory",
+     INSTALLER,
+     'UNIT_DEST_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"',
+     'UNIT_DEST_DIR="${SYSTEMD_UNIT_DIR:-/tmp/WRONG-UNIT-DIR}"'),
+
+    ("p2", "shift the production default by one character",
+     INSTALLER,
+     'UNIT_DEST_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"',
+     'UNIT_DEST_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system-old}"'),
+
+    ("p3", "point the source default at the wrong directory",
+     INSTALLER,
+     'UNIT_SRC_DIR="${GARDYN_UNIT_SRC_DIR:-$INSTALL_DIR/services/etc/systemd/system}"',
+     'UNIT_SRC_DIR="${GARDYN_UNIT_SRC_DIR:-$INSTALL_DIR/services/systemd}"'),
+
+    # --- the pending marker for units that are never restarted (T-491) ------
+    ("k1", "leak the marker again for the two units with no [Install]",
+     INSTALLER,
+     '    in_list "$u" ${changed[@]+"${changed[@]}"} || continue\n'
+     '    if [ "$reload_ok" -eq 1 ]; then',
+     '    in_list "$u" ${changed[@]+"${changed[@]}"} || continue\n'
+     '    if false; then'),
+
+    ("k2", "clear the marker even when daemon-reload failed",
+     INSTALLER,
+     '    if [ "$reload_ok" -eq 1 ]; then\n        sudo rm -f "$(pending_marker "$u")"',
+     '    if true; then\n        sudo rm -f "$(pending_marker "$u")"'),
+
+    ("k3", "start the oneshots while clearing their marker",
+     INSTALLER,
+     '        sudo rm -f "$(pending_marker "$u")"\n'
+     '        log_pass "$u installed (changed); its timer runs the new definition"',
+     '        sudo rm -f "$(pending_marker "$u")"\n'
+     '        sudo systemctl start "$u"\n'
+     '        log_pass "$u installed (changed); its timer runs the new definition"'),
+
+    # --- retired-unit removal (T-491) ---------------------------------------
+    #
+    # DESTRUCTIVE. r1 and r2 are the two ways this deletes a file that should
+    # have been left alone, and they are the mutants that matter most in this
+    # list: the guard they remove is the only thing between --remove-retired
+    # and a unit belonging to some other package.
+    ("r1", "remove without consulting the manifest - delete anything the "
+           "source directory no longer holds",
+     INSTALLER,
+     '        prev_manifest+=("$line")\n'
+     '        in_list "$line" "${units[@]}" || retired+=("$line")',
+     '        prev_manifest+=("$line")\n'
+     '        retired+=("$line")'),
+
+    ("r2", "drop the not-a-plain-file guard, so a masked unit is deleted",
+     INSTALLER,
+     '    if [ -L "$dest" ] || [ ! -f "$dest" ]; then',
+     '    if false; then'),
+
+    ("r3", "remove by default, with no flag asked for",
+     INSTALLER,
+     '    if [ "$REMOVE_RETIRED" -ne 1 ]; then',
+     '    if false; then'),
+
+    ("r4", "delete the file even when disable --now failed",
+     INSTALLER,
+     '    if sudo systemctl disable --now "$u"; then\n        if sudo rm -f "$dest"; then',
+     '    if true; then\n        if sudo rm -f "$dest"; then'),
+
+    ("r5", "stop claiming a retired unit, so its warning appears exactly once",
+     INSTALLER,
+     '    if in_list "$u" "${units[@]}" || [ -e "$UNIT_DEST_DIR/$u" ]; then\n'
+     '        manifest+=("$u")\n'
+     '    fi\n',
+     '    :\n'),
+
+    ("r6", "claim what the repo SHIPS rather than what was installed, so a "
+           "unit whose install failed becomes removable",
+     INSTALLER,
+     'manifest=()\nfor u in ${installed[@]+"${installed[@]}"}; do',
+     'manifest=()\nfor u in "${units[@]}"; do'),
+
+    ("r8", "remove even when the run has already failed",
+     INSTALLER,
+     '    if [ "$reload_ok" -ne 1 ] || [ ${#failures[@]} -gt 0 ]; then\n'
+     '        log_warn "$u is no longer shipped, but removal is deferred',
+     '    if false; then\n'
+     '        log_warn "$u is no longer shipped, but removal is deferred'),
+
+    ("r9", "skip the daemon-reload after deleting a unit file",
+     INSTALLER,
+     'if [ "$removed_any" -eq 1 ]; then\n    sudo systemctl daemon-reload',
+     'if false; then\n    sudo systemctl daemon-reload'),
+
+    ("r10", "drop the last manifest entry when the file has no trailing newline",
+     INSTALLER,
+     'while IFS= read -r line || [ -n "$line" ]; do',
+     'while IFS= read -r line; do'),
+
+    ("r11", "write the manifest in place, so a truncated write is what readers see",
+     INSTALLER,
+     'if printf \'%s\\n\' ${manifest[@]+"${manifest[@]}"} \\\n'
+     '       | sudo tee "$(manifest_path).new" >/dev/null; then\n'
+     '    sudo mv -f "$(manifest_path).new" "$(manifest_path)" \\\n',
+     'if printf \'%s\\n\' ${manifest[@]+"${manifest[@]}"} \\\n'
+     '       | sudo tee "$(manifest_path)" >/dev/null; then\n'
+     '    true \\\n'),
+
+    ("r7", "never write the manifest, so removal can never become possible",
+     INSTALLER,
+     'if printf \'%s\\n\' ${manifest[@]+"${manifest[@]}"} \\\n'
+     '       | sudo tee "$(manifest_path).new" >/dev/null; then',
+     'if true; then'),
+
+    # --- the code-moved advisory (T-491) ------------------------------------
+    #
+    # DESTRUCTIVE at c3: that one restarts the live controller.
+    ("c1", "report success over a service still running the old revision",
+     INSTALLER,
+     '    else\n        code_stale=1\n    fi',
+     '    else\n        :\n    fi'),
+
+    ("c2", "advance the recorded revision on a run that only warned",
+     INSTALLER,
+     '    else\n        code_stale=1\n    fi',
+     '    else\n        record_revision "$current_rev"\n        code_stale=1\n    fi'),
+
+    ("c3", "restart the controller on a code change with no flag asked for",
+     INSTALLER,
+     '    elif [ "$RESTART_ON_CODE_CHANGE" -eq 1 ]; then',
+     '    elif true; then'),
+
+    ("c7", "test the empty-revision case BEFORE the flag, so the flag can "
+           "never seed a host that has no revision recorded",
+     INSTALLER,
+     '    elif [ "$RESTART_ON_CODE_CHANGE" -eq 1 ]; then\n'
+     '        # Checked BEFORE the no-revision case',
+     '    elif [ -z "$recorded_rev" ]; then\n'
+     '        record_revision "$current_rev"\n'
+     '    elif [ "$RESTART_ON_CODE_CHANGE" -eq 1 ]; then\n'
+     '        # Checked BEFORE the no-revision case'),
+
+    ("c8", "leave a host with no recorded revision dormant forever, instead "
+           "of seeding a baseline on the first run",
+     INSTALLER,
+     '        record_revision "$current_rev"\n'
+     '        log_warn "no revision was recorded for $CODE_UNIT before this run;',
+     '        log_warn "no revision was recorded for $CODE_UNIT before this run;'),
+
+    ("c9", "seed the baseline silently, so an operator cannot tell that the "
+           "running code was never confirmed",
+     INSTALLER,
+     '        log_warn "no revision was recorded for $CODE_UNIT before this run;',
+     '        : "no revision was recorded for $CODE_UNIT before this run;'),
+
+    ("c10", "prescribe a manual restart, which this script cannot observe and "
+            "which therefore leaves the deploy permanently red",
+     INSTALLER,
+     '    log_error "Re-run with --restart-on-code-change; a restart done by hand '
+     'is not visible to this script and will not clear this."',
+     '    log_error "Run \'sudo systemctl restart $CODE_UNIT\'."'),
+
+    ("c11", "write the revision in place rather than through a rename",
+     INSTALLER,
+     '    if printf \'%s\\n\' "$1" | sudo tee "$(revision_path).new" >/dev/null; then\n'
+     '        sudo mv -f "$(revision_path).new" "$(revision_path)" \\\n',
+     '    if printf \'%s\\n\' "$1" | sudo tee "$(revision_path)" >/dev/null; then\n'
+     '        true \\\n'),
+
+    ("c4", "record the revision on install rather than on restart, so the "
+           "warning is silenced by the run that should have raised it",
+     INSTALLER,
+     '    elif in_list "$CODE_UNIT" ${restarted[@]+"${restarted[@]}"}; then',
+     '    elif true; then'),
+
+    ("c5", "read an enclosing repository's HEAD",
+     INSTALLER,
+     '    if [ "$(git -C "$INSTALL_DIR" rev-parse --show-toplevel 2>/dev/null)" \\\n'
+     '         = "$INSTALL_DIR" ]; then',
+     '    if true; then'),
+
+    ("c6", "skip the check silently instead of saying it skipped",
+     INSTALLER,
+     '        log_info "not a git checkout (or git unavailable) - cannot tell '
+     'whether the code moved since $CODE_UNIT was last restarted"',
+     '        :'),
+
+    # --- option parsing (T-491) ---------------------------------------------
+    ("o1", "accept an unknown option instead of refusing it",
+     INSTALLER,
+     '        *) usage >&2; fail "unknown option: $1" ;;',
+     '        *) ;;'),
 ]
 
 # Mutants that DELETE a file rather than edit one - the "a shipped unit quietly
@@ -352,14 +546,18 @@ def main():
     targets = [INSTALLER, SETUP, MQTT_UNIT, NETWATCH_TIMER]
     original = {p: read(p) for p in targets}
     original_sha = {p: sha(p) for p in targets}
+    # Modes too. The delete mutant RECREATES its target, and a recreated file
+    # gets whatever the umask gives - so a content-only comparison reports
+    # "restored byte-identical: True" over a file whose permissions moved.
+    original_mode = {p: stat.S_IMODE(os.stat(p).st_mode) for p in targets}
     stash = tempfile.mkdtemp(prefix="t477mut-")
     try:
-        return _run(targets, original, original_sha, stash)
+        return _run(targets, original, original_sha, original_mode, stash)
     finally:
-        _restore(targets, original, stash)
+        _restore(targets, original, original_mode, stash)
 
 
-def _run(targets, original, original_sha, stash):
+def _run(targets, original, original_sha, original_mode, stash):
 
     print("=" * 70)
     print("CONTROL A - clean tree must be GREEN")
@@ -427,6 +625,7 @@ def _run(targets, original, original_sha, stash):
         # copyfile, not move/copy2: do NOT restore the original mtime, or a
         # (mtime, size) bytecode cache can serve the previous run's bytecode.
         shutil.copyfile(parked, path)
+        os.chmod(path, original_mode[path])
         os.remove(parked)
         if ok_m:
             print(f"  [{tag}] SURVIVED  {label}")
@@ -439,8 +638,10 @@ def _run(targets, original, original_sha, stash):
     print("\n" + "=" * 70)
     print(f"RESULT: {killed}/{total} killed")
 
-    restored = all(sha(p) == original_sha[p] for p in targets)
-    print(f"tree restored byte-identical: {restored}")
+    restored = all(sha(p) == original_sha[p]
+                   and stat.S_IMODE(os.stat(p).st_mode) == original_mode[p]
+                   for p in targets)
+    print(f"tree restored byte-identical (content and mode): {restored}")
     shutil.rmtree(stash, ignore_errors=True)
 
     if survived:
@@ -454,25 +655,34 @@ def _run(targets, original, original_sha, stash):
     return 0 if (killed == total and restored) else 1
 
 
-def _restore(targets, original, stash):
+def _restore(targets, original, original_mode, stash):
     """Put every mutated file back, whatever happened.
 
     Without this a battery killed part-way through (^C, a timeout) leaves a
     mutant applied in the working tree - which is a silent, plausible-looking
     change to shipping code. Observed 2026-08-01: a 10-minute timeout left
     setup.sh with its installer call commented out.
+
+    Each file is restored INDEPENDENTLY. A single loop abandons the remaining
+    files the moment one raises - and it raises out of a `finally`, so the
+    second file stays mutated with nothing reporting it. Errors are collected
+    and re-raised after every file has had its turn.
+
+    The stash is only a scratch area for the delete mutant, which copies its
+    own file back; a file missing here is recreated from `original` like any
+    other, because sha() on a missing path returns a value no digest matches.
     """
+    errors = []
     for path, text in original.items():
         try:
             if sha(path) != hashlib.sha256(text.encode()).hexdigest():
                 write(path, text)
-        except OSError:
-            write(path, text)
-    for name in os.listdir(stash) if os.path.isdir(stash) else []:
-        for path in targets:
-            if os.path.basename(path) == name and not os.path.exists(path):
-                shutil.copyfile(os.path.join(stash, name), path)
+            os.chmod(path, original_mode[path])
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
     shutil.rmtree(stash, ignore_errors=True)
+    if errors:
+        raise OSError("could not restore: " + "; ".join(errors))
 
 
 if __name__ == "__main__":
