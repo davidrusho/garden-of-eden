@@ -25,7 +25,7 @@ import os
 import sys
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 from tests.test_water_interlock import mqtt_mod
 
@@ -106,6 +106,102 @@ class TestFswebcamArgv(unittest.TestCase):
                 self.assertEqual(argv[argv.index(flag) + 1], value)
         self.assertIn("--no-banner", argv)
         self.assertEqual(argv[-1], "/tmp/u.jpg")
+
+
+class TestOneCameraCannotBlockTheOther(unittest.TestCase):
+    """The load-bearing claim in _capture_and_publish's own docstring.
+
+    It says each camera gets its own try/except "so a failing camera (e.g. the
+    lower camera's intermittent USB error-32) never blocks the other's
+    publish". Nothing tested it: replacing BOTH except bodies with a bare
+    `raise` left test_water_interlock, test_camera_quality and
+    test_retired_entities all green. The lower camera is the flaky one and it
+    is captured SECOND, so the ordering hides the regression in the direction
+    that matters least - the case worth pinning is a failure on the FIRST
+    camera, which under a bare `raise` takes the healthy one down with it.
+
+    Two exception classes, deliberately, because the handlers are separate:
+    CalledProcessError is what a real fswebcam failure raises, and anything
+    else lands in the catch-all. A test covering only one of them leaves the
+    other free to be deleted.
+    """
+
+    # A real JPEG SOI marker rather than a MagicMock. With a bare mock the
+    # payload is a mock too, so nothing here could tell a publish carrying the
+    # captured frame from one carrying an empty body - the read is the whole
+    # point of opening the file.
+    FRAME = b"\xff\xd8\xff\xe0 fake jpeg body"
+
+    def setUp(self):
+        self.published = []
+        self.client = MagicMock()
+        self.client.publish.side_effect = (
+            lambda topic, **kw: self.published.append((topic, kw.get("payload"))))
+        self.check_call = patch.object(
+            mqtt_mod.subprocess, "check_call").start()
+        # No create=True: `open` always exists, so the flag never did anything.
+        patch("builtins.open", mock_open(read_data=self.FRAME)).start()
+        # publish_images() loops forever; stop it after the first cycle.
+        patch.object(mqtt_mod, "sleep",
+                     side_effect=RuntimeError("stop")).start()
+        self.addCleanup(patch.stopall)
+
+    @property
+    def topics(self):
+        return [t for t, _ in self.published]
+
+    def _cycle(self, first_camera_raises):
+        """Run one publish cycle in which the FIRST camera fails.
+
+        Returns (capture attempts, log records). assertLogs is not decoration:
+        a handler that swallows the failure without saying so is its own
+        defect, and wrapping here also keeps the catch-all's traceback out of
+        the test runner's output.
+        """
+        calls = {"n": 0}
+
+        def capture(argv, *a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise first_camera_raises
+            return 0
+
+        self.check_call.side_effect = capture
+        with self.assertLogs(mqtt_mod.logger, level="ERROR") as caught:
+            with self.assertRaises(RuntimeError):   # the sleep sentinel
+                mqtt_mod.publish_images(self.client)
+        return calls["n"], caught.records
+
+    def test_a_subprocess_failure_on_the_first_camera_still_publishes_the_second(self):
+        attempts, records = self._cycle(
+            mqtt_mod.subprocess.CalledProcessError(1, "fswebcam"))
+        self.assertEqual(2, attempts, "the second camera was never attempted")
+        self.assertEqual(["gardyn/image/lower_camera"], self.topics)
+        self.assertTrue(any("upper" in r.getMessage() for r in records),
+                        [r.getMessage() for r in records])
+
+    def test_an_unexpected_error_on_the_first_camera_still_publishes_the_second(self):
+        """The catch-all branch. OSError errno 32 is the lower camera's real
+        USB failure; here it is raised by the FIRST capture so that swallowing
+        it is what lets the other camera through."""
+        attempts, records = self._cycle(OSError(32, "Broken pipe"))
+        self.assertEqual(2, attempts)
+        self.assertEqual(["gardyn/image/lower_camera"], self.topics)
+        # logger.exception, so the record carries the traceback - which is what
+        # distinguishes the catch-all from the CalledProcessError branch.
+        self.assertTrue(any(r.exc_info for r in records))
+
+    def test_the_control_publishes_both_cameras_when_nothing_fails(self):
+        """Without this the two cases above would pass just as happily if
+        publish() were never called at all for either camera."""
+        self.check_call.side_effect = None
+        with self.assertRaises(RuntimeError):
+            mqtt_mod.publish_images(self.client)
+        self.assertEqual(["gardyn/image/upper_camera",
+                          "gardyn/image/lower_camera"], self.topics)
+        # …carrying the bytes that were captured, not an empty body.
+        self.assertEqual([self.FRAME, self.FRAME],
+                         [payload for _, payload in self.published])
 
 
 class TestBothCamerasGetTheirOwnQuality(unittest.TestCase):
