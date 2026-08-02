@@ -3,8 +3,13 @@
 # examples:
 # curl http://localhost:5000/distance/measure
 # curl http://localhost:5000/temperature
-# curl -X POST -H "Content-Type: application/json" -d '{"value":30}' http://localhost:5000/pump/speed
 # curl http://localhost:5000/pump/stats
+#
+# The API cannot START the pump (T-489). POST /pump/on and POST /pump/speed
+# drove the GPIO with no low-water check, and this process has no route to
+# mqtt.py's interlock, so they were removed rather than duplicated. To run the
+# pump under the interlock:
+#   mosquitto_pub -t "gardyn/pump/command" -m "ON" -u gardyn -P "<password>"
 
 BASE_URL="http://localhost:5000"
 CONTENT_TYPE_HEADER="Content-Type: application/json"
@@ -31,14 +36,6 @@ control_light() {
     sleep "$SLEEP_DURATION"
 }
 
-control_pump() {
-    local value="$1"
-    
-    post_data "/pump/speed" "{\"value\": $value}"
-    get_data "/pump/speed"
-    sleep "$SLEEP_DURATION"
-}
-
 # Light Control
 control_light 30
 control_light 0
@@ -47,19 +44,8 @@ post_data "/light/on" ""
 sleep "$SLEEP_DURATION"
 post_data "/light/off" ""
 
-#Pump Control
-control_pump 30
-control_pump 0
-
-post_data "/pump/on" ""
-sleep "$SLEEP_DURATION"
-post_data "/pump/off" ""
-
-#pump current usage
-control_pump 30
-get_data "/pump/stats"
-control_pump 10
-get_data "/pump/stats"
+# Pump: stop and read only. There is no start endpoint to exercise.
+get_data "/pump/speed"
 post_data "/pump/off" ""
 sleep "$SLEEP_DURATION"
 get_data "/pump/stats"

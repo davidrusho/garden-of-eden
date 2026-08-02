@@ -13,13 +13,21 @@ class BaseTestCase(unittest.TestCase):
         self.client = self.app.test_client()
 
 class PumpBlueprintTestCase(BaseTestCase):
-    
+
     BASE_ROUTE = "/pump"
 
-    # Parameterized test for /on and /off routes
+    # POST /pump/on and POST /pump/speed were tested here and are gone with the
+    # routes themselves (T-489): both started the pump with no water check,
+    # and this process cannot reach mqtt.py's interlock to acquire one. Their
+    # ABSENCE is scored by tests/test_pump_api_interlock.py, which enumerates
+    # the URL map rather than probing the two paths by name - so a start route
+    # coming back under any name fails there, which is the assertion that
+    # actually matters. Nothing about it belongs in this file, whose subject is
+    # the surviving endpoints answering correctly.
+
+    # Parameterized so a second stop-shaped route joins it without a new case.
     @parameterized.expand([
-        ("/on", "on", "Pump turned on!"),
-        ("/off", "off", "Pump turned off!")
+        ("/off", "off", "Pump turned off!"),
     ])
 
     def test_pump_actions(self, route, mock_method, expected_message):
@@ -29,26 +37,12 @@ class PumpBlueprintTestCase(BaseTestCase):
             mock_action.assert_called_once()
             self.assertEqual(response.get_json(), {"message": expected_message})
 
-    @patch('app.sensors.pump.routes.pump_control.on')
-    def test_pump_turn_on(self, mock_on):
-        response = self.client.post(f'{self.BASE_ROUTE}/on')
-        self.assertEqual(response.status_code, 200)
-        mock_on.assert_called_once()
-        self.assertEqual(response.get_json(), {"message": "Pump turned on!"})
-
     @patch('app.sensors.pump.routes.pump_control.off')
     def test_pump_turn_off(self, mock_off):
         response = self.client.post(f'{self.BASE_ROUTE}/off')
         self.assertEqual(response.status_code, 200)
         mock_off.assert_called_once()
         self.assertEqual(response.get_json(), {"message": "Pump turned off!"})
-
-    @patch('app.sensors.pump.routes.pump_control.set_speed')
-    def test_pump_adjust_speed(self, mock_set_speed):
-        response = self.client.post(f'{self.BASE_ROUTE}/speed', json={"value": 50})
-        self.assertEqual(response.status_code, 200)
-        mock_set_speed.assert_called_once_with(50)
-        self.assertEqual(response.get_json(), {"message": "Pump adjusted to 50% speed!"})
 
     @patch('app.sensors.pump.routes.PumpControl.get_speed')
     def test_pump_get_speed(self, mock_get_speed):
@@ -64,13 +58,6 @@ class PumpBlueprintTestCase(BaseTestCase):
         response = self.client.get(f'{self.BASE_ROUTE}/stats')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), mock_data)
-
-    @patch('app.sensors.pump.routes.pump_control.set_speed')
-    def test_pump_adjust_speed_invalid(self, mock_set_speed):
-        mock_set_speed.side_effect = ValueError("Invalid speed value")
-        response = self.client.post(f'{self.BASE_ROUTE}/speed', json={"value": 150})  # Assuming 150 is invalid
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json(), {"message": "Invalid speed value"})
 
 class LightBlueprintTestCase(BaseTestCase):
     

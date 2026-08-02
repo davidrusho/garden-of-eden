@@ -319,12 +319,27 @@ python run.py
 
 [GET] http://<pi-ip>:5000/pcb-temp
 
-[POST] http://<pi-ip>:5000/pump/on
 [POST] http://<pi-ip>:5000/pump/off
-[POST] http://<pi-ip>:5000/pump/speed body:{"value": 50 }
 [GET] http://<pi-ip>:5000/pump/speed
 [GET] http://<pi-ip>:5000/pump/stats
 ```
+
+> **The REST API cannot start the pump, by design.** `POST /pump/on` and
+> `POST /pump/speed` existed and drove the GPIO with no water check at all. The
+> low-water interlock lives in `mqtt.py`'s `start_pump()`, bound to the one
+> process that owns the GPIO, so the Flask app can neither call it nor
+> reimplement it without a second copy of the same safety decision. The routes
+> were removed instead. To run the pump *with* the interlock:
+>
+> ```
+> mosquitto_pub -t "gardyn/pump/command" -m "ON" -u gardyn -P "somepassword"
+> ```
+>
+> Stopping is still served — a control that can refuse to start a pump but
+> cannot stop one is not a safety control.
+>
+> The Postman collection below predates this and still lists the removed
+> routes.
 
 #### Postman
 
@@ -335,6 +350,14 @@ Export this [Postman collection](https://www.postman.com/orange-shadow-8689/work
 Run `crontab -e`, select your preferred editor and then add the following job. Edit as needed.
 
 > Note: update your paths for the following...
+
+> **The pump entries below are NOT interlocked.** `pump.py --on` is the raw
+> driver and makes no water check — the same gap that removed the REST API's
+> start routes (T-489), and `bin/water.sh` inherits it because it shells out to
+> the same CLI. Nothing in this repository schedules them; they are upstream
+> example content. Prefer a Home Assistant automation publishing
+> `gardyn/pump/command`, which is gated by `start_pump()`. If you do install
+> these, understand that they will run the pump on an empty reservoir.
 
 ```text
 # †urn on lights at 6am, 9am, 5pm, and turn off at 8pm
