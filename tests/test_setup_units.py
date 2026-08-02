@@ -43,6 +43,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INSTALLER = os.path.join(REPO, "bin", "install-systemd-units.sh")
 SETUP_SH = os.path.join(REPO, "bin", "setup.sh")
 UNIT_SRC = os.path.join(REPO, "services", "etc", "systemd", "system")
+NETWATCH_TEMPLATE = os.path.join(REPO, "services", "etc", "gardyn",
+                                 "netwatch.env.example")
 
 # Pinned deliberately. The installer derives its unit list from the directory,
 # which is what stops a newly added unit being forgotten; this list is the
@@ -662,6 +664,113 @@ class InstallerFailureTests(unittest.TestCase):
         proc = box.run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+
+    def _box_with_config(self, text=None, template=False):
+        box = Sandbox(netwatch_config=False)
+        self.addCleanup(box.cleanup)
+        if template:
+            shutil.copy(NETWATCH_TEMPLATE, box.netwatch_config)
+        elif text is not None:
+            with open(box.netwatch_config, "w") as fh:
+                fh.write(text)
+        return box
+
+    @staticmethod
+    def _filled_template(leave_placeholder_in=()):
+        """The shipped template with its VALUES replaced, comments untouched.
+
+        This is what copy-then-edit actually produces, and it is the case that
+        separates a value-scoped placeholder check from a bare `grep CHANGEME`
+        - the template EXPLAINS the placeholder in its own prose, and that
+        prose survives every correct edit.
+        """
+        real = {
+            "GARDYN_NETWATCH_PING_TARGETS": "192.0.2.1,192.0.2.9",
+            "GARDYN_NETWATCH_TCP_HOST": "192.0.2.9",
+            "GARDYN_NETWATCH_WLAN_UUID": "11111111-2222-3333-4444-555555555555",
+        }
+        out = []
+        for line in read(NETWATCH_TEMPLATE).decode().splitlines(True):
+            key = line.split("=", 1)[0]
+            if key in real and key not in leave_placeholder_in:
+                line = f"{key}={real[key]}\n"
+            out.append(line)
+        return "".join(out)
+
+    def test_an_UNEDITED_template_is_refused_like_a_missing_config(self):
+        """`-s` tests PRESENCE, not usability.
+
+        The README says copy-then-edit, so copy-and-forget is the single most
+        likely first-deploy mistake - and it produced a completely green run
+        over a watchdog that then refuses on every tick, because gardyn-netwatch
+        rejects a CHANGEME value and nothing in install/enable/start can see
+        that until the TIMER has fired.
+        """
+        box = self._box_with_config(template=True)
+        proc = box.run()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("CHANGEME", proc.stderr)
+        self.assertNotIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+
+    def test_a_correctly_edited_config_KEEPING_its_comments_is_accepted(self):
+        """The control that makes the check above worth having.
+
+        The obvious implementation - `grep -q CHANGEME` - is WRONG, and wrong
+        in the direction that never gets noticed in a test that only feeds it
+        bad input: the template's own comments say "replace every CHANGEME"
+        and "a CHANGEME left in place", so a bare grep refuses every properly
+        filled config forever. Measured before the check was written.
+        """
+        box = self._box_with_config(self._filled_template())
+        self.assertIn("CHANGEME", read(box.netwatch_config).decode(),
+                      "fixture no longer exercises the trap: the template's "
+                      "prose no longer mentions the placeholder")
+        proc = box.run()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+
+    def test_a_PARTIALLY_edited_config_is_refused(self):
+        """Two keys filled in and one forgotten is a config the watchdog
+        refuses, so it is one the installer must not arm."""
+        box = self._box_with_config(
+            self._filled_template(leave_placeholder_in=("GARDYN_NETWATCH_WLAN_UUID",)))
+        proc = box.run()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+
+    def test_a_DIRECTORY_at_the_config_path_is_refused(self):
+        """`[ -s ]` is true for a directory, so `mkdir` where a file belonged
+        armed the watchdog against something it can never read."""
+        box = Sandbox(netwatch_config=False)
+        self.addCleanup(box.cleanup)
+        os.makedirs(box.netwatch_config)
+        proc = box.run()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+
+    def test_an_UNREADABLE_config_is_refused_rather_than_armed(self):
+        """"Could not look" and "found no placeholder" are the same empty
+        result from grep, and only one of them is an all-clear. The whole file
+        fails closed on that distinction elsewhere; so must this."""
+        box = self._box_with_config(self._filled_template())
+        os.chmod(box.netwatch_config, 0o000)
+        self.addCleanup(os.chmod, box.netwatch_config, 0o644)
+        if os.access(box.netwatch_config, os.R_OK):
+            self.skipTest("running as root - an unreadable file is still readable")
+        proc = box.run()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+
+    def test_the_installer_and_the_watchdog_agree_on_the_PLACEHOLDER(self):
+        """A third independent naming of the same token, alongside the config
+        PATH pinned above. If the script's PLACEHOLDER ever moves and the
+        installer's does not, the installer green-lights a config the watchdog
+        refuses - which is precisely the false all-clear this check exists to
+        close, restored by drift."""
+        installer = read(INSTALLER).decode()
+        script = read(os.path.join(REPO, "bin", "gardyn-netwatch.py")).decode()
+        self.assertIn('PLACEHOLDER = "CHANGEME"', script)
+        self.assertIn('NETWATCH_PLACEHOLDER="CHANGEME"', installer)
 
     def test_a_masked_destination_is_refused_and_left_intact(self):
         """`systemctl mask` links the unit to /dev/null; GNU install would

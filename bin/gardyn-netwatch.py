@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-# Reviewed: 2026-08-02 against a4bb303 (T-490) — that review found four open
-# defects in this file, none of them fixed here: an all-digit port longer than
-# CPython's 4300-digit conversion cap escapes as an uncaught ValueError, _read()
-# decodes with the locale encoding rather than UTF-8, _fmt() lets a raw newline
-# or tab split the record onto another line, and load_state()'s "never raises"
-# is still not literally true. See the ticket before relying on any of them.
+# Reviewed: 2026-08-02 against 27a8165 (T-494) — read end to end. All four
+# defects the T-490 review left open are fixed and each carries a test and a
+# mutant: the port length bound in front of int(), an explicit UTF-8 read,
+# control-character escaping in _fmt(), and RecursionError in load_state()'s
+# caught tuple. Known and ACCEPTED: neither the script nor the installer can
+# tell a correctly-shaped config from one naming hosts that no longer exist,
+# and that config drives the reboot ladder — see the ticket.
+# Reviewed: 2026-08-02 against a4bb303 (T-490)
 # Reviewed: 2026-07-31 against bf5680f (T-473.4)
 """Network watchdog for the Gardyn Pi (T-473.4).
 
@@ -336,6 +338,21 @@ def build_config(env: dict) -> NetwatchConfig:
         if not (raw_port.isascii() and raw_port.isdigit()):
             raise ConfigError("config_bad_port",
                               f"{KEY_TCP_PORT} is not a plain decimal integer")
+        # BEFORE the conversion, because the conversion is what raises.
+        # `isdigit()` is true for any number of digits, and past CPython's
+        # 4300-digit cap `int()` raises ValueError - which is not a
+        # ConfigError, so it escapes main()'s handler and exits 1 with a
+        # traceback and NO journal line. That is the same failure shape the
+        # UnicodeDecodeError catch removed from _read(): the operator loses
+        # the named reason this whole refusal vocabulary exists to give them.
+        #
+        # Five, because 65535 is five digits - so a sixth character can only be
+        # zero padding or garbage, and a config file carrying either is a typo
+        # rather than an intent. Checking the converted VALUE instead would be
+        # checking a number that was never produced.
+        if len(raw_port) > 5:
+            raise ConfigError("config_bad_port",
+                              f"{KEY_TCP_PORT} is longer than any port can be")
         port = int(raw_port, 10)
         if not 1 <= port <= 65535:
             raise ConfigError("config_bad_port",
@@ -408,7 +425,11 @@ def load_state(raw: str | None) -> dict:
         return state
     try:
         parsed = json.loads(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError, because json raises THAT rather than ValueError on a
+        # deeply nested document - so without it the "never raises" promise
+        # above was not literally true, and a corrupt state file took the whole
+        # ladder down with it.
         return state
     if not isinstance(parsed, dict):
         return state
@@ -529,8 +550,27 @@ def _fmt(value) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     text = str(value)
-    if " " in text or '"' in text:
-        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    # CONTROL CHARACTERS are escaped for the same reason the quote is. The
+    # quoting rule keys off a space and a quote, and a newline is neither - so
+    # a raw newline ENDS the record and turns its remainder into a second line
+    # carrying an injected field. One record arriving as three reads as data
+    # rather than as damage, and this line is the only artifact anybody reads
+    # back during an outage.
+    #
+    # Escaped BEFORE the quoting decision, so a value whose only oddity is a
+    # control character still gets quoted rather than slipping past for not
+    # containing a space.
+    escaped = (text.replace("\\", "\\\\")
+                   .replace('"', '\\"')
+                   .replace("\n", "\\n")
+                   .replace("\r", "\\r")
+                   .replace("\t", "\\t"))
+    # Anything else below 0x20, plus DEL. A bare ESC can retint or reposition
+    # the terminal of whoever is reading the journal back.
+    escaped = "".join(
+        ch if (ch >= " " and ch != "\x7f") else f"\\x{ord(ch):02x}"
+        for ch in escaped)
+    if escaped != text or " " in text or '"' in text:
         return f'"{escaped}"'
     return text
 
@@ -680,9 +720,17 @@ def _read(path: str) -> str | None:
     Deliberately NOT `errors="replace"`: measured, that ACCEPTS the corrupt
     config and yields a ping target with a U+FFFD in it. Refusing to read is
     the whole point; salvaging bytes is strictly worse than not reading them.
+
+    The encoding is NAMED rather than inherited. `open()` with no `encoding=`
+    uses the locale's, and a systemd unit runs with a minimal environment - so
+    under a C/POSIX locale Python did not coerce to C.UTF-8 the preferred
+    encoding is ASCII, and a perfectly valid UTF-8 config is then refused as
+    `config_unreadable`. The template this repository ships contains em
+    dashes, so the file the README says to copy is exactly the file that would
+    be rejected.
     """
     try:
-        with open(path) as handle:
+        with open(path, encoding="utf-8") as handle:
             return handle.read()
     except (OSError, UnicodeDecodeError):
         return None

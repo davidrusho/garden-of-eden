@@ -14,8 +14,11 @@ Run from the repo root:
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -347,6 +350,28 @@ class TestTickSequences(unittest.TestCase):
 # State file.
 # --------------------------------------------------------------------------
 class TestLoadState(unittest.TestCase):
+    def test_never_raises_holds_for_RecursionError_too(self):
+        """`json.loads` raises RecursionError - not ValueError - on a deeply
+        nested document, and RecursionError was not in the caught tuple.
+
+        The docstring promises "never raises", and a watchdog that dies on a
+        corrupt state file is a watchdog that stops watching. It fails in the
+        SAFE direction (the unit exits non-zero, no reboot is ordered), but it
+        costs the whole ladder on a host with no physical recovery path, for a
+        file this process writes moments before an intentional reboot.
+
+        Asserted by raising it from `json.loads` rather than by feeding real
+        nesting. The genuine trigger needs roughly 150,000 levels, the exact
+        depth is C-STACK dependent rather than governed by
+        `sys.setrecursionlimit` (which the C scanner ignores), and a fixture
+        tuned to overflow one machine's stack can hard-crash another instead
+        of raising - so the real document would make this suite flaky on the
+        small-stack ARM host it describes. What is pinned here is the handler,
+        which is the part that was missing.
+        """
+        with mock.patch.object(nw.json, "loads", side_effect=RecursionError):
+            self.assertEqual(dict(nw.EMPTY_STATE), nw.load_state('{"a": 1}'))
+
     def test_missing_file_is_a_clean_slate(self):
         self.assertEqual(nw.load_state(None), nw.EMPTY_STATE)
 
@@ -901,6 +926,31 @@ class TestFormatRecord(unittest.TestCase):
         self.assertIn('outcome="a b"',
                       nw.format_record("none", "r", {}, 1.0, state(), CFG, "a b"))
 
+    def test_a_control_character_cannot_SPLIT_the_record(self):
+        """A raw newline in a value ends the log line and turns the remainder
+        into a second record with an injected field. The quoting rule keys off
+        a space and a quote, and a newline is neither - so the escape hatch the
+        embedded-quote test closes is still open by a different route.
+
+        During an outage this line is the only artifact anyone reads back, and
+        one record arriving as three is worse than one that visibly does not
+        parse, for the same reason a mis-parsed field is worse than a broken
+        one: it reads as data.
+        """
+        for raw in ("a\nb", "a\rb", "a\tb", "a\x00b", "a\x1bb"):
+            with self.subTest(raw=raw):
+                rendered = nw._fmt(raw)
+                self.assertEqual(
+                    1, len(rendered.splitlines()),
+                    f"{raw!r} rendered as {rendered!r}, which spans lines")
+                for ch in "\n\r\t":
+                    self.assertNotIn(ch, rendered)
+
+    def test_a_newline_in_a_record_VALUE_stays_on_one_line(self):
+        """The property one level up from _fmt: the whole rendered record."""
+        line = nw.format_record("none", "r", {}, 1.0, state(), CFG, "a\nb")
+        self.assertEqual(1, len(line.splitlines()))
+
 
 class TestSafetyConstants(unittest.TestCase):
     """The thresholds are the safety envelope, so pin them as literals.
@@ -1120,6 +1170,44 @@ class TestBuildConfig(unittest.TestCase):
             with self.subTest(port=bad):
                 self._refuses("config_bad_port", GARDYN_NETWATCH_TCP_PORT=bad)
 
+    def test_an_absurdly_long_all_digit_port_is_REFUSED_not_a_traceback(self):
+        """`isdigit()` passes for any number of digits, and `int()` then raises
+        ValueError past CPython's 4300-digit conversion cap - which is NOT a
+        ConfigError, so it escapes main()'s handler and exits 1 with a
+        traceback and NO journal line.
+
+        That is byte-for-byte the failure shape the UnicodeDecodeError fix
+        removed from _read(): the operator gets a stack trace instead of the
+        named reason the whole refusal vocabulary exists to give them.
+        """
+        for digits in (4301, 5000):
+            with self.subTest(digits=digits):
+                self._refuses("config_bad_port",
+                              GARDYN_NETWATCH_TCP_PORT="1" * digits)
+
+    def test_the_port_length_bound_is_what_a_port_can_actually_be(self):
+        """65535 is five digits, so a sixth can only be padding or garbage.
+
+        The bound is on LENGTH rather than on the converted value because the
+        conversion is the thing that raises - checking the number afterwards is
+        checking a value that was never produced.
+        """
+        cfg = nw.build_config(nw.parse_env(
+            cfg_text(GARDYN_NETWATCH_TCP_PORT="65535")))
+        self.assertEqual(cfg.tcp_port, 65535)
+        # Zero-padded past five characters is refused rather than silently
+        # accepted. This is the ONLY class of input whose treatment the bound
+        # changes, and a config file carrying it is a typo, not an intent.
+        for padded in ("001883", "0001883", "000001"):
+            with self.subTest(padded=padded):
+                self._refuses("config_bad_port",
+                              GARDYN_NETWATCH_TCP_PORT=padded)
+        # Five characters still converts, padding and all.
+        self.assertEqual(
+            1883,
+            nw.build_config(nw.parse_env(
+                cfg_text(GARDYN_NETWATCH_TCP_PORT="01883"))).tcp_port)
+
     def test_an_omitted_port_takes_the_registered_default(self):
         cfg = nw.build_config(nw.parse_env(cfg_text(GARDYN_NETWATCH_TCP_PORT=None)))
         self.assertEqual(cfg.tcp_port, nw.DEFAULT_TCP_PORT)
@@ -1176,6 +1264,81 @@ class TestLoadConfig(unittest.TestCase):
             path = pathlib.Path(tmp) / "netwatch.env"
             path.write_text(CFG_TEXT)
             self.assertEqual(nw.load_config(str(path)), CFG)
+
+    def test_the_config_read_names_its_encoding_rather_than_inheriting_one(self):
+        """`open()` with no `encoding=` uses the LOCALE's encoding.
+
+        systemd units run with a minimal environment, and under a C/POSIX
+        locale Python did not coerce to C.UTF-8 the preferred encoding is
+        ASCII - so a config carrying any non-ASCII byte raises
+        UnicodeDecodeError, is caught as "unreadable", and a PERFECTLY VALID
+        config is refused with `config_unreadable`.
+
+        Asserted on the mechanism, because a running interpreter cannot change
+        its own locale; the end-to-end proof under a real ASCII locale is the
+        subprocess test below.
+        """
+        seen = {}
+        real_open = open
+
+        def recording_open(path, *args, **kwargs):
+            seen["encoding"] = kwargs.get("encoding")
+            return real_open(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "netwatch.env"
+            path.write_text(CFG_TEXT)
+            with mock.patch("builtins.open", recording_open):
+                nw._read(str(path))
+        self.assertEqual(
+            "utf-8", seen.get("encoding"),
+            "_read() inherits the locale encoding; a valid UTF-8 config is "
+            "then refused as unreadable under a C locale")
+
+    def test_a_valid_utf8_config_is_accepted_under_a_REAL_ascii_locale(self):
+        """End-to-end, in a subprocess whose locale is genuinely ASCII.
+
+        Carries its own positive control: if the environment does not actually
+        produce an ASCII preferred encoding, the case proves nothing and is
+        skipped rather than passing quietly.
+        """
+        env = dict(os.environ, LC_ALL="C", LANG="C",
+                   PYTHONCOERCECLOCALE="0", PYTHONUTF8="0")
+        control = subprocess.run(
+            [sys.executable, "-c",
+             "import locale; print(locale.getpreferredencoding(False))"],
+            env=env, capture_output=True, text=True)
+        if "ascii" not in control.stdout.strip().lower().replace(
+                "ansi_x3.4-1968", "ascii"):
+            self.skipTest(
+                f"locale did not go ASCII (got {control.stdout.strip()!r}); "
+                "this platform cannot exercise the failing case")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "netwatch.env"
+            # An em dash, exactly as the shipped template carries.
+            path.write_bytes(
+                ("# targets — an em dash, as the template has\n"
+                 + CFG_TEXT).encode("utf-8"))
+            proc = subprocess.run(
+                [sys.executable, "-c",
+                 "import importlib.util,sys\n"
+                 f"s=importlib.util.spec_from_file_location('nw', {str(_SRC)!r})\n"
+                 "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+                 f"c=m.load_config({str(path)!r}); print(c.tcp_host)"],
+                env=env, capture_output=True, text=True)
+        self.assertEqual(
+            0, proc.returncode,
+            "a valid UTF-8 config was refused under a C locale:\n"
+            + proc.stdout + proc.stderr)
+        self.assertEqual("192.0.2.9", proc.stdout.strip())
+
+    def test_the_shipped_template_itself_is_not_pure_ascii(self):
+        """The positive control for the pair above: were the template ever to
+        become plain ASCII, a locale-dependent read would stop being able to
+        refuse it and both tests would pass while proving nothing."""
+        with self.assertRaises(UnicodeDecodeError):
+            TEMPLATE.read_bytes().decode("ascii")
 
     def test_the_error_record_names_the_reason_and_the_path(self):
         exc = nw.ConfigError("config_unreadable", "cannot read /etc/x")

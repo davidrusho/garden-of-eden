@@ -34,6 +34,8 @@ Mechanics that have bitten this repo before, all handled here:
   * the tree is asserted byte-identical at the end, including the file the
     deletion mutant removes.
 """
+# Reviewed: 2026-08-02 against 27a8165 (T-494) — read end to end; every anchor
+# re-verified to match exactly once against the merged installer.
 # Reviewed: 2026-08-01 against 3e8374c and 92dd3fd (T-477)
 import hashlib
 import os
@@ -517,6 +519,54 @@ MUTANTS = [
      'if [ ${#failures[@]} -gt 0 ] || [ "${code_stale:-0}" -eq 1 ]; then\n'
      '    report_and_exit\nfi',
      'if [ "${code_stale:-0}" -eq 1 ]; then\n    report_and_exit\nfi'),
+
+    # --- the watchdog config-usability gate (T-494) --------------------------
+    #
+    # This gate decides whether gardyn-netwatch - the unit that can REBOOT a
+    # host with no physical recovery path - gets armed. n3 is the one that
+    # matters most and the one a suite fed only bad configs cannot catch: it
+    # installs the NAIVE placeholder test, which refuses every correctly
+    # filled config forever because the template's own prose mentions the
+    # token. It is killed only by the positive control.
+    ("n1", "drop the directory check - a dir at the config path arms it",
+     INSTALLER,
+     '    if [ -d "$NETWATCH_CONFIG" ]; then',
+     '    if false; then'),
+
+    ("n2", "drop the placeholder check - an unedited template arms it",
+     INSTALLER,
+     '    grep -qE "^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=.*$NETWATCH_PLACEHOLDER" \\\n'
+     '        "$NETWATCH_CONFIG"\n'
+     '    case $? in',
+     '    grep -qE "THIS-PATTERN-MATCHES-NOTHING-EVER" \\\n'
+     '        "$NETWATCH_CONFIG"\n'
+     '    case $? in'),
+
+    ("n3", "use the NAIVE unscoped placeholder grep, which refuses every "
+           "correctly filled config because the template's prose names the token",
+     INSTALLER,
+     '    grep -qE "^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=.*$NETWATCH_PLACEHOLDER" \\\n'
+     '        "$NETWATCH_CONFIG"',
+     '    grep -qE "$NETWATCH_PLACEHOLDER" \\\n'
+     '        "$NETWATCH_CONFIG"'),
+
+    ("n4", "treat an UNREADABLE config as an all-clear (fail open)",
+     INSTALLER,
+     '        *) echo "$NETWATCH_CONFIG cannot be read"\n'
+     '           return 0 ;;',
+     '        *) ;;'),
+
+    ("n5", "let the gate report a problem but arm the unit anyway",
+     INSTALLER,
+     '            problem=$(netwatch_config_problem)\n'
+     '            if [ -n "$problem" ]; then',
+     '            problem=$(netwatch_config_problem)\n'
+     '            if false; then'),
+
+    ("n6", "drop the empty-file half of the gate",
+     INSTALLER,
+     '    if [ ! -f "$NETWATCH_CONFIG" ] || [ ! -s "$NETWATCH_CONFIG" ]; then',
+     '    if false; then'),
 
     # --- option parsing (T-491) ---------------------------------------------
     ("o1", "accept an unknown option instead of refusing it",

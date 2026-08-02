@@ -1,5 +1,8 @@
 #!/bin/bash
 #
+# Reviewed: 2026-08-02 against 27a8165 (T-494) — read end to end, including the
+# T-490/T-491 conflict resolution. Both branches' properties survive it; the
+# watchdog config gate now tests USABILITY rather than presence.
 # Reviewed: 2026-08-01 against 3e8374c and 92dd3fd (T-477)
 #
 # Install the systemd units this project ships.
@@ -374,6 +377,53 @@ EOF
     return $ok
 }
 
+# --- is the watchdog's config USABLE, not merely present? --------------------
+#
+# Echoes a short reason and returns 0 when the config cannot be used; prints
+# nothing and returns 1 when it can. Three ways `[ -s ]` said yes to something
+# gardyn-netwatch then refuses on every tick:
+#
+#   * A DIRECTORY passes `-s` - a directory's size is non-zero - so `mkdir`
+#     where a file belonged armed the watchdog against something unreadable.
+#   * An UNEDITED template. The README says copy-then-edit, so copy-and-forget
+#     is the most likely first-deploy mistake, and every value is still
+#     CHANGEME. The script rejects that; the installer reported success.
+#   * An UNREADABLE file. "Could not look" and "found nothing" are the same
+#     empty result from grep, and only one of them is an all-clear - the same
+#     distinction unit_can_run and the [Install] grep already fail closed on.
+#
+# THE OBVIOUS PLACEHOLDER TEST IS WRONG, and wrong in the direction that a
+# suite fed only bad input never catches. The template EXPLAINS the placeholder
+# in its own prose ("replace every CHANGEME", "a CHANGEME left in place"), and
+# that prose survives every correct edit - so a bare `grep -q CHANGEME` refuses
+# every properly filled config, forever. Measured both ways before this was
+# written. Requiring `KEY=` before the token is what separates a live value
+# from prose about it; a comment line starts with `#` and cannot match.
+#
+# Kept in step with gardyn-netwatch.py's own PLACEHOLDER by a test - a drift
+# between them restores the exact false all-clear this closes.
+NETWATCH_PLACEHOLDER="CHANGEME"
+function netwatch_config_problem {
+    if [ -d "$NETWATCH_CONFIG" ]; then
+        echo "$NETWATCH_CONFIG is a directory, not a file"
+        return 0
+    fi
+    if [ ! -f "$NETWATCH_CONFIG" ] || [ ! -s "$NETWATCH_CONFIG" ]; then
+        echo "$NETWATCH_CONFIG is missing or empty"
+        return 0
+    fi
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=.*$NETWATCH_PLACEHOLDER" \
+        "$NETWATCH_CONFIG"
+    case $? in
+        0) echo "$NETWATCH_CONFIG still holds a $NETWATCH_PLACEHOLDER value"
+           return 0 ;;
+        1) ;;
+        *) echo "$NETWATCH_CONFIG cannot be read"
+           return 0 ;;
+    esac
+    return 1
+}
+
 # --- install -----------------------------------------------------------------
 changed=()
 installed=()
@@ -465,14 +515,11 @@ for u in ${installed[@]+"${installed[@]}"}; do
         continue
     fi
 
-    # `-s`, not `-e`: an empty file is a half-finished `install` or a truncated
-    # edit, and gardyn-netwatch rejects it exactly as it rejects an absent one.
-    # Deliberately NOT a ConditionPathExists= in the unit, which would SKIP the
-    # unit and report success - the quiet failure being removed, not a fix.
     case "$u" in
         gardyn-netwatch.*)
-            if [ ! -s "$NETWATCH_CONFIG" ]; then
-                record_failure "$u: NOT enabled - $NETWATCH_CONFIG is missing or empty. gardyn-netwatch has no default network topology and refuses to run without it; copy services/etc/gardyn/netwatch.env.example there and fill it in."
+            problem=$(netwatch_config_problem)
+            if [ -n "$problem" ]; then
+                record_failure "$u: NOT enabled - $problem. gardyn-netwatch has no default network topology and refuses to run without a complete one; copy services/etc/gardyn/netwatch.env.example to $NETWATCH_CONFIG and replace every $NETWATCH_PLACEHOLDER."
                 continue
             fi
             ;;

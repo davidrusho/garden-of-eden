@@ -68,7 +68,7 @@ INSTALLER = "bin/install-systemd-units.sh"
 # Taken verbatim from the source rather than retyped: this line is dense with
 # backslashes and quotes, and a retyped anchor that silently matches nothing
 # would report a survivor for a mutation that never happened.
-_ESCAPE_LINE = '        escaped = text.replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\')'
+_ESCAPE_LINE = '    escaped = (text.replace("\\\\", "\\\\\\\\")\n                   .replace(\'"\', \'\\\\"\')'
 TEMPLATE = "services/etc/gardyn/netwatch.env.example"
 
 TEST_MODULES = ("tests.test_netwatch", "tests.test_setup_units")
@@ -109,8 +109,8 @@ MUTATIONS = [
     ("port range check dropped", SRC,
      "        if not 1 <= port <= 65535:", "        if False:"),
     ("non-numeric port coerced to the default instead of refused", SRC,
-     '            raise ConfigError("config_bad_port",\n                              f"{KEY_TCP_PORT} is not a plain decimal integer")\n        port = int(raw_port, 10)',
-     "            port = DEFAULT_TCP_PORT\n        else:\n            port = int(raw_port, 10)"),
+     '            raise ConfigError("config_bad_port",\n                              f"{KEY_TCP_PORT} is not a plain decimal integer")',
+     "            port = DEFAULT_TCP_PORT\n        elif False:\n            pass"),
     ("a connection NAME accepted where a UUID belongs", SRC,
      "    if not _UUID_RE.match(uuid):", "    if False:"),
     ("uuid trailing anchor dropped - a uuid with junk appended passes", SRC,
@@ -143,19 +143,26 @@ MUTATIONS = [
      "    except (OSError, UnicodeDecodeError):\n        return None",
      "    except OSError:\n        return None"),
     ("undecodable bytes SALVAGED into a config value", SRC,
-     "        with open(path) as handle:",
-     '        with open(path, errors="replace") as handle:'),
+     '        with open(path, encoding="utf-8") as handle:',
+     '        with open(path, encoding="utf-8", errors="replace") as handle:'),
     ("logfmt quoting no longer escapes an embedded quote", SRC,
-     _ESCAPE_LINE, "        escaped = text"),
+     _ESCAPE_LINE, "    escaped = (text\n                   .replace('x', 'x')"),
     # --------------------------------------------------- installer preflight
     ("installer arms the watchdog with no config file", INSTALLER,
-     '            if [ ! -s "$NETWATCH_CONFIG" ]; then', "            if false; then"),
+     '    if [ ! -f "$NETWATCH_CONFIG" ] || [ ! -s "$NETWATCH_CONFIG" ]; then\n'
+     '        echo "$NETWATCH_CONFIG is missing or empty"\n'
+     '        return 0\n'
+     '    fi',
+     '    if false; then\n'
+     '        echo "$NETWATCH_CONFIG is missing or empty"\n'
+     '        return 0\n'
+     '    fi'),
     ("installer accepts a zero-byte config", INSTALLER,
-     '            if [ ! -s "$NETWATCH_CONFIG" ]; then',
-     '            if [ ! -e "$NETWATCH_CONFIG" ]; then'),
+     '    if [ ! -f "$NETWATCH_CONFIG" ] || [ ! -s "$NETWATCH_CONFIG" ]; then',
+     '    if [ ! -e "$NETWATCH_CONFIG" ]; then'),
     ("installer downgrades the missing config to a warning", INSTALLER,
-     '                record_failure "$u: NOT enabled - $NETWATCH_CONFIG is missing or empty.',
-     '                log_warn "$u: NOT enabled - $NETWATCH_CONFIG is missing or empty.'),
+     '                record_failure "$u: NOT enabled - $problem.',
+     '                log_warn "$u: NOT enabled - $problem.'),
     ("installer default config path silently changed", INSTALLER,
      'NETWATCH_CONFIG="${GARDYN_NETWATCH_CONFIG:-/etc/gardyn/netwatch.env}"',
      'NETWATCH_CONFIG="${GARDYN_NETWATCH_CONFIG:-/etc/gardyn/netwatch.env.bak}"'),
@@ -220,6 +227,34 @@ MUTATIONS = [
      "    if not reachable and not measured:", "    if False:"),
     ("missing uptime no longer stands down", SRC,
      "    if uptime_s is None:\n        # No trustworthy clock", "    if False:\n        # No trustworthy clock"),
+
+    # ------------------------------------------- the T-494 refusal-shape fixes
+    #
+    # All three restore a defect whose damage is to the REFUSAL, not to the
+    # ladder: an operator loses either the named reason or the config itself,
+    # on a host with no physical recovery path where the journal line is the
+    # only thing anybody can act on.
+    ("port length bound removed - a long all-digit port is a TRACEBACK, "
+     "not a named refusal", SRC,
+     "        if len(raw_port) > 5:", "        if False:"),
+    ("load_state stops catching RecursionError, so a corrupt state file "
+     "takes the whole ladder down", SRC,
+     "    except (ValueError, TypeError, RecursionError):",
+     "    except (ValueError, TypeError):"),
+    ("config read back to the LOCALE encoding - a valid UTF-8 config is "
+     "refused as unreadable under a C locale", SRC,
+     '        with open(path, encoding="utf-8") as handle:',
+     "        with open(path) as handle:"),
+    ("logfmt no longer escapes control characters - one record splits into "
+     "three with an injected field", SRC,
+     '                   .replace("\\n", "\\\\n")\n'
+     '                   .replace("\\r", "\\\\r")\n'
+     '                   .replace("\\t", "\\\\t"))',
+     "                   )"),
+    ("the quoting decision stops seeing the escape, so a control character "
+     "slips past for not being a space", SRC,
+     '    if escaped != text or " " in text or \'"\' in text:',
+     '    if " " in text or \'"\' in text:'),
 
     # ------------------------------------------------------ mqtt.service Type=
     ("mqtt.service back to the default Type (broken start reports success)", UNIT,
