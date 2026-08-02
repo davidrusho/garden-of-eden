@@ -240,8 +240,16 @@ function enable_pigpiod_service {
 # dirty, the T-471 boot-resilience directives were silently reverted, and the
 # health sampler and network watchdog were not installed at all. The unit files
 # are the single source of truth now; bin/install-systemd-units.sh copies them.
+#
+# setup.sh's own arguments are forwarded, so `./bin/setup.sh
+# --restart-on-code-change` reaches the installer. Without the passthrough the
+# installer's documented escape hatch is unreachable from the documented
+# entrypoint: a pull that changes only Python makes the installer exit non-zero
+# by design, setup.sh propagates that, and the flag that clears it cannot be
+# passed. setup.sh parses no options of its own, so "$@" is exactly the set the
+# installer will reject by name if it is not one of its own.
 function install_systemd_units {
-    if ! "$BIN_DIR/install-systemd-units.sh"; then
+    if ! "$BIN_DIR/install-systemd-units.sh" "$@"; then
         log_error "systemd unit installation failed."
         return 1
     fi
@@ -269,4 +277,4 @@ create_bash_script_symlinks
 # `|| exit 1` rather than a bare call: this happens to be the last line today,
 # so setup.sh's exit status would be the function's by position alone, and
 # anything appended below would silently swallow a failed unit install.
-install_systemd_units || exit 1
+install_systemd_units "$@" || exit 1

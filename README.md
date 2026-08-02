@@ -116,8 +116,35 @@ carry an `[Install]` section, and restarts only the units whose file actually
 changed. Units with no `[Install]` section are `Type=oneshot` jobs started by
 their timer, so they are installed but never enabled directly.
 
-Because it restarts only on a unit-file change, a pull that changes **only**
-Python still needs `sudo systemctl restart mqtt.service` to take effect.
+Two flags, both off by default:
+
+```
+./bin/install-systemd-units.sh [--remove-retired] [--restart-on-code-change]
+```
+
+**`--remove-retired`** disables and deletes deployed units the repository no
+longer ships. Without it they are reported and left alone, which is the safer
+default but does mean a unit deleted from the repo stays armed on the Pi —
+including `gardyn-netwatch`, which can reboot the host. Removal only ever
+considers names recorded in `.gardyn-installed-units`, the manifest the script
+writes beside the units, so a host that has never run this version can lose
+nothing and a unit belonging to another package is never a candidate.
+
+**`--restart-on-code-change`** covers the deploy that changes no unit file at
+all. `git pull && ./bin/install-systemd-units.sh` is the usual redeploy, and a
+pull that touches only Python leaves every unit byte-identical — so nothing is
+restarted and `mqtt.service` goes on running the previous revision. The script
+records the checkout's git revision beside the units at the moment it actually
+restarts that service, and a later run whose revision differs **exits non-zero
+and says so** rather than printing a column of PASS lines. Either restart the
+service yourself:
+
+```
+sudo systemctl restart mqtt.service
+```
+
+…or pass `--restart-on-code-change` and let the installer do it. A checkout
+with no git metadata skips the check and reports that it skipped.
 
 > **The shipped units are written for one specific deployment.** They hardcode
 > `User=gardyn` and `/home/gardyn/garden-of-eden`, and `gardyn-netwatch` is a
