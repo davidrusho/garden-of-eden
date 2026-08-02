@@ -76,21 +76,46 @@ STUBBING_MODULES = (
     "tests.test_camera_quality",
     "tests.test_light_logging",
     "tests.test_retired_entities",
+    "tests.test_pump_api_interlock",
 )
 
 # Names that may legitimately appear in sys.modules after an import, outside
 # the roots above: the stdlib. Anything else is something the import pulled in
 # and left behind.
 _LEAK_PROBE = r"""
-import json, sys, importlib
+import contextlib, io, json, sys, importlib
 roots = tuple(json.loads(sys.argv[2]))
 def owned(name):
     return name.split(".")[0] in roots
 before_owned = {n: m for n, m in sys.modules.items() if owned(n)}
 before_all = set(sys.modules)
-importlib.import_module(sys.argv[1])
+# The import's OWN stdout is swallowed, because this probe's result is parsed
+# as JSON from stdout and several drivers print at import time -- pump.py says
+# "Setting pump frequency to 50", the temperature and humidity drivers announce
+# that they could not initialise. Any one of them turns a correct probe run
+# into a JSONDecodeError that reads like a broken probe rather than a chatty
+# module. Not reproducible without the real Flask installed, which is why it
+# survived the suite that introduced this file.
+with contextlib.redirect_stdout(io.StringIO()):
+    importlib.import_module(sys.argv[1])
 after_owned = {n: m for n, m in sys.modules.items() if owned(n)}
-added = sorted(n for n in after_owned if n not in before_owned)
+
+
+def _stub_shaped(m):
+    # A hand-built types.ModuleType has neither; a real module or a namespace
+    # package has at least one.
+    return getattr(m, "__file__", None) is None and not hasattr(m, "__path__")
+
+
+# Same reasoning as `foreign` below: a real module left behind is what an
+# ordinary import does. `config` is a root and it imports python-dotenv, so a
+# suite that loads the real config necessarily registers real dotenv modules -
+# flagging those says nothing about isolation.
+added = sorted(n for n in after_owned
+               if n not in before_owned and _stub_shaped(after_owned[n]))
+# NOT filtered by shape: something standing where a real module used to be is
+# the actual contamination, and it is just as bad when the replacement is
+# itself real.
 replaced = sorted(n for n in before_owned if after_owned.get(n) is not before_owned[n])
 # Everything new, whatever its root - this is what catches a module the stub
 # window created under a name the roots list has never heard of. The stdlib is
@@ -103,7 +128,21 @@ def expected(name):
         return True
     return name == "tests" or name.startswith("tests.")
 
-foreign = sorted(n for n in set(sys.modules) - before_all if not expected(n))
+# A REAL library left in sys.modules is what every ordinary import does and
+# harms nobody -- tests/test_pump_api_interlock.py exercises the real Flask
+# app, so importing it necessarily registers flask, werkzeug, jinja2, click
+# and the rest. What this file is actually guarding against is a STUB standing
+# where a real module should be, and the two are cheaply distinguishable: a
+# types.ModuleType built by hand has neither __file__ nor __path__, while a
+# real module or namespace package has at least one. Requiring `foreign == []`
+# instead would have forced a suite to either stub Flask (defeating its point)
+# or be exempted from the check entirely.
+def stub_shaped(name):
+    m = sys.modules.get(name)
+    return getattr(m, "__file__", None) is None and not hasattr(m, "__path__")
+
+foreign = sorted(n for n in set(sys.modules) - before_all
+                 if not expected(n) and stub_shaped(n))
 print(json.dumps({"added": added, "replaced": replaced, "foreign": foreign}))
 """
 
@@ -327,6 +366,7 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         "mutate_setup_units.py": ["bin/install-systemd-units.sh", "bin/setup.sh",
                                   "services/etc/systemd/system/mqtt.service",
                                   "services/etc/systemd/system/gardyn-netwatch.timer"],
+        "mutate_pump_api_interlock.py": ["app/sensors/pump/routes.py"],
     }
 
     # Harnesses that copy the repository and mutate the COPY. They cannot leave

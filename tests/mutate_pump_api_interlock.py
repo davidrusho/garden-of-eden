@@ -184,7 +184,20 @@ def sha(path):
 def main():
     original_src = open(ROUTES).read()
     original_sha = sha(ROUTES)
+    # Every write below is undone on its own happy path, which covers nothing
+    # if the run dies in between -- a Ctrl-C or a wrapper's timeout then leaves
+    # a mutant sitting in the working tree, where the next commit picks it up.
+    # tests/test_suite_isolation.py drives this harness and asserts the tree
+    # comes back, so the guarantee is checked rather than asserted in a comment.
+    try:
+        return _battery(original_src, original_sha)
+    finally:
+        if open(ROUTES).read() != original_src:
+            open(ROUTES, "w").write(original_src)
+            print(f"\nrestored {ROUTES} after an interrupted run")
 
+
+def _battery(original_src, original_sha):
     print("=" * 70)
     print("CONTROL A - clean tree must be GREEN")
     ok, out = run_suites()
