@@ -168,10 +168,14 @@ sudoedit /etc/gardyn/netwatch.env        # replace every CHANGEME
 
 Find the wlan0 profile's UUID with `nmcli -g UUID,NAME,DEVICE connection show`.
 
-`bin/install-systemd-units.sh` refuses to enable or start the watchdog while
-that file is missing or empty, and exits non-zero saying so — the other units
-are still installed and armed, so a missing config never keeps the grow-light
-controller down.
+`bin/install-systemd-units.sh` refuses to enable or start the watchdog unless
+that file is *usable*, and exits non-zero saying so — the other units are still
+installed and armed, so a missing config never keeps the grow-light controller
+down. Usable means more than present: it refuses a missing or empty file, a
+directory where the file belongs, a file it cannot read, and — the likely one —
+a copy of the template whose values are still `CHANGEME`. Copying and
+forgetting to edit would otherwise arm a watchdog that then fails on every
+tick, over a completely green install.
 
 Every incomplete state — the file absent, a key missing or blank, a `CHANGEME`
 left in place, a port that is not a number, fewer than two ping targets, a
