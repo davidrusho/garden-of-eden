@@ -738,15 +738,26 @@ class InstallerFailureTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertNotIn("enable gardyn-netwatch.timer", box.systemctl_calls())
 
-    def test_a_DIRECTORY_at_the_config_path_is_refused(self):
+    def test_a_DIRECTORY_at_the_config_path_is_refused_AND_named_as_one(self):
         """`[ -s ]` is true for a directory, so `mkdir` where a file belonged
-        armed the watchdog against something it can never read."""
+        armed the watchdog against something it can never read.
+
+        The message is asserted, not just the refusal. `[ ! -f ]` already
+        refuses a directory on its own, so the dedicated branch earns its place
+        only by SAYING which of the two happened - and a mutation battery found
+        exactly that: dropping the branch left every refusal assertion green.
+        On a host nobody can walk up to, "someone ran mkdir here" and "the file
+        was never created" are different problems with different fixes, and the
+        journal line is all the operator gets.
+        """
         box = Sandbox(netwatch_config=False)
         self.addCleanup(box.cleanup)
         os.makedirs(box.netwatch_config)
         proc = box.run()
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertNotIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+        self.assertIn("is a directory, not a file", proc.stderr)
+        self.assertNotIn("is missing or empty", proc.stderr)
 
     def test_an_UNREADABLE_config_is_refused_rather_than_armed(self):
         """"Could not look" and "found no placeholder" are the same empty
