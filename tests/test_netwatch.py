@@ -946,6 +946,23 @@ class TestFormatRecord(unittest.TestCase):
                 for ch in "\n\r\t":
                     self.assertNotIn(ch, rendered)
 
+    def test_the_common_control_characters_render_READABLY(self):
+        """The three that actually occur get their conventional escape.
+
+        The generic \\xNN fallback below them already makes the record safe, so
+        this is about what an operator READS - and on a host nobody can walk up
+        to, the journal line is the whole diagnostic. A mutation battery found
+        the named escapes were unpinned: deleting them left the safety
+        assertions green while every newline came back as \\x0a.
+        """
+        self.assertEqual(r'"a\nb"', nw._fmt("a\nb"))
+        self.assertEqual(r'"a\rb"', nw._fmt("a\rb"))
+        self.assertEqual(r'"a\tb"', nw._fmt("a\tb"))
+        # Everything rarer stays on the generic escape rather than growing a
+        # special case per byte.
+        self.assertEqual(r'"a\x00b"', nw._fmt("a\x00b"))
+        self.assertEqual(r'"a\x1bb"', nw._fmt("a\x1bb"))
+
     def test_a_newline_in_a_record_VALUE_stays_on_one_line(self):
         """The property one level up from _fmt: the whole rendered record."""
         line = nw.format_record("none", "r", {}, 1.0, state(), CFG, "a\nb")
