@@ -255,7 +255,8 @@ MUTANTS = [
 
     ("i34", "print a PASS line on a run that had failures",
      INSTALLER,
-     'if [ ${#failures[@]} -gt 0 ]; then\n    report_and_exit\nfi',
+     'if [ ${#failures[@]} -gt 0 ] || [ "${code_stale:-0}" -eq 1 ]; then\n'
+     '    report_and_exit\nfi',
      ':'),
 
     ("i35", "use \\\\e escapes bash 3.2 cannot expand",
@@ -484,6 +485,38 @@ MUTANTS = [
      '        log_info "not a git checkout (or git unavailable) - cannot tell '
      'whether the code moved since $CODE_UNIT was last restarted"',
      '        :'),
+
+    # --- both failure conditions at once ------------------------------------
+    #
+    # The netwatch-config refusal and the code-moved advisory were written
+    # independently and can hold in the same run. x1 restores the arrangement
+    # that had, where the failure list exited on its own and the stale-deploy
+    # report below it was unreachable - a masking defect that reads as a
+    # perfectly ordinary early exit.
+    ("x1", "exit on the failure list, so a missing config MASKS a stale deploy",
+     INSTALLER,
+     '        log_error "A unit may be installed on disk without the running '
+     'service having picked it up. Re-run this script; the units left in that '
+     'state are remembered and will be restarted."\n        rc=1',
+     '        log_error "A unit may be installed on disk without the running '
+     'service having picked it up. Re-run this script; the units left in that '
+     'state are remembered and will be restarted."\n        exit 1'),
+
+    ("x2", "never report the stale deploy at all",
+     INSTALLER,
+     '    report_code_stale || rc=1',
+     '    :'),
+
+    ("x3", "report the stale deploy but exit 0 over it",
+     INSTALLER,
+     '    report_code_stale || rc=1',
+     '    report_code_stale || true'),
+
+    ("x4", "reach the report only when the failure list is empty",
+     INSTALLER,
+     'if [ ${#failures[@]} -gt 0 ] || [ "${code_stale:-0}" -eq 1 ]; then\n'
+     '    report_and_exit\nfi',
+     'if [ "${code_stale:-0}" -eq 1 ]; then\n    report_and_exit\nfi'),
 
     # --- option parsing (T-491) ---------------------------------------------
     ("o1", "accept an unknown option instead of refusing it",

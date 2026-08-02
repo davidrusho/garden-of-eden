@@ -372,7 +372,8 @@ class MutationHarnessRestoreTests(unittest.TestCase):
     # Harnesses that copy the repository and mutate the COPY. They cannot leave
     # anything behind and need no restore - which is the better design, and the
     # reason they are listed rather than exempted silently.
-    SANDBOXED = {"mutate_health_log.py", "mutate_upgrade_policy.py"}
+    SANDBOXED = {"mutate_health_log.py", "mutate_upgrade_policy.py",
+                 "mutate_netwatch.py"}
 
     # Harnesses that also DELETE a file rather than only editing one. The
     # restore path for a deletion is different code (move to a stash, copy

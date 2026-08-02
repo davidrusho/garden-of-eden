@@ -1362,6 +1362,100 @@ class CodeRevisionTests(unittest.TestCase):
         self.assertEqual(moved, self.box.recorded_revision())
 
 
+class BothFailureConditionsTests(unittest.TestCase):
+    """The two fail-closed checks in this script were written independently and
+    can hold in the SAME run - which is the case neither side's suite covers.
+
+    A missing /etc/gardyn/netwatch.env records a failure; a pull that moved only
+    Python sets the code-stale flag. Both are true on the shape of host that
+    provokes them: a first deploy that never created the config, followed by
+    ordinary Python-only pulls. Before these tests the failure list was reported
+    with an `exit 1` of its own and the stale-deploy block below it was
+    unreachable - so the operator fixed the config, re-ran, and only THEN
+    discovered the deploy had never taken effect. Two round trips for one run's
+    worth of information, and the failure list's closing advice ("re-run this
+    script") is actively wrong for the half it was hiding: a plain re-run
+    restarts nothing and cannot clear it.
+    """
+
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.base = self.box.git_init()
+
+    def _make_both_true(self):
+        """A healthy first run, then remove the config and move the code."""
+        proc = self.box.run()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        os.remove(self.box.netwatch_config)
+        moved = self.box.git_commit_python_only()
+        self.box.clear_log()
+        return moved
+
+    def test_ONE_run_reports_both_the_missing_config_and_the_stale_deploy(self):
+        moved = self._make_both_true()
+        proc = self.box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("netwatch.env", proc.stderr)
+        self.assertIn("has NOT taken effect", proc.stderr)
+        self.assertIn(moved, proc.stderr)
+        # Neither half turns the run into a reported success.
+        self.assertNotIn("units installed;", proc.stdout)
+
+    def test_the_remedy_for_the_stale_half_survives_the_other_half(self):
+        """The failure list ends with "re-run this script", which does not
+        restart anything. If that is the last word the operator gets, the run
+        has told them to do something that cannot work."""
+        self._make_both_true()
+        proc = self.box.run()
+        self.assertIn("--restart-on-code-change", proc.stderr)
+
+    def test_control_a_missing_config_ALONE_says_nothing_about_a_stale_deploy(self):
+        """Positive control for the pair above: without it, an installer that
+        printed the stale-deploy text unconditionally would satisfy them."""
+        self.box.run()
+        os.remove(self.box.netwatch_config)
+        proc = self.box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("netwatch.env", proc.stderr)
+        self.assertNotIn("has NOT taken effect", proc.stderr)
+
+    def test_control_a_stale_deploy_ALONE_says_nothing_about_the_config(self):
+        """The other direction of the same control."""
+        self.box.run()
+        self.box.git_commit_python_only()
+        proc = self.box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("has NOT taken effect", proc.stderr)
+        self.assertNotIn("netwatch.env", proc.stderr)
+
+    def test_fixing_only_the_config_still_leaves_the_run_red(self):
+        """The sequence an operator actually walks. Having been told both
+        things, fixing one must not produce a green run over the other - that
+        would be the masking defect with the roles swapped."""
+        self._make_both_true()
+        with open(self.box.netwatch_config, "w") as fh:
+            fh.write("GARDYN_NETWATCH_PING_TARGETS=192.0.2.1,192.0.2.9\n")
+        proc = self.box.run()
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("has NOT taken effect", proc.stderr)
+        self.assertNotIn("netwatch.env is missing", proc.stderr)
+
+    def test_the_flag_clears_both_once_the_config_is_back(self):
+        """The exit from the state, and the positive control for every
+        assertion above: they are all satisfied by a script that can never
+        report success at all."""
+        moved = self._make_both_true()
+        with open(self.box.netwatch_config, "w") as fh:
+            fh.write("GARDYN_NETWATCH_PING_TARGETS=192.0.2.1,192.0.2.9\n")
+        self.box.clear_log()
+        proc = self.box.run(args=["--restart-on-code-change"])
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual(moved, self.box.recorded_revision())
+        self.assertIn("enable gardyn-netwatch.timer",
+                      self.box.systemctl_calls())
+
+
 class ExistingDeploymentTests(unittest.TestCase):
     """The host that matters: a Pi where the units are already deployed and
     byte-identical, running an installer that has never recorded a revision.

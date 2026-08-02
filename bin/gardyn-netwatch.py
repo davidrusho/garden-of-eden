@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# Reviewed: 2026-08-02 against a4bb303 (T-490) — that review found four open
+# defects in this file, none of them fixed here: an all-digit port longer than
+# CPython's 4300-digit conversion cap escapes as an uncaught ValueError, _read()
+# decodes with the locale encoding rather than UTF-8, _fmt() lets a raw newline
+# or tab split the record onto another line, and load_state()'s "never raises"
+# is still not literally true. See the ticket before relying on any of them.
 # Reviewed: 2026-07-31 against bf5680f (T-473.4)
 """Network watchdog for the Gardyn Pi (T-473.4).
 

@@ -201,16 +201,49 @@ function record_revision {
 # pick up new code on their own.
 CODE_UNIT="mqtt.service"
 
+# The code-moved advisory, kept out of `failures` because that list's advice is
+# "re-run this script" and re-running plain will not fix this one: the units are
+# all correct and the SERVICE is behind the checkout.
+#
+# Reported LAST, and by the same function that reports the failure list, because
+# BOTH CONDITIONS CAN HOLD AT ONCE and each carries different advice. The
+# realistic case is one run: a host whose /etc/gardyn/netwatch.env is missing
+# (so the watchdog is refused and `failures` is non-empty) after a pull that
+# moved only Python (so nothing restarted and the service is stale). Printing
+# one INSTEAD of the other sends the operator round the loop twice - fix the
+# config, re-run, and only then discover the deploy never took effect - and the
+# failure list's closing advice is actively wrong for this half, since a plain
+# re-run cannot clear it. Last, rather than first, so the advice left on screen
+# is the one that covers both: `--restart-on-code-change` re-runs everything.
+#
+# Returns non-zero when it reported something, so the caller can fold it into
+# the exit status without re-testing the flag.
+function report_code_stale {
+    [ "${code_stale:-0}" -eq 1 ] || return 0
+    log_error "$CODE_UNIT is still running $recorded_rev; the checkout is at $current_rev."
+    log_error "No unit file changed, so nothing was restarted and this deploy has NOT taken effect."
+    # Deliberately NOT "or restart it yourself". A restart issued out of band is
+    # invisible here - the revision is recorded only by the run that performs
+    # the restart - so that advice would leave the deploy permanently red while
+    # the service was in fact current. Re-running with the flag restarts and
+    # records in one step; on an already-current service the extra bounce is
+    # seconds, which is cheaper than a check nobody can clear.
+    log_error "Re-run with --restart-on-code-change; a restart done by hand is not visible to this script and will not clear this."
+    return 1
+}
+
 function report_and_exit {
+    local rc=0
     if [ ${#failures[@]} -gt 0 ]; then
         log_error "${#failures[@]} problem(s):"
         for f in "${failures[@]}"; do
             log_error "  - $f"
         done
         log_error "A unit may be installed on disk without the running service having picked it up. Re-run this script; the units left in that state are remembered and will be restarted."
-        exit 1
+        rc=1
     fi
-    exit 0
+    report_code_stale || rc=1
+    exit $rc
 }
 
 # Portable, and deliberately not `readlink -f` / `realpath`: this script is
@@ -661,25 +694,12 @@ if in_list "$CODE_UNIT" "${units[@]}"; then
 fi
 
 # --- report ------------------------------------------------------------------
-if [ ${#failures[@]} -gt 0 ]; then
+#
+# One exit point for both kinds of bad news. Reporting success here is the whole
+# defect the two checks exist to remove, so neither may be reached only when the
+# other is absent - see report_and_exit.
+if [ ${#failures[@]} -gt 0 ] || [ "${code_stale:-0}" -eq 1 ]; then
     report_and_exit
-fi
-
-# Not a `failures` entry, because that list's advice is "re-run this script" and
-# re-running will not fix this one. The units are all correct; the SERVICE is
-# behind the checkout. Reporting success here is the whole defect - a deploy
-# that changed nothing printing a column of PASS lines.
-if [ "${code_stale:-0}" -eq 1 ]; then
-    log_error "$CODE_UNIT is still running $recorded_rev; the checkout is at $current_rev."
-    log_error "No unit file changed, so nothing was restarted and this deploy has NOT taken effect."
-    # Deliberately NOT "or restart it yourself". A restart issued out of band is
-    # invisible here - the revision is recorded only by the run that performs
-    # the restart - so that advice would leave the deploy permanently red while
-    # the service was in fact current. Re-running with the flag restarts and
-    # records in one step; on an already-current service the extra bounce is
-    # seconds, which is cheaper than a check nobody can clear.
-    log_error "Re-run with --restart-on-code-change; a restart done by hand is not visible to this script and will not clear this."
-    exit 1
 fi
 
 if [ ${#changed[@]} -eq 0 ]; then
