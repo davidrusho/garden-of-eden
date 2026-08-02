@@ -97,6 +97,60 @@ sudo systemctl status pigpiod
 sudo systemctl status mqtt.service
 ```
 
+### Deploying
+
+The Pi tracks a **`deploy` branch**, not `main`, and one command does the whole
+release:
+
+```
+./bin/deploy.sh --restart-on-code-change
+```
+
+It fast-forwards the checkout to the deploy branch, installs the units, and then
+**hash-verifies every deployed artifact against the resulting commit** — always,
+including when the install failed, because that is the run whose aftermath
+nobody can otherwise describe.
+
+Two other things it does that are worth knowing before you need them:
+
+```
+./bin/deploy.sh --check                  # read-only. Safe on the live host anytime.
+./bin/deploy.sh --rollback-to <sha>      # remote recovery, no console required
+```
+
+`--check` runs no `sudo`, writes nothing and restarts nothing, so it is the
+before-and-after instrument for any change — including one somebody else is
+making.
+
+The promotion policy — what moves `deploy` forward, who decides, how to roll
+back, and which artifact can take the host away permanently — is in
+[docs/DEPLOY.md](docs/DEPLOY.md). Read it before promoting anything that touches
+`gardyn-netwatch`.
+
+`bin/setup.sh` is **not** a deploy tool. It provisions a machine: apt, the venv,
+`/boot/config.txt`, `raspi-config`, group memberships. Running it to ship a
+Python change puts an apt transaction in front of a grow light.
+
+### Verifying what is actually deployed
+
+```
+./bin/verify-deployed-artifacts.sh [--rev <rev>] [--quiet]
+```
+
+`git status` on the Pi describes the checkout's own pointer and nothing else.
+The systemd units live under `/etc/systemd/system` as **copies**, so they can be
+edited in place, half-written by an interrupted run, masked with
+`systemctl mask`, or left behind by a rollback while git reports a clean tree.
+
+This compares both halves against a commit: the checkout by content diff, and
+each installed unit by SHA-256 against the blob at the same revision. It fails
+closed — exit `0` matched, `1` differs, and **`2` means the check could not be
+carried out**, which is not a milder version of `0`.
+
+It also reports, without ever writing, the revision the installer recorded when
+it last restarted `mqtt.service`. That is the one question files cannot answer:
+whether the running process is executing the code on disk.
+
 ### systemd units
 
 Every unit this project ships is a tracked file under
@@ -131,8 +185,8 @@ writes beside the units, so a host that has never run this version can lose
 nothing and a unit belonging to another package is never a candidate.
 
 **`--restart-on-code-change`** covers the deploy that changes no unit file at
-all. `git pull && ./bin/install-systemd-units.sh` is the usual redeploy, and a
-pull that touches only Python leaves every unit byte-identical — so nothing is
+all. `./bin/deploy.sh` is the usual redeploy and forwards this flag, and a pull
+that touches only Python leaves every unit byte-identical — so nothing is
 restarted and `mqtt.service` goes on running the previous revision. The script
 records the checkout's git revision beside the units at the moment it actually
 restarts that service, and a later run whose revision differs **exits non-zero
