@@ -28,6 +28,32 @@ candidate explanations. Those two things are:
     vs gone from /proc/net/wireless entirely. Those imply different fixes and
     look identical from the outside once the host is unreachable.
 
+The uplink half (T-478)
+-----------------------
+`wlan_link` and `wlan_level_dbm` describe how well this host HEARS the AP.
+They said almost nothing about the 2026-08-01 fault, which is asymmetric: the
+Pi hears the AP at a steady -66 dBm while the AP stops hearing the Pi, and the
+AP eventually gives up with DISASSOC_LOW_ACK (reason=34). A downlink-only
+instrument reads that as a healthy radio right up to the disconnect.
+
+`wlan_tx_bitrate_mbps` and `wlan_tx_failed` are the uplink counterparts, and
+they come from `iw dev wlan0 station dump` — one call, both fields:
+
+    tx bitrate  -> the rate the driver has settled on for THIS link. Falling
+                   toward the 1-5.5 MBit/s 802.11b floor is rate-control
+                   backing off after repeated unacknowledged frames, which is
+                   the leading indicator of the disassociation.
+    tx failed   -> frames the driver gave up on after exhausting retries.
+                   COUNTER, not a rate: monotonic since association, and it
+                   RESETS TO ZERO on reassociation. Read it by diffing
+                   consecutive samples; a value lower than the previous
+                   sample's means the link re-associated in between, which is
+                   itself the event worth seeing.
+
+Both are absent from /proc/net/wireless, whose only tx-side column is the
+`retry` discard counter — related but not the same quantity, and not exposed
+per-station.
+
 Watching the watchdog (T-479)
 ----------------------------
 This sampler also carries the external heartbeat for `gardyn-netwatch.timer`,
@@ -100,6 +126,23 @@ THROTTLED_BITS = {
 }
 
 UNKNOWN = "unknown"
+
+# The interface every wireless reading here is about. /proc/net/wireless is
+# parsed with the same default; keeping one constant stops the two halves of
+# the wireless picture from silently describing different radios.
+WLAN_IFACE = "wlan0"
+
+# `iw` ships in /sbin (Debian symlinks /sbin -> /usr/sbin), and that is a trap
+# worth spending three lines on. systemd hands units
+# PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin, so a
+# bare "iw" resolves under the timer. An unprivileged INTERACTIVE shell on
+# this host gets PATH=/usr/local/bin:/usr/bin:/bin:/usr/games — no sbin — so
+# `shutil.which("iw")` returns None and the sampler would report
+# `not_installed` for a package that is installed and working. Anyone
+# hand-running this script to check the new fields would conclude the host
+# lacks iw. Verified both ways on the Pi 2026-08-01. Resolving explicit
+# fallbacks costs nothing and removes the trap instead of documenting it.
+IW_CANDIDATES = ("iw", "/usr/sbin/iw", "/sbin/iw")
 
 # --- Watching the netwatch watchdog (T-479) ---------------------------------
 
@@ -391,7 +434,7 @@ def parse_soc_temp(raw: str | None) -> float | None:
         return None
 
 
-def parse_proc_net_wireless(raw: str | None, iface: str = "wlan0") -> dict:
+def parse_proc_net_wireless(raw: str | None, iface: str = WLAN_IFACE) -> dict:
     """Pull one interface's row out of /proc/net/wireless.
 
     The three outcomes are deliberately distinct, because they imply different
@@ -432,6 +475,88 @@ def parse_proc_net_wireless(raw: str | None, iface: str = "wlan0") -> dict:
             return {"present": True, "link": link, "level_dbm": None}
         return {"present": True, "link": link, "level_dbm": num(fields[2])}
     return {"present": False}
+
+
+def _leading_number(value: str, cast):
+    """First whitespace-separated token of `value`, cast, or None.
+
+    `tx bitrate` is "5.5 MBit/s" on this radio and "65.0 MBit/s MCS 7 short GI"
+    on anything newer, so the unit and any modulation detail have to be dropped
+    rather than matched.
+    """
+    parts = value.split()
+    if not parts:
+        return None
+    try:
+        return cast(parts[0])
+    except ValueError:
+        return None
+
+
+def resolve_iw(candidates=IW_CANDIDATES) -> str | None:
+    """First resolvable `iw` from IW_CANDIDATES, or None if genuinely absent.
+
+    shutil.which() accepts an absolute path and checks it is executable, so the
+    same call covers both the PATH lookup and the explicit fallbacks.
+    """
+    for candidate in candidates:
+        if shutil.which(candidate):
+            return candidate
+    return None
+
+
+def parse_iw_station_dump(raw: str | None) -> dict:
+    """Pull the uplink counters out of `iw dev <iface> station dump`.
+
+    Live shape on this host (tabs between key and value):
+
+        Station 04:bc:9f:63:37:76 (on wlan0)
+                tx packets:     10178
+                tx failed:      947
+                tx bitrate:     5.5 MBit/s
+
+    THE FAILURE SHAPES ARE NOT WHAT A HAND-WRITTEN FAKE WOULD GUESS, so they
+    were observed against the real binary on the Pi (2026-08-01) rather than
+    invented. `iw` is messy in three separate directions:
+
+      * missing interface   -> rc=237, EMPTY stdout, "command failed: No such
+                               device (-19)" on stderr. _run() drops it on the
+                               returncode, so this arrives here as raw=None.
+      * bad subcommand      -> rc=1 and ~18 KB of USAGE TEXT on **stdout**,
+                               nothing on stderr. Again caught by _run()'s
+                               returncode check, which is the only reason the
+                               usage dump never reaches this parser — but this
+                               function must still not manufacture a value
+                               from it, so there is a test that feeds it in.
+      * not associated      -> rc=0 with NO stations printed at all, i.e. exit
+                               SUCCESS with an empty body. (`iw ... link` has
+                               the same shape, printing a bare "Not connected."
+                               at rc=0.) This is the dangerous one: a caller
+                               that only checks the exit code sees success and
+                               a parser that defaults to 0 would log a
+                               perfectly healthy-looking `tx_failed=0` for a
+                               radio that is not on the network.
+
+    So: absent fields are None and never 0, and an empty or station-less body
+    is reported as an explicit error rather than as a set of zeroes.
+    """
+    if raw is None:
+        return {"error": "no_output"}
+    fields: dict = {}
+    for line in raw.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        # The "Station <mac>" header partitions on the MAC's first colon, so it
+        # lands here as key="Station 04" and matches neither branch below.
+        key = key.strip().lower()
+        if key == "tx failed":
+            fields["tx_failed"] = _leading_number(value.strip(), int)
+        elif key == "tx bitrate":
+            fields["tx_bitrate_mbps"] = _leading_number(value.strip(), float)
+    if not fields:
+        return {"error": "no_station"}
+    return fields
 
 
 def parse_uptime(raw: str | None) -> float | None:
@@ -489,13 +614,24 @@ def format_record(throttled: dict, temp_c: float | None, wireless: dict,
                   mem_avail_mb: float | None = None,
                   nm_error: str | None = None,
                   netwatch: dict | None = None,
-                  push_outcome: str | None = None) -> str:
+                  push_outcome: str | None = None,
+                  station: dict | None = None) -> str:
     """Render one logfmt line. Key order is stable so the output greps well."""
     parts = [
         ("nm_state", nm_state),
         ("wlan_present", wireless.get("present", False)),
         ("wlan_link", wireless.get("link")),
         ("wlan_level_dbm", wireless.get("level_dbm")),
+    ]
+    # Kept adjacent to the downlink readings on purpose: the diagnosis this
+    # exists for is the DISAGREEMENT between the two halves - a strong
+    # level_dbm sitting next to a collapsing tx_bitrate is the signature.
+    if station is not None:
+        parts += [
+            ("wlan_tx_bitrate_mbps", station.get("tx_bitrate_mbps")),
+            ("wlan_tx_failed", station.get("tx_failed")),
+        ]
+    parts += [
         ("soc_temp_c", None if temp_c is None else round(temp_c, 1)),
         ("throttled", throttled.get("raw", UNKNOWN)),
         ("uptime_s", None if uptime_s is None else int(uptime_s)),
@@ -522,6 +658,8 @@ def format_record(throttled: dict, temp_c: float | None, wireless: dict,
             parts.append((f"throttled_{key}", throttled[key]))
         if wireless.get(key):
             parts.append((f"wlan_{key}", wireless[key]))
+        if station and station.get(key):
+            parts.append((f"wlan_station_{key}", station[key]))
     return " ".join(f"{k}={_fmt(v)}" for k, v in parts)
 
 
@@ -570,6 +708,21 @@ def main() -> int:
 
     nm_out, nm_err = _run(["nmcli", "-t", "-f", "STATE", "general"])
 
+    # T-478: the uplink half. One `iw` call yields both tx counters; keeping it
+    # to one subprocess matters on a single-core ARMv6 host where the unit's
+    # 60s TimeoutStartSec already has only ~25s of margin. No unit-file change
+    # is needed for this, so deploying it is a file copy with no daemon-reload.
+    iw_bin = resolve_iw()
+    if iw_bin is None:
+        station = {"error": "not_installed"}
+    else:
+        st_out, st_err = _run([iw_bin, "dev", WLAN_IFACE, "station", "dump"])
+        station = parse_iw_station_dump(st_out)
+        if st_out is None and st_err:
+            # Same discipline as the vcgencmd reading above: keep WHY the
+            # counters are missing, not merely that they are.
+            station["error"] = st_err
+
     uptime_s = parse_uptime(_read("/proc/uptime"))
 
     # T-479: watch the watchdog. `systemctl show` exits 0 for a unit that does
@@ -601,8 +754,9 @@ def main() -> int:
     record = format_record(
         throttled=throttled,
         temp_c=parse_soc_temp(_read("/sys/class/thermal/thermal_zone0/temp")),
-        wireless=parse_proc_net_wireless(_read("/proc/net/wireless")),
+        wireless=parse_proc_net_wireless(_read("/proc/net/wireless"), WLAN_IFACE),
         nm_state=parse_nmcli_state(nm_out),
+        station=station,
         uptime_s=uptime_s,
         mem_avail_mb=parse_mem_available_mb(_read("/proc/meminfo")),
         nm_error=nm_err,

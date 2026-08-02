@@ -935,3 +935,290 @@ class TestMainNetwatchWiring(unittest.TestCase):
         rc, rec, _, _ = self._drive()
         self.assertIn("uptime_s", rec)
         self.assertIn("throttled", rec)
+
+
+# ---------------------------------------------------------------------------
+# T-478: the uplink counters. `wlan_link` / `wlan_level_dbm` describe how well
+# this host HEARS the AP and read as healthy throughout an asymmetric failure
+# where the AP stops hearing the Pi. tx bitrate and tx failed are the other
+# half of that picture.
+#
+# EVERY fixture below was captured from the real `iw` on the Pi on 2026-08-01,
+# including the failure ones. That matters more than usual here: `iw` exits 0
+# with an empty body when unassociated, and exits 1 with 18 KB of usage text on
+# STDOUT when given a bad subcommand. A fake whose error branch is a bare
+# non-zero exit with no output would let both of those bugs through green.
+# ---------------------------------------------------------------------------
+
+
+class TestParseIwStationDump(unittest.TestCase):
+    # Captured verbatim: `iw dev wlan0 station dump` on gardyn, 2026-08-01.
+    LIVE = (
+        "Station 04:bc:9f:63:37:76 (on wlan0)\n"
+        "\tinactive time:\t0 ms\n"
+        "\trx bytes:\t9218850\n"
+        "\trx packets:\t61996\n"
+        "\ttx bytes:\t9132719\n"
+        "\ttx packets:\t10178\n"
+        "\ttx failed:\t947\n"
+        "\tsignal:  \t-59 dBm\n"
+        "\ttx bitrate:\t5.5 MBit/s\n"
+        "\trx bitrate:\t2.0 MBit/s\n"
+        "\tauthorized:\tyes\n"
+        "\tassociated:\tyes\n"
+        "\tbeacon interval:100\n"
+        "\tconnected time:\t10133 seconds\n"
+        "\tcurrent time:\t1785640017147 ms\n"
+    )
+
+    def test_live_sample(self):
+        got = hl.parse_iw_station_dump(self.LIVE)
+        self.assertEqual(got["tx_failed"], 947)
+        self.assertAlmostEqual(got["tx_bitrate_mbps"], 5.5)
+        self.assertNotIn("error", got)
+
+    def test_station_header_mac_does_not_confuse_the_partition(self):
+        # "Station 04:bc:..." partitions on the MAC's first colon. If that were
+        # mishandled the header could shadow a real key.
+        got = hl.parse_iw_station_dump(self.LIVE)
+        self.assertEqual(set(got), {"tx_failed", "tx_bitrate_mbps"})
+
+    def test_rx_bitrate_is_not_read_as_tx(self):
+        # rx bitrate (2.0) sits one line BELOW tx bitrate (5.5) in the real
+        # output, so a parser matching on a substring rather than the whole key
+        # would silently return the downlink rate - which is precisely the
+        # number this field exists to be different from.
+        self.assertAlmostEqual(
+            hl.parse_iw_station_dump(self.LIVE)["tx_bitrate_mbps"], 5.5)
+
+    def test_modulation_suffix_is_dropped(self):
+        # This radio is 802.11b-only so it never emits MCS detail, but any
+        # newer AP/adapter pairing does: "65.0 MBit/s MCS 7 short GI".
+        got = hl.parse_iw_station_dump(
+            "\ttx bitrate:\t65.0 MBit/s MCS 7 short GI\n\ttx failed:\t3\n")
+        self.assertAlmostEqual(got["tx_bitrate_mbps"], 65.0)
+        self.assertEqual(got["tx_failed"], 3)
+
+    def test_unassociated_is_an_error_not_a_row_of_zeroes(self):
+        # THE dangerous case. `iw ... station dump` exits 0 and prints nothing
+        # when the radio is not associated. Defaulting the counters to 0 would
+        # log a flawless-looking uplink for a host that is off the network -
+        # the exact false all-clear this sampler exists to prevent.
+        got = hl.parse_iw_station_dump("")
+        self.assertEqual(got["error"], "no_station")
+        self.assertNotIn("tx_failed", got)
+        self.assertNotIn("tx_bitrate_mbps", got)
+
+    def test_not_connected_body_at_exit_zero(self):
+        # The sibling shape, from `iw dev lo link`: rc=0 with a bare sentence.
+        got = hl.parse_iw_station_dump("Not connected.\n")
+        self.assertEqual(got["error"], "no_station")
+
+    def test_usage_text_never_manufactures_a_value(self):
+        # rc=1 puts ~18 KB of usage on STDOUT, not stderr. _run() drops it on
+        # the returncode so it should never arrive here - but "should never"
+        # is what this suite exists to stop relying on.
+        usage = ("Usage:\t/usr/sbin/iw [options] command\n"
+                 "Options:\n"
+                 "\t--debug\t\tenable netlink debugging\n"
+                 "Commands:\n"
+                 "\tdev <devname> station dump\n"
+                 "\tdev <devname> link\n")
+        got = hl.parse_iw_station_dump(usage)
+        self.assertEqual(got["error"], "no_station")
+
+    def test_command_failed_arrives_as_none(self):
+        # A missing interface is rc=237 with empty stdout, so _run() hands us
+        # None rather than the stderr text.
+        self.assertEqual(hl.parse_iw_station_dump(None)["error"], "no_output")
+
+    def test_malformed_values_are_none_not_zero(self):
+        got = hl.parse_iw_station_dump(
+            "\ttx failed:\tbanana\n\ttx bitrate:\tnonsense MBit/s\n")
+        self.assertIsNone(got["tx_failed"])
+        self.assertIsNone(got["tx_bitrate_mbps"])
+        self.assertNotIn("error", got)
+
+    def test_empty_values_do_not_raise(self):
+        got = hl.parse_iw_station_dump("\ttx failed:\n\ttx bitrate:\n")
+        self.assertIsNone(got["tx_failed"])
+        self.assertIsNone(got["tx_bitrate_mbps"])
+
+    def test_partial_output_keeps_what_it_has(self):
+        got = hl.parse_iw_station_dump("Station aa:bb (on wlan0)\n\ttx failed:\t12\n")
+        self.assertEqual(got["tx_failed"], 12)
+        self.assertIsNone(got.get("tx_bitrate_mbps"))
+        self.assertNotIn("error", got)
+
+    def test_zero_failures_is_a_real_reading_not_an_absence(self):
+        # The inverse of the unassociated case: a genuine 0 must survive as 0.
+        got = hl.parse_iw_station_dump("\ttx failed:\t0\n\ttx bitrate:\t1.0 MBit/s\n")
+        self.assertEqual(got["tx_failed"], 0)
+        self.assertNotIn("error", got)
+
+    def test_never_raises_on_junk(self):
+        for junk in (":", "\x00", "tx failed", "::::", "\t\t\n", "tx failed:\t\t\t"):
+            self.assertIsInstance(hl.parse_iw_station_dump(junk), dict)
+
+
+class TestResolveIw(unittest.TestCase):
+    """`iw` is in /sbin, which an unprivileged interactive PATH omits.
+
+    systemd gives units a PATH containing sbin, so the timer works; a human
+    running the script by hand does not, and would see `not_installed` for an
+    installed package. Both PATHs were verified on the Pi 2026-08-01.
+    """
+
+    def test_prefers_a_bare_name_when_path_resolves_it(self):
+        with mock.patch.object(hl.shutil, "which",
+                               side_effect=lambda c: "/usr/sbin/iw" if c == "iw" else None):
+            self.assertEqual(hl.resolve_iw(), "iw")
+
+    def test_falls_back_to_an_absolute_path_when_path_lacks_sbin(self):
+        with mock.patch.object(hl.shutil, "which",
+                               side_effect=lambda c: c if c.startswith("/") else None):
+            self.assertEqual(hl.resolve_iw(), "/usr/sbin/iw")
+
+    def test_second_fallback_used_when_only_sbin_exists(self):
+        with mock.patch.object(hl.shutil, "which",
+                               side_effect=lambda c: c if c == "/sbin/iw" else None):
+            self.assertEqual(hl.resolve_iw(), "/sbin/iw")
+
+    def test_genuinely_absent_returns_none(self):
+        with mock.patch.object(hl.shutil, "which", return_value=None):
+            self.assertIsNone(hl.resolve_iw())
+
+    def test_candidate_list_covers_both_real_locations(self):
+        # Debian symlinks /sbin -> /usr/sbin, but which one `iw` reports
+        # depends on the layout, so both are listed deliberately.
+        self.assertIn("/usr/sbin/iw", hl.IW_CANDIDATES)
+        self.assertIn("/sbin/iw", hl.IW_CANDIDATES)
+
+
+class TestStationFieldsReachTheLine(unittest.TestCase):
+    def test_values_are_rendered(self):
+        line = hl.format_record(
+            {"raw": "0x0"}, 41.9, {"present": True}, "connected",
+            station={"tx_bitrate_mbps": 5.5, "tx_failed": 947})
+        self.assertIn("wlan_tx_bitrate_mbps=5.5", line)
+        self.assertIn("wlan_tx_failed=947", line)
+
+    def test_missing_counters_render_as_dash_not_zero(self):
+        line = hl.format_record(
+            {"raw": "0x0"}, 41.9, {"present": True}, "connected",
+            station={"error": "no_station"})
+        self.assertIn("wlan_tx_bitrate_mbps=-", line)
+        self.assertIn("wlan_tx_failed=-", line)
+        self.assertIn("wlan_station_error=no_station", line)
+        self.assertNotIn("wlan_tx_failed=0", line)
+
+    def test_uplink_sits_next_to_the_downlink_readings(self):
+        # The diagnosis is the DISAGREEMENT between level and bitrate, so the
+        # two must be adjacent in the line for a human scanning the journal.
+        line = hl.format_record(
+            {"raw": "0x0"}, 41.9,
+            hl.parse_proc_net_wireless(TestParseProcNetWireless.LIVE), "connected",
+            station={"tx_bitrate_mbps": 5.5, "tx_failed": 947})
+        keys = [tok.partition("=")[0] for tok in shlex.split(line)]
+        self.assertEqual(
+            keys[keys.index("wlan_level_dbm"):keys.index("wlan_level_dbm") + 3],
+            ["wlan_level_dbm", "wlan_tx_bitrate_mbps", "wlan_tx_failed"])
+
+    def test_absent_station_arg_leaves_the_old_shape_untouched(self):
+        line = hl.format_record({"raw": "0x0"}, 41.9, {"present": True}, "connected")
+        self.assertNotIn("wlan_tx_", line)
+
+    def test_no_stray_none_or_newline(self):
+        line = hl.format_record(
+            {"raw": "0x0"}, None, {"present": True}, "connected",
+            station={"tx_bitrate_mbps": None, "tx_failed": None})
+        self.assertNotIn("None", line)
+        self.assertNotIn("\n", line)
+
+
+class TestStationEndToEnd(unittest.TestCase):
+    """main()'s wiring for the new fields - the seam that actually ships."""
+
+    def _drive(self, iw_result=None, iw_bin="/usr/sbin/iw"):
+        buf = io.StringIO()
+        calls = []
+
+        def fake_run(cmd, timeout=5.0):
+            calls.append(cmd)
+            if cmd[0] == "vcgencmd":
+                return ("throttled=0x0\n", None)
+            if cmd[0] == "nmcli":
+                return ("connected\n", None)
+            if cmd[0] == "systemctl":
+                # LastTriggerUSecMonotonic renders as a systemd TIMESPAN, not a
+                # raw integer: "3h 25min 45s" = 12345s against the 12345.67s
+                # uptime in HEALTHY_READS, i.e. a tick 0.67s ago. Feeding a
+                # bare number here makes the verdict age_unknown, which pushes
+                # nothing and would have made the assertions below vacuous.
+                return ("UnitFileState=enabled\nActiveState=active\n"
+                        "LastTriggerUSecMonotonic=3h 25min 45s\n"
+                        "ActiveEnterTimestampMonotonic=1000000\nResult=success\n", None)
+            if cmd[0].endswith("iw"):
+                return iw_result if iw_result is not None else (
+                    TestParseIwStationDump.LIVE, None)
+            return (None, "not_installed")
+
+        with mock.patch.object(hl, "resolve_iw", return_value=iw_bin), \
+             mock.patch.object(hl, "_run", side_effect=fake_run), \
+             mock.patch.object(hl, "_read", side_effect=TestMainEndToEnd.HEALTHY_READS), \
+             mock.patch.object(hl, "push_kuma", return_value="ok"), \
+             contextlib.redirect_stdout(buf):
+            rc = hl.main()
+        out = buf.getvalue()
+        rec = dict(t.partition("=")[::2] for t in shlex.split(out.strip()))
+        return rc, rec, calls, out
+
+    def test_healthy_sample_carries_both_counters(self):
+        rc, rec, calls, out = self._drive()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertEqual(rec["wlan_tx_failed"], "947")
+        self.assertEqual(rec["wlan_tx_bitrate_mbps"], "5.5")
+
+    def test_the_right_command_is_issued_against_the_right_interface(self):
+        # A typo in the subcommand is rc=1 + usage text, which _run() turns
+        # into a permanent "no counters" that looks like a quiet radio.
+        rc, rec, calls, out = self._drive()
+        iw_calls = [c for c in calls if c[0].endswith("iw")]
+        self.assertEqual(iw_calls, [["/usr/sbin/iw", "dev", "wlan0", "station", "dump"]])
+
+    def test_only_one_iw_subprocess_per_sample(self):
+        # Both counters come from one call by design; a second would eat into
+        # the unit's remaining TimeoutStartSec margin on a single-core host.
+        rc, rec, calls, out = self._drive()
+        self.assertEqual(len([c for c in calls if c[0].endswith("iw")]), 1)
+
+    def test_iw_absent_says_so_and_still_emits_the_sample(self):
+        rc, rec, calls, out = self._drive(iw_bin=None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertEqual(rec["wlan_station_error"], "not_installed")
+        self.assertEqual(rec["wlan_tx_failed"], "-")
+        self.assertEqual([c for c in calls if c[0].endswith("iw")], [])
+
+    def test_command_failure_reason_is_kept_not_collapsed(self):
+        rc, rec, calls, out = self._drive(iw_result=(None, "exit_237_command_failed"))
+        self.assertEqual(rec["wlan_station_error"], "exit_237_command_failed")
+        self.assertEqual(rec["wlan_tx_failed"], "-")
+
+    def test_unassociated_radio_does_not_log_zero_failures(self):
+        # rc=0, empty body. The whole point: this must not read as a clean link.
+        rc, rec, calls, out = self._drive(iw_result=("", None))
+        self.assertEqual(rec["wlan_station_error"], "no_station")
+        self.assertEqual(rec["wlan_tx_failed"], "-")
+        self.assertNotEqual(rec["wlan_tx_failed"], "0")
+
+    def test_iw_failure_never_costs_the_rest_of_the_sample(self):
+        # The counters are the newest and least important reading here. Losing
+        # them must not lose the throttle flags or the netwatch heartbeat.
+        rc, rec, calls, out = self._drive(iw_result=(None, "timeout"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(rec["throttled"], "0x0")
+        self.assertEqual(rec["nm_state"], "connected")
+        self.assertIn("netwatch_ok", rec)
+        self.assertEqual(rec["kuma_push"], "ok")

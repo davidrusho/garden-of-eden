@@ -130,7 +130,53 @@ MUTATIONS = [
     ("blank UnitFileState dropped by the property parser", SRC,
      "        if sep:\n            out[key.strip()] = value.strip()",
      "        if sep and value.strip():\n            out[key.strip()] = value.strip()"),
+
+    # --- T-478: the uplink counters. The failure mode that matters for all of
+    # these is the same one, and it is a FALSE ALL-CLEAR: a link that is not
+    # passing traffic logging a tidy tx_failed=0 instead of saying it could not
+    # measure. Every mutation below produces exactly that.
+    ("unassociated radio logs zeroes instead of saying no_station", SRC,
+     '    if not fields:\n        return {"error": "no_station"}',
+     '    if not fields:\n        return {"tx_failed": 0, "tx_bitrate_mbps": 0.0}'),
+    ("malformed counter defaults to 0 rather than None", SRC,
+     "    try:\n        return cast(parts[0])\n    except ValueError:\n        return None",
+     "    try:\n        return cast(parts[0])\n    except ValueError:\n        return 0"),
+    ("bitrate key matched loosely, so rx bitrate overwrites tx", SRC,
+     '        elif key == "tx bitrate":', '        elif "bitrate" in key:'),
+    ("tx_failed parsed as float, changing the logged token", SRC,
+     '            fields["tx_failed"] = _leading_number(value.strip(), int)',
+     '            fields["tx_failed"] = _leading_number(value.strip(), float)'),
+    ("uplink counters dropped from the log line", SRC,
+     "    if station is not None:", "    if False:"),
+    ("station error never surfaced, so a blind sampler looks healthy", SRC,
+     "        if station and station.get(key):", "        if False:"),
+    ("sbin fallbacks removed, reinstating the interactive-PATH trap", SRC,
+     'IW_CANDIDATES = ("iw", "/usr/sbin/iw", "/sbin/iw")', 'IW_CANDIDATES = ("iw",)'),
+    ("resolve_iw returns a candidate it never checked exists", SRC,
+     "        if shutil.which(candidate):\n            return candidate",
+     "        return candidate"),
+    ("wrong iw subcommand: link instead of station dump", SRC,
+     '_run([iw_bin, "dev", WLAN_IFACE, "station", "dump"])',
+     '_run([iw_bin, "dev", WLAN_IFACE, "link"])'),
+    ("wrong interface sampled", SRC,
+     'WLAN_IFACE = "wlan0"', 'WLAN_IFACE = "wlan1"'),
+    ("iw failure reason discarded, leaving a bare absence", SRC,
+     "        if st_out is None and st_err:", "        if False:"),
+    ("missing iw reported as nothing at all", SRC,
+     '        station = {"error": "not_installed"}', "        station = {}"),
 ]
+
+# CONTROL B. Control A above (a GREEN clean tree) proves the scorer can report
+# a pass. It cannot catch the opposite break, and the opposite break is the
+# dangerous one: a battery scores a mutant by whether the test run FAILED, so
+# a scorer wedged into always-failing reports EVERY mutation killed — the most
+# reassuring output this tool can emit, and pure fiction. This injects an
+# assertion that cannot hold and requires the harness to notice.
+CONTROL_B = (
+    "\n\nclass _ControlBMustFail(unittest.TestCase):\n"
+    "    def test_deliberately_broken(self):\n"
+    "        self.assertEqual(1, 2)\n"
+)
 
 
 def run_suite(root: Path) -> tuple[int, str]:
@@ -157,12 +203,32 @@ def main() -> int:
         root = Path(tmp) / "repo"
         shutil.copytree(REPO, root, ignore=shutil.ignore_patterns(".git", "__pycache__"))
 
+        # CONTROL A: the clean tree must score GREEN.
         rc, err = run_suite(root)
         if rc != 0:
-            print("BASELINE IS RED - the battery cannot mean anything. Output:\n" + err)
+            print("CONTROL A FAILED (baseline is RED) - no result below means "
+                  "anything. Output:\n" + err)
             return 2
         count = re.search(r"Ran (\d+) tests", err)
-        print("baseline: GREEN (%s tests)\n" % (count.group(1) if count else "?"))
+        print("control A: clean tree GREEN (%s tests)" % (count.group(1) if count else "?"))
+
+        # CONTROL B: a deliberately broken assertion must score RED. Both are
+        # required. A is scored by the same code path as every mutant, so on
+        # its own it cannot distinguish a working scorer from one that always
+        # reports failure - and always-failure reads as a perfect kill sheet.
+        tests_file = root / TESTS
+        pristine_tests = tests_file.read_text()
+        tests_file.write_text(pristine_tests + CONTROL_B)
+        rc_b, err_b = run_suite(root)
+        tests_file.write_text(pristine_tests)
+        if rc_b == 0:
+            print("CONTROL B FAILED - an assertion that cannot hold scored GREEN, "
+                  "so the harness cannot detect ANY mutation. Output:\n" + err_b)
+            return 2
+        if tests_file.read_text() != pristine_tests:
+            print("CONTROL B FAILED - the test file was not restored.")
+            return 2
+        print("control B: broken assertion RED (the scorer can fail)\n")
 
         survived = []
         for name, relpath, old, new in MUTATIONS:
@@ -173,8 +239,19 @@ def main() -> int:
                 survived.append(name + " (anchor not unique)")
                 continue
             target.write_text(original.replace(old, new))
+            # Prove the edit landed on disk. A replacement that silently
+            # produced identical text would be scored as a SURVIVOR and read
+            # as a weak test, sending the next reader to fix the wrong thing.
+            if target.read_text() == original:
+                print(f"  SKIP  {name}: mutation produced identical text")
+                survived.append(name + " (mutation was a no-op)")
+                target.write_text(original)
+                continue
             rc, err = run_suite(root)
             target.write_text(original)
+            if target.read_text() != original:
+                print(f"  ABORT {name}: tree not restored")
+                return 2
 
             failures = re.search(r"FAILED \((.*)\)", err)
             if rc == 0:
