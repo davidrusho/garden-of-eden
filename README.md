@@ -148,12 +148,47 @@ with no git metadata skips the check and reports that it skipped.
 
 > **The shipped units are written for one specific deployment.** They hardcode
 > `User=gardyn` and `/home/gardyn/garden-of-eden`, and `gardyn-netwatch` is a
-> watchdog that reconnects Wi-Fi and can **reboot the host**, aimed at fixed
-> LAN addresses in `bin/gardyn-netwatch.py`. The installer will not enable a
-> unit whose `ExecStart` path does not exist on the machine, so a checkout
-> somewhere else gets the files but nothing armed. That guard is not enough if
-> your paths happen to match: edit `TARGETS`, `TCP_PROBE_HOST` and `WLAN_UUID`,
-> or delete the two `gardyn-netwatch` units, before running setup.
+> watchdog that reconnects Wi-Fi and can **reboot the host**. The installer
+> will not enable a unit whose `ExecStart` path does not exist on the machine,
+> so a checkout somewhere else gets the files but nothing armed. If your paths
+> happen to match, delete the two `gardyn-netwatch` units before running setup.
+
+### Configuring the network watchdog
+
+`bin/gardyn-netwatch.py` needs `/etc/gardyn/netwatch.env`, and **there is no
+default**. The ping targets, the MQTT probe host and the wlan0 profile UUID
+used to be constants in the script — one LAN's topology, published from a
+public repository, attached to something that reboots the machine it runs on.
+
+```
+sudo install -d -m 0755 /etc/gardyn
+sudo install -m 0644 services/etc/gardyn/netwatch.env.example /etc/gardyn/netwatch.env
+sudoedit /etc/gardyn/netwatch.env        # replace every CHANGEME
+```
+
+Find the wlan0 profile's UUID with `nmcli -g UUID,NAME,DEVICE connection show`.
+
+Every incomplete state — the file absent, a key missing or blank, a `CHANGEME`
+left in place, a port that is not a number, a connection name where a UUID
+belongs — makes the watchdog refuse to run and exit non-zero, so `systemctl
+status gardyn-netwatch` shows a failed unit and the reason lands on the
+journal:
+
+```
+journalctl -t gardyn-netwatch --since -1h
+# action=stand_down reason=config_missing_key config_path=/etc/gardyn/netwatch.env ...
+```
+
+It will never fall back to a target this repository chose, which is the point:
+a watchdog quietly deciding a stranger's network is down and rebooting their
+machine is worse than one that does not start.
+
+> **Upgrading an existing install: create the file BEFORE deploying the new
+> script.** The unit is armed by a timer every two minutes, so a Pi that pulls
+> this change without `/etc/gardyn/netwatch.env` in place gets a failed
+> `gardyn-netwatch` run on every tick — noisy, and with no network watchdog
+> running until the file exists. Nothing else is affected: the grow-light
+> controller (`mqtt.service`) does not read this file.
 
 ## Usage
 

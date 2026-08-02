@@ -53,7 +53,7 @@ things worse:
 
 Two probe modalities, and the difference between "no" and "don't know"
 ----------------------------------------------------------------------
-ICMP to two hosts plus a TCP connect to the broker. Two reasons for the mix:
+ICMP to the configured hosts plus a TCP connect to the broker. Two reasons:
 a single target makes any one host's reboot look like this Pi's radio dying,
 and ICMP alone cannot distinguish a dead path from a filtered or rate-limited
 one — so an ICMP-only watchdog bounces a perfectly good link whenever somebody
@@ -76,6 +76,23 @@ only ever caught the case where the stored value was LARGER.
 Design note: `decide()` is a pure function of (uptime, reachability, prior
 state, boot id). Every branch — including the reboot path, which cannot be
 exercised on a live host without rebooting it — is reachable from a test.
+
+Configuration, and why there is no default
+------------------------------------------
+The ping targets, the TCP probe host and the wlan0 profile UUID are one
+particular LAN's topology, and this is a PUBLIC repository. They used to be
+module constants, which meant a clone anywhere else inherited both somebody
+else's addressing AND a reboot policy aimed at it — a watchdog that decides a
+stranger's network is down and power-cycles the machine it is running on.
+
+They now come from `/etc/gardyn/netwatch.env` (`services/etc/gardyn/
+netwatch.env.example` is the template) and there is NO working fallback. Every
+way of not having a complete, non-placeholder configuration — file absent,
+unreadable, empty, a key missing, a value still holding the template's
+CHANGEME — refuses to run and exits non-zero, so systemd marks the unit
+failed. A silent fall back to a built-in target is precisely the failure this
+exists to prevent, so "found no config" and "found a usable config" must never
+produce the same behaviour.
 """
 from __future__ import annotations
 
@@ -83,27 +100,34 @@ import errno
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
+from typing import NamedTuple
 
-# Pinged in order; the network is UP if ANY probe answers. Requiring one
-# specific host to agree would make a broker reboot look identical to this
-# Pi's radio failing. The question is "can this Pi reach the LAN at all", not
-# "is one particular box up".
-TARGETS = ("192.168.1.1", "192.168.1.204")
+# Overridable only so the test suite can point at a fixture; the deployed unit
+# passes nothing and gets the real path. Same seam as GARDYN_UNIT_SRC_DIR in
+# bin/install-systemd-units.sh.
+CONFIG_PATH = os.environ.get("GARDYN_NETWATCH_CONFIG", "/etc/gardyn/netwatch.env")
 
-# An independent, non-ICMP modality: the MQTT broker this Pi actually talks
-# to. If ICMP is filtered or rate-limited upstream, this still answers, and it
-# tests the path that carries the grow-light commands rather than a proxy for
-# it.
-TCP_PROBE_HOST = "192.168.1.204"
-TCP_PROBE_PORT = 1883
+KEY_TARGETS = "GARDYN_NETWATCH_PING_TARGETS"
+KEY_TCP_HOST = "GARDYN_NETWATCH_TCP_HOST"
+KEY_TCP_PORT = "GARDYN_NETWATCH_TCP_PORT"
+KEY_WLAN_UUID = "GARDYN_NETWATCH_WLAN_UUID"
 
-# The `preconfigured` wlan0 profile. Pinned by UUID rather than by name so a
-# renamed connection fails loudly at reconnect time instead of silently
-# activating some other profile.
-WLAN_UUID = "11d51067-9d11-4257-822e-cf6744b9a997"
+# Deliberately does NOT include the port: 1883 is the IANA-registered MQTT
+# port and says nothing about anybody's topology, so it is the one field that
+# may sensibly default. The three below are all site-specific.
+REQUIRED_KEYS = (KEY_TARGETS, KEY_TCP_HOST, KEY_WLAN_UUID)
+
+# The sentinel the shipped template uses. Rejecting it is what stops a
+# copied-but-unedited config becoming a working-looking watchdog aimed at
+# nothing: unedited placeholders would otherwise never answer a probe, which
+# reads to the ladder as a total outage and escalates to a reboot.
+PLACEHOLDER = "CHANGEME"
+
+DEFAULT_TCP_PORT = 1883
 
 STATE_PATH = "/var/lib/gardyn-netwatch/state.json"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
@@ -133,6 +157,13 @@ TCP_TIMEOUT_S = 3.0
 RECONNECT_NMCLI_WAIT_S = 45
 RECONNECT_TIMEOUT_S = 60.0
 
+# Must match TimeoutStartSec= in services/etc/systemd/system/gardyn-netwatch.service.
+# Pinned here because the target COUNT is now operator-supplied, so the worst-
+# case run time is no longer fixed at authoring time: a config listing enough
+# ping targets would push a failing run past the unit's start timeout and get
+# it killed mid-reconnect, every tick, silently.
+UNIT_TIMEOUT_START_S = 90.0
+
 ACT_NONE = "none"
 ACT_WAIT = "wait"
 ACT_RECONNECT = "reconnect"
@@ -148,6 +179,172 @@ EMPTY_STATE = {
     "consecutive_reboots": 0,
     "healthy_streak": 0,
 }
+
+
+class ConfigError(Exception):
+    """A configuration that cannot be used. Carries a short greppable reason.
+
+    Every raise site is a refusal to run, never a downgrade to a default —
+    see the module docstring for why this file has no fallback topology.
+    """
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
+class NetwatchConfig(NamedTuple):
+    targets: tuple[str, ...]
+    tcp_host: str
+    tcp_port: int
+    wlan_uuid: str
+
+    @property
+    def tcp_key(self) -> str:
+        return f"tcp_{self.tcp_host}_{self.tcp_port}"
+
+
+def probe_budget_s(target_count: int) -> float:
+    """Worst-case wall time for one failing run with `target_count` pings.
+
+    Every ping runs to its deadline (plus the subprocess backstop), then the
+    TCP probe times out, then a reconnect is allowed its full budget.
+    """
+    return (target_count * (float(PING_DEADLINE_S) + 5.0)
+            + TCP_TIMEOUT_S + RECONNECT_TIMEOUT_S)
+
+
+def _max_ping_targets() -> int:
+    """The largest target count whose worst-case run still fits the unit's
+    start timeout. DERIVED, not chosen: bumping TimeoutStartSec= or a probe
+    timeout moves this by itself instead of leaving a stale literal behind."""
+    count = 1
+    while probe_budget_s(count + 1) < UNIT_TIMEOUT_START_S:
+        count += 1
+    return count
+
+
+MAX_PING_TARGETS = _max_ping_targets()
+
+_UUID_RE = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+
+
+def parse_env(raw: str | None) -> dict:
+    """Parse a systemd EnvironmentFile-shaped KEY=VALUE body.
+
+    Deliberately lenient about SHAPE and strict about CONTENT: a stray line
+    is skipped here and the missing-key check below is what refuses to run.
+    Splitting it that way keeps every refusal in one place, so there is no
+    path where a malformed line produces a partial config that still runs.
+    """
+    out: dict = {}
+    if not raw:
+        return out
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def build_config(env: dict) -> NetwatchConfig:
+    """Validate a parsed environment into a config, or refuse.
+
+    Raises ConfigError for every incomplete or implausible input. There is no
+    branch that returns a partially-populated config and no branch that
+    substitutes a value the operator did not write.
+    """
+    for key in REQUIRED_KEYS:
+        value = (env.get(key) or "").strip()
+        if not value:
+            raise ConfigError("config_missing_key", f"{key} is missing or empty")
+        if PLACEHOLDER in value.upper():
+            raise ConfigError("config_placeholder",
+                              f"{key} still holds the template placeholder")
+
+    targets = tuple(t for t in re.split(r"[,\s]+", env[KEY_TARGETS].strip()) if t)
+    if not targets:
+        raise ConfigError("config_no_targets", f"{KEY_TARGETS} names no host")
+    if len(set(targets)) != len(targets):
+        # Two entries that are the same host are one modality wearing a hat:
+        # that host rebooting then looks exactly like this Pi's radio dying,
+        # which is the specific confusion the multi-target design removes.
+        raise ConfigError("config_duplicate_targets",
+                          f"{KEY_TARGETS} repeats a host")
+    if len(targets) > MAX_PING_TARGETS:
+        raise ConfigError(
+            "config_too_many_targets",
+            f"{KEY_TARGETS} lists {len(targets)}; more than {MAX_PING_TARGETS} "
+            f"can exceed the unit's {UNIT_TIMEOUT_START_S:.0f}s start timeout")
+
+    raw_port = (env.get(KEY_TCP_PORT) or "").strip()
+    if raw_port:
+        if PLACEHOLDER in raw_port.upper():
+            raise ConfigError("config_placeholder",
+                              f"{KEY_TCP_PORT} still holds the template placeholder")
+        try:
+            port = int(raw_port, 10)
+        except ValueError:
+            raise ConfigError("config_bad_port",
+                              f"{KEY_TCP_PORT} is not an integer") from None
+        if not 1 <= port <= 65535:
+            raise ConfigError("config_bad_port",
+                              f"{KEY_TCP_PORT} is outside 1-65535")
+    else:
+        port = DEFAULT_TCP_PORT
+
+    uuid = env[KEY_WLAN_UUID].strip()
+    if not _UUID_RE.match(uuid):
+        # `nmcli connection up uuid <x>` with a connection NAME here fails
+        # every reconnect with nothing but the journal to show for it, so
+        # catch the shape at config time rather than during an outage.
+        raise ConfigError("config_bad_uuid",
+                          f"{KEY_WLAN_UUID} is not a UUID")
+
+    return NetwatchConfig(targets=targets, tcp_host=env[KEY_TCP_HOST].strip(),
+                          tcp_port=port, wlan_uuid=uuid)
+
+
+def load_config(path: str) -> NetwatchConfig:
+    """Read and validate the config file, or refuse. Never returns a default."""
+    raw = _read(path)
+    if raw is None:
+        raise ConfigError("config_unreadable", f"cannot read {path}")
+    env = parse_env(raw)
+    if not env:
+        raise ConfigError("config_empty", f"{path} defines no settings")
+    return build_config(env)
+
+
+def config_error_record(exc: ConfigError, path: str) -> str:
+    """The one log line emitted when there is no config to run against.
+
+    Shaped like the ordinary record so `journalctl -t gardyn-netwatch` greps
+    the same way, but it cannot use format_record(): the per-probe keys are
+    derived from the config that just failed to load.
+    """
+    parts = [
+        ("action", ACT_STAND_DOWN),
+        ("reason", exc.reason),
+        ("config_path", path),
+        ("detail", exc.detail),
+    ]
+    return " ".join(f"{k}={_fmt(v)}" for k, v in parts)
 
 
 def read_boot_id(raw: str | None) -> str | None:
@@ -290,7 +487,8 @@ def _fmt(value) -> str:
 
 
 def format_record(action: str, reason: str, results: dict, uptime_s: float | None,
-                  state: dict, outcome: str | None = None) -> str:
+                  state: dict, cfg: NetwatchConfig,
+                  outcome: str | None = None) -> str:
     """Render one logfmt line. Key order is stable so the output greps well.
 
     During an outage this line is the only artifact anyone reads back, so the
@@ -306,7 +504,7 @@ def format_record(action: str, reason: str, results: dict, uptime_s: float | Non
         ("consecutive_reboots", state.get("consecutive_reboots", 0)),
         ("healthy_streak", state.get("healthy_streak", 0)),
     ]
-    for name in list(TARGETS) + [f"tcp_{TCP_PROBE_HOST}_{TCP_PROBE_PORT}"]:
+    for name in list(cfg.targets) + [cfg.tcp_key]:
         parts.append((f"probe_{name}", results.get(name)))
     if outcome:
         parts.append(("outcome", outcome))
@@ -346,8 +544,12 @@ NETWORK_ERRNOS = frozenset({
 })
 
 
-def tcp_probe(host: str = TCP_PROBE_HOST, port: int = TCP_PROBE_PORT) -> bool | None:
+def tcp_probe(host: str, port: int) -> bool | None:
     """True connected, False a network-level no, None could not measure.
+
+    Both arguments are REQUIRED. A default here would be a built-in target
+    reintroduced through the back door — the caller could then omit it and
+    get a probe aimed at somebody else's broker with nothing to show for it.
 
     This probe carries more weight than it looks. When wlan0 is down there is
     no route, so `ping` exits 2 and both ICMP probes report "don't know" —
@@ -372,8 +574,12 @@ def tcp_probe(host: str = TCP_PROBE_HOST, port: int = TCP_PROBE_PORT) -> bool | 
         return False if exc.errno in NETWORK_ERRNOS else None
 
 
-def reconnect() -> str:
+def reconnect(wlan_uuid: str) -> str:
     """Reactivate the wlan0 profile. Returns a short outcome string.
+
+    The UUID is REQUIRED and has no default, for the same reason tcp_probe's
+    host does: activating a profile identified by a value this repository
+    guessed is the one action here that changes a stranger's machine.
 
     `nmcli connection up` — NOT `nmcli device reconnect`, which does not exist
     (nmcli 1.42.4 exits 2 with "argument not understood", so a watchdog built
@@ -384,7 +590,7 @@ def reconnect() -> str:
     try:
         proc = subprocess.run(
             ["nmcli", "--wait", str(RECONNECT_NMCLI_WAIT_S),
-             "connection", "up", "uuid", WLAN_UUID],
+             "connection", "up", "uuid", wlan_uuid],
             capture_output=True, text=True, timeout=RECONNECT_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
@@ -452,25 +658,38 @@ def save_state(path: str, state: dict) -> bool:
 
 
 def main() -> int:
+    # FIRST, and fail closed. Nothing below is safe to attempt against a
+    # topology this process had to invent, so no probe is run, no state is
+    # written, and the exit status is non-zero so systemd marks the unit
+    # failed rather than logging a stand-down that looks like a quiet tick.
+    try:
+        cfg = load_config(CONFIG_PATH)
+    except ConfigError as exc:
+        print(config_error_record(exc, CONFIG_PATH), flush=True)
+        print(f"gardyn-netwatch: refusing to run: {exc.detail}", file=sys.stderr,
+              flush=True)
+        return 2
+
     uptime_s = parse_uptime(_read("/proc/uptime"))
     boot_id = read_boot_id(_read(BOOT_ID_PATH))
     state = load_state(_read(STATE_PATH))
 
-    results: dict = {target: ping(target) for target in TARGETS}
-    results[f"tcp_{TCP_PROBE_HOST}_{TCP_PROBE_PORT}"] = tcp_probe()
+    results: dict = {target: ping(target) for target in cfg.targets}
+    results[cfg.tcp_key] = tcp_probe(cfg.tcp_host, cfg.tcp_port)
 
     reachable = any(v is True for v in results.values())
     measured = any(v is not None for v in results.values())
 
     if uptime_s is None:
         # No trustworthy clock means the ladder cannot be evaluated.
-        print(format_record(ACT_STAND_DOWN, "no_uptime", results, None, state), flush=True)
+        print(format_record(ACT_STAND_DOWN, "no_uptime", results, None, state, cfg),
+              flush=True)
         return 0
 
     if not reachable and not measured:
         # Nothing answered because nothing could be ASKED. That is not evidence
         # about the network, and acting on it would reboot a healthy host.
-        print(format_record(ACT_STAND_DOWN, "no_probe_ran", results, uptime_s, state),
+        print(format_record(ACT_STAND_DOWN, "no_probe_ran", results, uptime_s, state, cfg),
               flush=True)
         return 0
 
@@ -481,10 +700,10 @@ def main() -> int:
         # If the write fails the cap is blind, so downgrade rather than reboot.
         if not save_state(STATE_PATH, new_state):
             print(format_record(ACT_REBOOT_SUPPRESSED, "state_unwritable", results,
-                                uptime_s, new_state, "reconnect_skipped"), flush=True)
+                                uptime_s, new_state, cfg, "reconnect_skipped"), flush=True)
             return 0
-        print(format_record(action, reason, results, uptime_s, new_state, "reboot_ordering"),
-              flush=True)
+        print(format_record(action, reason, results, uptime_s, new_state, cfg,
+                            "reboot_ordering"), flush=True)
         outcome = reboot()
         if outcome != "reboot_ordered":
             # The reboot did not happen; give the slot back or two failures
@@ -493,17 +712,19 @@ def main() -> int:
             rolled["consecutive_reboots"] = max(0, rolled["consecutive_reboots"] - 1)
             save_state(STATE_PATH, rolled)
             new_state = rolled
-        print(format_record(action, reason, results, uptime_s, new_state, outcome), flush=True)
+        print(format_record(action, reason, results, uptime_s, new_state, cfg, outcome),
+              flush=True)
         return 0
 
-    outcome = reconnect() if reconnect_now else None
+    outcome = reconnect(cfg.wlan_uuid) if reconnect_now else None
 
     # Skip an unchanged write: a healthy host would otherwise fsync 720 times a
     # day onto the SD card, on a ticket whose sibling work exists to cut SD
     # writes.
     if new_state != state:
         save_state(STATE_PATH, new_state)
-    print(format_record(action, reason, results, uptime_s, new_state, outcome), flush=True)
+    print(format_record(action, reason, results, uptime_s, new_state, cfg, outcome),
+          flush=True)
     return 0
 
 

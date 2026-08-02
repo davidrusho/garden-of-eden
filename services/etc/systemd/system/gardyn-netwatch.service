@@ -14,6 +14,16 @@ User=root
 ExecStart=/usr/bin/python3 /home/gardyn/garden-of-eden/bin/gardyn-netwatch.py
 SyslogIdentifier=gardyn-netwatch
 
+# REQUIRES /etc/gardyn/netwatch.env — the ping targets, the TCP probe host and
+# the wlan0 profile UUID, none of which have a default. Template and the reason
+# there is no default: services/etc/gardyn/netwatch.env.example.
+#
+# Deliberately NOT an EnvironmentFile= or a ConditionPathExists=. The script
+# reads and validates the file itself so that a missing or half-filled config
+# produces a named reason on the journal line and a non-zero exit — a
+# Condition= would skip the unit and report success, which is the quiet failure
+# this whole file exists to avoid.
+
 # Cross-boot state lives here: /var/lib/gardyn-netwatch, created 0750 root.
 # It MUST survive a reboot — the consecutive-reboot cap is the guard that stops
 # this unit power-cycling the plants forever when the AP, not the Pi, is what

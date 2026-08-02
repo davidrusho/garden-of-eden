@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -28,8 +29,37 @@ if _spec is None or _spec.loader is None:  # pragma: no cover - import plumbing
 nw = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(nw)
 
+REPO = pathlib.Path(__file__).resolve().parents[1]
+TEMPLATE = REPO / "services" / "etc" / "gardyn" / "netwatch.env.example"
+UNIT = REPO / "services" / "etc" / "systemd" / "system" / "gardyn-netwatch.service"
+
 BOOT = "boot-aaaa"
-TCP_KEY = f"tcp_{nw.TCP_PROBE_HOST}_{nw.TCP_PROBE_PORT}"
+CONFIG = "/fixture/netwatch.env"
+
+# RFC 5737 TEST-NET-1 and a synthetic UUID. Deliberately not the deployment's
+# real values: this suite must not become the place the addressing that was
+# just lifted out of the script quietly reappears in a public repository.
+CFG_TEXT = (
+    "# a comment\n"
+    "\n"
+    "GARDYN_NETWATCH_PING_TARGETS=192.0.2.1,192.0.2.9\n"
+    "GARDYN_NETWATCH_TCP_HOST=192.0.2.9\n"
+    "GARDYN_NETWATCH_TCP_PORT=1883\n"
+    "GARDYN_NETWATCH_WLAN_UUID=11111111-2222-3333-4444-555555555555\n"
+)
+CFG = nw.build_config(nw.parse_env(CFG_TEXT))
+TCP_KEY = CFG.tcp_key
+
+
+def cfg_text(**overrides) -> str:
+    """CFG_TEXT with keys replaced or removed (pass None to drop a key)."""
+    env = nw.parse_env(CFG_TEXT)
+    for key, value in overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    return "".join(f"{k}={v}\n" for k, v in env.items())
 
 
 def state(first=None, failures=0, reconnects=0, reboots=0, streak=0, boot_id=BOOT):
@@ -400,9 +430,9 @@ class TestPing(unittest.TestCase):
     def test_reply_is_reachable(self):
         with mock.patch.object(nw.subprocess, "run",
                                return_value=mock.Mock(returncode=0)) as run:
-            self.assertIs(nw.ping("192.168.1.1"), True)
+            self.assertIs(nw.ping("192.0.2.1"), True)
         argv = run.call_args[0][0]
-        self.assertEqual(argv, ["ping", "-w", nw.PING_DEADLINE_S, "192.168.1.1"])
+        self.assertEqual(argv, ["ping", "-w", nw.PING_DEADLINE_S, "192.0.2.1"])
 
     def test_no_count_flag_is_passed(self):
         """ping(8): with a count AND a deadline, receiving fewer than count
@@ -411,40 +441,40 @@ class TestPing(unittest.TestCase):
         exit 0 <=> at least one reply, which is the question being asked."""
         with mock.patch.object(nw.subprocess, "run",
                                return_value=mock.Mock(returncode=0)) as run:
-            nw.ping("192.168.1.1")
+            nw.ping("192.0.2.1")
         self.assertNotIn("-c", run.call_args[0][0])
 
     def test_exit_1_is_no_answer(self):
         with mock.patch.object(nw.subprocess, "run", return_value=mock.Mock(returncode=1)):
-            self.assertIs(nw.ping("192.168.1.1"), False)
+            self.assertIs(nw.ping("192.0.2.1"), False)
 
     def test_exit_2_is_could_not_measure(self):
         """ping exits 2 for errors that say nothing about the network."""
         with mock.patch.object(nw.subprocess, "run", return_value=mock.Mock(returncode=2)):
-            self.assertIsNone(nw.ping("192.168.1.1"))
+            self.assertIsNone(nw.ping("192.0.2.1"))
 
     def test_timeout_is_could_not_measure(self):
         with mock.patch.object(nw.subprocess, "run",
                                side_effect=nw.subprocess.TimeoutExpired("ping", 8)):
-            self.assertIsNone(nw.ping("192.168.1.1"))
+            self.assertIsNone(nw.ping("192.0.2.1"))
 
     def test_missing_binary_or_fork_failure_is_could_not_measure(self):
         """Under a memory limit a fork failure raises OSError(ENOMEM). Reading
         that as 'the LAN is down' would reboot a healthy host."""
         with mock.patch.object(nw.subprocess, "run", side_effect=OSError(12, "ENOMEM")):
-            self.assertIsNone(nw.ping("192.168.1.1"))
+            self.assertIsNone(nw.ping("192.0.2.1"))
 
 
 class TestTcpProbe(unittest.TestCase):
     def test_connect_is_reachable(self):
         with mock.patch.object(nw.socket, "create_connection", return_value=mock.MagicMock()):
-            self.assertIs(nw.tcp_probe(), True)
+            self.assertIs(nw.tcp_probe(CFG.tcp_host, CFG.tcp_port), True)
 
     def test_refused_is_still_reachable(self):
         """Something answered — the path is up and the port is shut."""
         with mock.patch.object(nw.socket, "create_connection",
                                side_effect=ConnectionRefusedError()):
-            self.assertIs(nw.tcp_probe(), True)
+            self.assertIs(nw.tcp_probe(CFG.tcp_host, CFG.tcp_port), True)
 
     def test_network_level_errors_are_a_real_no(self):
         import errno as _errno
@@ -453,7 +483,7 @@ class TestTcpProbe(unittest.TestCase):
             with self.subTest(errno=err):
                 with mock.patch.object(nw.socket, "create_connection",
                                        side_effect=OSError(err, "network")):
-                    self.assertIs(nw.tcp_probe(), False)
+                    self.assertIs(nw.tcp_probe(CFG.tcp_host, CFG.tcp_port), False)
 
     def test_local_resource_failures_are_could_not_measure(self):
         """EMFILE/ENOMEM say nothing about reachability. Reading them as
@@ -465,18 +495,18 @@ class TestTcpProbe(unittest.TestCase):
             with self.subTest(errno=err):
                 with mock.patch.object(nw.socket, "create_connection",
                                        side_effect=OSError(err, "local")):
-                    self.assertIsNone(nw.tcp_probe())
+                    self.assertIsNone(nw.tcp_probe(CFG.tcp_host, CFG.tcp_port))
 
     def test_timeout_is_a_real_no(self):
         with mock.patch.object(nw.socket, "create_connection",
                                side_effect=nw.socket.timeout()):
-            self.assertIs(nw.tcp_probe(), False)
+            self.assertIs(nw.tcp_probe(CFG.tcp_host, CFG.tcp_port), False)
 
     def test_uses_the_broker_and_a_bounded_timeout(self):
         with mock.patch.object(nw.socket, "create_connection",
                                return_value=mock.MagicMock()) as conn:
-            nw.tcp_probe()
-        self.assertEqual(conn.call_args[0][0], (nw.TCP_PROBE_HOST, nw.TCP_PROBE_PORT))
+            nw.tcp_probe(CFG.tcp_host, CFG.tcp_port)
+        self.assertEqual(conn.call_args[0][0], (CFG.tcp_host, CFG.tcp_port))
         self.assertEqual(conn.call_args[1]["timeout"], nw.TCP_TIMEOUT_S)
 
 
@@ -487,10 +517,10 @@ class TestReconnect(unittest.TestCase):
         `nmcli device reapply` reports success without re-activating."""
         with mock.patch.object(nw.subprocess, "run",
                                return_value=mock.Mock(returncode=0)) as run:
-            self.assertEqual(nw.reconnect(), "reconnect_ok")
+            self.assertEqual(nw.reconnect(CFG.wlan_uuid), "reconnect_ok")
         argv = run.call_args[0][0]
         self.assertEqual(argv, ["nmcli", "--wait", str(nw.RECONNECT_NMCLI_WAIT_S),
-                                "connection", "up", "uuid", nw.WLAN_UUID])
+                                "connection", "up", "uuid", CFG.wlan_uuid])
         self.assertNotIn("reconnect", argv)
         self.assertNotIn("reapply", argv)
 
@@ -501,12 +531,12 @@ class TestReconnect(unittest.TestCase):
 
     def test_failure_timeout_and_oserror_are_reported_distinctly(self):
         with mock.patch.object(nw.subprocess, "run", return_value=mock.Mock(returncode=4)):
-            self.assertEqual(nw.reconnect(), "reconnect_exit_4")
+            self.assertEqual(nw.reconnect(CFG.wlan_uuid), "reconnect_exit_4")
         with mock.patch.object(nw.subprocess, "run",
                                side_effect=nw.subprocess.TimeoutExpired("nmcli", 60)):
-            self.assertEqual(nw.reconnect(), "reconnect_timeout")
+            self.assertEqual(nw.reconnect(CFG.wlan_uuid), "reconnect_timeout")
         with mock.patch.object(nw.subprocess, "run", side_effect=OSError(2, "gone")):
-            self.assertEqual(nw.reconnect(), "reconnect_oserror_2")
+            self.assertEqual(nw.reconnect(CFG.wlan_uuid), "reconnect_oserror_2")
 
 
 class TestReboot(unittest.TestCase):
@@ -545,12 +575,15 @@ class TestReboot(unittest.TestCase):
 # --------------------------------------------------------------------------
 class TestMain(unittest.TestCase):
     def _run_main(self, uptime, probe_result, prior, tmpdir, tcp=None,
-                  reboot_outcome="reboot_ordered", boot_id=BOOT):
+                  reboot_outcome="reboot_ordered", boot_id=BOOT,
+                  config_text=CFG_TEXT, expect_rv=0):
         path = str(pathlib.Path(tmpdir) / "state.json")
         if prior is not None:
             nw.save_state(path, prior)
 
         def fake_read(p):
+            if p == CONFIG:
+                return config_text
             if p == "/proc/uptime":
                 return None if uptime is None else f"{uptime} 0"
             if p == nw.BOOT_ID_PATH:
@@ -561,6 +594,7 @@ class TestMain(unittest.TestCase):
 
         buf = io.StringIO()
         with mock.patch.object(nw, "STATE_PATH", path), \
+             mock.patch.object(nw, "CONFIG_PATH", CONFIG), \
              mock.patch.object(nw, "_read", side_effect=fake_read), \
              mock.patch.object(nw, "ping", side_effect=lambda _t: probe_result), \
              mock.patch.object(nw, "tcp_probe",
@@ -569,7 +603,7 @@ class TestMain(unittest.TestCase):
              mock.patch.object(nw, "reboot", return_value=reboot_outcome) as rb, \
              redirect_stdout(buf):
             rv = nw.main()
-        self.assertEqual(rv, 0)
+        self.assertEqual(rv, expect_rv)
         after = (nw.load_state(pathlib.Path(path).read_text())
                  if pathlib.Path(path).exists() else None)
         return buf.getvalue(), rc, rb, after
@@ -628,6 +662,8 @@ class TestMain(unittest.TestCase):
                 return "reboot_ordered"
 
             def fake_read(p):
+                if p == CONFIG:
+                    return CFG_TEXT
                 if p == "/proc/uptime":
                     return "50400 0"
                 if p == nw.BOOT_ID_PATH:
@@ -635,6 +671,7 @@ class TestMain(unittest.TestCase):
                 return pathlib.Path(path).read_text()
 
             with mock.patch.object(nw, "STATE_PATH", path), \
+                 mock.patch.object(nw, "CONFIG_PATH", CONFIG), \
                  mock.patch.object(nw, "_read", side_effect=fake_read), \
                  mock.patch.object(nw, "ping", return_value=False), \
                  mock.patch.object(nw, "tcp_probe", return_value=False), \
@@ -652,6 +689,8 @@ class TestMain(unittest.TestCase):
             nw.save_state(path, state(first=50_000.0, failures=9, reconnects=2))
 
             def fake_read(p):
+                if p == CONFIG:
+                    return CFG_TEXT
                 if p == "/proc/uptime":
                     return "50400 0"
                 if p == nw.BOOT_ID_PATH:
@@ -660,6 +699,7 @@ class TestMain(unittest.TestCase):
 
             buf = io.StringIO()
             with mock.patch.object(nw, "STATE_PATH", path), \
+                 mock.patch.object(nw, "CONFIG_PATH", CONFIG), \
                  mock.patch.object(nw, "_read", side_effect=fake_read), \
                  mock.patch.object(nw, "ping", return_value=False), \
                  mock.patch.object(nw, "tcp_probe", return_value=False), \
@@ -720,24 +760,105 @@ class TestMain(unittest.TestCase):
             path = str(pathlib.Path(tmp) / "state.json")
             asked = []
             with mock.patch.object(nw, "STATE_PATH", path), \
+                 mock.patch.object(nw, "CONFIG_PATH", CONFIG), \
                  mock.patch.object(nw, "_read",
-                                   side_effect=lambda p: "50000 0" if p == "/proc/uptime"
-                                   else (BOOT if p == nw.BOOT_ID_PATH else None)), \
+                                   side_effect=lambda p: CFG_TEXT if p == CONFIG
+                                   else ("50000 0" if p == "/proc/uptime"
+                                         else (BOOT if p == nw.BOOT_ID_PATH else None))), \
                  mock.patch.object(nw, "ping",
                                    side_effect=lambda t: asked.append(t) or True), \
                  mock.patch.object(nw, "tcp_probe", return_value=True) as tcp, \
                  redirect_stdout(io.StringIO()):
                 nw.main()
-            self.assertEqual(asked, list(nw.TARGETS))
+            self.assertEqual(asked, list(CFG.targets))
             tcp.assert_called_once()
+
+
+class TestMainRefusesWithoutConfig(unittest.TestCase):
+    """Fail closed, and fail LOUDLY.
+
+    The dangerous shape is not a crash — it is a run that looks like an
+    ordinary quiet tick. So all three are asserted together: nothing is
+    probed, nothing is written, and the exit status is non-zero so systemd
+    marks the unit failed instead of logging a success.
+    """
+
+    def _run(self, config_text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(pathlib.Path(tmp) / "state.json")
+            buf, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(nw, "STATE_PATH", path), \
+                 mock.patch.object(nw, "CONFIG_PATH", CONFIG), \
+                 mock.patch.object(nw, "_read",
+                                   side_effect=lambda p: config_text if p == CONFIG
+                                   else None), \
+                 mock.patch.object(nw, "ping") as ping, \
+                 mock.patch.object(nw, "tcp_probe") as tcp, \
+                 mock.patch.object(nw, "reconnect") as rc, \
+                 mock.patch.object(nw, "reboot") as rb, \
+                 mock.patch.object(nw, "save_state") as save, \
+                 mock.patch("sys.stderr", err), \
+                 redirect_stdout(buf):
+                rv = nw.main()
+            for probe in (ping, tcp, rc, rb, save):
+                probe.assert_not_called()
+            self.assertFalse(pathlib.Path(path).exists())
+            return rv, buf.getvalue(), err.getvalue()
+
+    def test_a_missing_config_file_refuses(self):
+        rv, out, err = self._run(None)
+        self.assertNotEqual(rv, 0)
+        self.assertIn("reason=config_unreadable", out)
+        self.assertIn(CONFIG, out)
+        self.assertIn("refusing to run", err)
+
+    def test_an_empty_config_file_refuses(self):
+        rv, out, _ = self._run("\n# nothing here\n")
+        self.assertNotEqual(rv, 0)
+        self.assertIn("reason=config_empty", out)
+
+    def test_a_config_missing_one_key_refuses(self):
+        rv, out, _ = self._run(cfg_text(GARDYN_NETWATCH_WLAN_UUID=None))
+        self.assertNotEqual(rv, 0)
+        self.assertIn("reason=config_missing_key", out)
+        self.assertIn(nw.KEY_WLAN_UUID, out)
+
+    def test_a_malformed_config_refuses(self):
+        rv, out, _ = self._run(cfg_text(GARDYN_NETWATCH_TCP_PORT="not-a-port"))
+        self.assertNotEqual(rv, 0)
+        self.assertIn("reason=config_bad_port", out)
+
+    def test_the_unedited_template_refuses(self):
+        rv, out, _ = self._run(TEMPLATE.read_text())
+        self.assertNotEqual(rv, 0)
+        self.assertIn("reason=config_placeholder", out)
+
+    def test_a_complete_config_does_NOT_refuse(self):
+        """The positive control for this whole class. Without it every test
+        above is satisfied by a main() that refuses unconditionally."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(pathlib.Path(tmp) / "state.json")
+            with mock.patch.object(nw, "STATE_PATH", path), \
+                 mock.patch.object(nw, "CONFIG_PATH", CONFIG), \
+                 mock.patch.object(nw, "_read",
+                                   side_effect=lambda p: CFG_TEXT if p == CONFIG
+                                   else ("50000 0" if p == "/proc/uptime"
+                                         else (BOOT if p == nw.BOOT_ID_PATH else None))), \
+                 mock.patch.object(nw, "ping", return_value=True) as ping, \
+                 mock.patch.object(nw, "tcp_probe", return_value=True), \
+                 redirect_stdout(io.StringIO()) as buf:
+                rv = nw.main()
+        self.assertEqual(rv, 0)
+        self.assertEqual(ping.call_count, len(CFG.targets))
+        self.assertIn("action=none", buf.getvalue())
 
 
 class TestFormatRecord(unittest.TestCase):
     def test_per_probe_results_are_all_present(self):
-        results = {t: True for t in nw.TARGETS}
+        results = {t: True for t in CFG.targets}
         results[TCP_KEY] = True
-        line = nw.format_record("none", "reachable", results, 50_000.0, state())
-        for target in nw.TARGETS:
+        line = nw.format_record("none", "reachable", results, 50_000.0, state(), CFG)
+        for target in CFG.targets:
             self.assertIn(f"probe_{target}=true", line)
         self.assertIn(f"probe_{TCP_KEY}=true", line)
 
@@ -745,21 +866,21 @@ class TestFormatRecord(unittest.TestCase):
         """During an outage this line is the only artifact anyone reads. A
         mutation hardcoding reachable=true survived the old suite, which had
         no test asserting any false value in a rendered line."""
-        results = {nw.TARGETS[0]: False, nw.TARGETS[1]: None, TCP_KEY: False}
-        line = nw.format_record("reconnect", "first_failure", results, 50_000.0, state())
+        results = {CFG.targets[0]: False, CFG.targets[1]: None, TCP_KEY: False}
+        line = nw.format_record("reconnect", "first_failure", results, 50_000.0,
+                                state(), CFG)
         self.assertIn("reachable=false", line)
-        self.assertIn(f"probe_{nw.TARGETS[0]}=false", line)
-        self.assertIn(f"probe_{nw.TARGETS[1]}=-", line)
+        self.assertIn(f"probe_{CFG.targets[0]}=false", line)
+        self.assertIn(f"probe_{CFG.targets[1]}=-", line)
 
     def test_an_unmeasured_probe_does_not_count_as_reachable(self):
         line = nw.format_record("stand_down", "no_probe_ran",
-                                {t: None for t in nw.TARGETS}, 50_000.0, state())
+                                {t: None for t in CFG.targets}, 50_000.0, state(), CFG)
         self.assertIn("reachable=false", line)
 
     def test_counters_are_rendered_from_state(self):
-        line = nw.format_record("wait", "backoff_3",
-                                {}, 50_000.0, state(failures=3, reconnects=2, reboots=1,
-                                                    streak=4))
+        line = nw.format_record("wait", "backoff_3", {}, 50_000.0,
+                                state(failures=3, reconnects=2, reboots=1, streak=4), CFG)
         self.assertIn("failures=3", line)
         self.assertIn("reconnects=2", line)
         self.assertIn("consecutive_reboots=1", line)
@@ -767,10 +888,11 @@ class TestFormatRecord(unittest.TestCase):
 
     def test_none_renders_as_a_bare_dash(self):
         self.assertIn("uptime_s=-", nw.format_record("stand_down", "no_uptime", {},
-                                                     None, state()))
+                                                     None, state(), CFG))
 
     def test_values_with_spaces_are_quoted(self):
-        self.assertIn('outcome="a b"', nw.format_record("none", "r", {}, 1.0, state(), "a b"))
+        self.assertIn('outcome="a b"',
+                      nw.format_record("none", "r", {}, 1.0, state(), CFG, "a b"))
 
 
 class TestSafetyConstants(unittest.TestCase):
@@ -798,19 +920,37 @@ class TestSafetyConstants(unittest.TestCase):
                            nw.REBOOT_AFTER_DOWN_S + 120)
 
     def test_probe_budget_fits_inside_the_timer_period(self):
-        """TimeoutStartSec=90 in the unit, against a 120s OnCalendar period."""
-        worst = (len(nw.TARGETS) * (float(nw.PING_DEADLINE_S) + 5.0)
-                 + nw.TCP_TIMEOUT_S + nw.RECONNECT_TIMEOUT_S)
-        self.assertLess(worst, 90)
+        """TimeoutStartSec=90 in the unit, against a 120s OnCalendar period.
 
-    def test_two_distinct_targets_plus_an_independent_modality(self):
-        """len()==2 alone is satisfied by a duplicated tuple, and 'contains
-        the gateway' is satisfied by a WAN address. Pin distinctness and that
-        both are on this LAN."""
-        self.assertEqual(len(set(nw.TARGETS)), 2)
-        for target in nw.TARGETS:
-            self.assertTrue(target.startswith("192.168.1."), target)
-        self.assertEqual(nw.TCP_PROBE_PORT, 1883)
+        The target COUNT is operator-supplied now, so this is checked at the
+        cap rather than against whatever this deployment happens to list."""
+        self.assertLess(nw.probe_budget_s(nw.MAX_PING_TARGETS),
+                        nw.UNIT_TIMEOUT_START_S)
+
+    def test_the_target_cap_is_DERIVED_from_the_budget_not_chosen(self):
+        """One more target must not fit. A cap that is merely smaller than the
+        budget allows would drift silently when a timeout changes, and this is
+        the constant that decides whether a failing run is killed mid-
+        reconnect on every single tick."""
+        self.assertGreaterEqual(nw.probe_budget_s(nw.MAX_PING_TARGETS + 1),
+                                nw.UNIT_TIMEOUT_START_S)
+        self.assertGreaterEqual(nw.MAX_PING_TARGETS, 2)
+
+    def test_the_pinned_unit_timeout_matches_the_unit_FILE(self):
+        """UNIT_TIMEOUT_START_S is a copy of a value systemd owns. A copy that
+        nothing compares is a copy that goes stale, and the failure is
+        invisible: the cap keeps computing from a timeout that is no longer
+        deployed."""
+        match = re.search(r"^TimeoutStartSec=(\d+)\s*$", UNIT.read_text(),
+                          re.MULTILINE)
+        self.assertIsNotNone(match, "no TimeoutStartSec= in the unit file")
+        assert match is not None
+        self.assertEqual(float(match.group(1)), nw.UNIT_TIMEOUT_START_S)
+
+    def test_the_default_tcp_port_is_the_registered_mqtt_one(self):
+        """The one field allowed a default, precisely because 1883 is IANA's
+        and reveals nothing about anybody's topology."""
+        self.assertEqual(nw.DEFAULT_TCP_PORT, 1883)
 
     def test_state_lives_on_a_boot_persistent_path(self):
         """The reboot cap is worthless if state dies with the reboot. /tmp is
@@ -818,11 +958,249 @@ class TestSafetyConstants(unittest.TestCase):
         it every RUN."""
         self.assertTrue(nw.STATE_PATH.startswith("/var/lib/"), nw.STATE_PATH)
 
-    def test_wlan_uuid_is_the_preconfigured_profile(self):
-        """Verified against the live host: this UUID is the `preconfigured`
-        802-11-wireless profile on wlan0. A wrong one fails every reconnect
-        with nothing but the journal to show it."""
-        self.assertEqual(nw.WLAN_UUID, "11d51067-9d11-4257-822e-cf6744b9a997")
+
+# --------------------------------------------------------------------------
+# Configuration. Every branch here is a REFUSAL, and every one of them is
+# unreachable on the deployed host — which has a correct config file and will
+# therefore exercise none of this ever again.
+# --------------------------------------------------------------------------
+class TestParseEnv(unittest.TestCase):
+    def test_comments_blanks_and_quotes(self):
+        env = nw.parse_env('# note\n\n A = " x " \nB=\'y\'\nexport C=z\n')
+        self.assertEqual(env, {"A": " x ", "B": "y", "C": "z"})
+
+    def test_a_line_without_an_equals_is_skipped_not_fatal(self):
+        self.assertEqual(nw.parse_env("junk\nA=1\n"), {"A": "1"})
+
+    def test_a_value_may_contain_an_equals(self):
+        self.assertEqual(nw.parse_env("A=b=c\n"), {"A": "b=c"})
+
+    def test_empty_and_none(self):
+        self.assertEqual(nw.parse_env(None), {})
+        self.assertEqual(nw.parse_env(""), {})
+
+
+class TestBuildConfig(unittest.TestCase):
+    def test_the_happy_path(self):
+        cfg = nw.build_config(nw.parse_env(CFG_TEXT))
+        self.assertEqual(cfg.targets, ("192.0.2.1", "192.0.2.9"))
+        self.assertEqual(cfg.tcp_host, "192.0.2.9")
+        self.assertEqual(cfg.tcp_port, 1883)
+        self.assertEqual(cfg.wlan_uuid, "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(cfg.tcp_key, "tcp_192.0.2.9_1883")
+
+    def test_targets_may_be_space_separated(self):
+        cfg = nw.build_config(nw.parse_env(
+            cfg_text(GARDYN_NETWATCH_PING_TARGETS="192.0.2.1 192.0.2.9")))
+        self.assertEqual(cfg.targets, ("192.0.2.1", "192.0.2.9"))
+
+    def _refuses(self, reason, **overrides):
+        with self.assertRaises(nw.ConfigError) as ctx:
+            nw.build_config(nw.parse_env(cfg_text(**overrides)))
+        self.assertEqual(ctx.exception.reason, reason)
+        return ctx.exception
+
+    def test_each_required_key_missing_is_refused(self):
+        for key in nw.REQUIRED_KEYS:
+            with self.subTest(key=key):
+                exc = self._refuses("config_missing_key", **{key: None})
+                self.assertIn(key, exc.detail)
+
+    def test_each_required_key_EMPTY_is_refused(self):
+        """Not the same branch as absent: a key present with a blank value is
+        what a half-finished edit leaves behind."""
+        for key in nw.REQUIRED_KEYS:
+            with self.subTest(key=key):
+                self._refuses("config_missing_key", **{key: "   "})
+
+    def test_a_template_placeholder_left_in_place_is_refused(self):
+        """The whole point of the CHANGEME sentinel. Unedited placeholders
+        would answer no probe, which reads to the ladder as a total outage and
+        escalates — a copied template would REBOOT the host on a cadence."""
+        for key in nw.REQUIRED_KEYS:
+            with self.subTest(key=key):
+                self._refuses("config_placeholder",
+                              **{key: f"{nw.PLACEHOLDER}-something"})
+
+    def test_a_placeholder_in_the_optional_port_is_also_refused(self):
+        self._refuses("config_placeholder",
+                      GARDYN_NETWATCH_TCP_PORT=nw.PLACEHOLDER)
+
+    def test_a_target_list_of_only_separators_is_refused(self):
+        self._refuses("config_no_targets", GARDYN_NETWATCH_PING_TARGETS=" , , ")
+
+    def test_a_repeated_target_is_refused(self):
+        """Two entries that are one host is one modality wearing a hat: that
+        host rebooting then looks exactly like this Pi's radio dying."""
+        self._refuses("config_duplicate_targets",
+                      GARDYN_NETWATCH_PING_TARGETS="192.0.2.1,192.0.2.1")
+
+    def test_more_targets_than_the_run_budget_allows_is_refused(self):
+        many = ",".join(f"192.0.2.{n}" for n in range(1, nw.MAX_PING_TARGETS + 2))
+        self._refuses("config_too_many_targets", GARDYN_NETWATCH_PING_TARGETS=many)
+
+    def test_exactly_the_cap_is_accepted(self):
+        many = ",".join(f"192.0.2.{n}" for n in range(1, nw.MAX_PING_TARGETS + 1))
+        cfg = nw.build_config(nw.parse_env(
+            cfg_text(GARDYN_NETWATCH_PING_TARGETS=many)))
+        self.assertEqual(len(cfg.targets), nw.MAX_PING_TARGETS)
+
+    def test_a_malformed_or_out_of_range_port_is_refused(self):
+        for bad in ("1883x", "", "-1", "0", "65536", "1e3", " 18 83"):
+            if bad == "":
+                continue  # empty means "use the default", covered below
+            with self.subTest(port=bad):
+                self._refuses("config_bad_port", GARDYN_NETWATCH_TCP_PORT=bad)
+
+    def test_an_omitted_port_takes_the_registered_default(self):
+        cfg = nw.build_config(nw.parse_env(cfg_text(GARDYN_NETWATCH_TCP_PORT=None)))
+        self.assertEqual(cfg.tcp_port, nw.DEFAULT_TCP_PORT)
+
+    def test_a_blank_port_takes_the_default_rather_than_failing(self):
+        cfg = nw.build_config(nw.parse_env(cfg_text(GARDYN_NETWATCH_TCP_PORT="  ")))
+        self.assertEqual(cfg.tcp_port, nw.DEFAULT_TCP_PORT)
+
+    def test_a_connection_NAME_where_a_uuid_belongs_is_refused(self):
+        """`nmcli connection up uuid <name>` fails every reconnect with
+        nothing but the journal to show for it. Catch the shape at load time,
+        not during the outage it was supposed to fix."""
+        for bad in ("preconfigured", "11111111-2222-3333-4444", "not-a-uuid",
+                    "11111111222233334444555555555555",
+                    # A real UUID with junk appended: only the TRAILING anchor
+                    # rejects this, and re.match() makes the leading one
+                    # redundant, so this is the case that pins \Z.
+                    "11111111-2222-3333-4444-555555555555-extra",
+                    "prefix-11111111-2222-3333-4444-555555555555"):
+            with self.subTest(uuid=bad):
+                self._refuses("config_bad_uuid", GARDYN_NETWATCH_WLAN_UUID=bad)
+
+
+class TestLoadConfig(unittest.TestCase):
+    def test_a_missing_file_is_refused_not_defaulted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(pathlib.Path(tmp) / "absent.env")
+            with self.assertRaises(nw.ConfigError) as ctx:
+                nw.load_config(path)
+            self.assertEqual(ctx.exception.reason, "config_unreadable")
+
+    def test_an_empty_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "empty.env"
+            path.write_text("# only comments\n\n")
+            with self.assertRaises(nw.ConfigError) as ctx:
+                nw.load_config(str(path))
+            self.assertEqual(ctx.exception.reason, "config_empty")
+
+    def test_a_real_file_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "netwatch.env"
+            path.write_text(CFG_TEXT)
+            self.assertEqual(nw.load_config(str(path)), CFG)
+
+    def test_the_error_record_names_the_reason_and_the_path(self):
+        exc = nw.ConfigError("config_unreadable", "cannot read /etc/x")
+        line = nw.config_error_record(exc, "/etc/x")
+        self.assertIn("action=stand_down", line)
+        self.assertIn("reason=config_unreadable", line)
+        self.assertIn("config_path=/etc/x", line)
+        self.assertIn('detail="cannot read /etc/x"', line)
+
+
+class TestNoTopologyIsBakedIn(unittest.TestCase):
+    """The policy itself, pinned against RE-INTRODUCTION rather than breakage.
+
+    Every other test here would still pass if somebody added a fallback
+    default alongside the config loader — the loader would simply never be
+    asked. These scan the shipped source instead, so the deleted code cannot
+    come back quietly.
+    """
+
+    IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+    UUID = re.compile(r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b")
+
+    def test_the_script_contains_no_ip_address_and_no_uuid(self):
+        text = pathlib.Path(nw.__file__ or str(_SRC)).read_text()
+        self.assertEqual(self.IPV4.findall(text), [])
+        self.assertEqual(self.UUID.findall(text), [])
+
+    def test_the_probe_helpers_take_no_default_target(self):
+        """A default argument is the back door: main() would keep passing the
+        config while any other caller silently got a built-in host."""
+        import inspect
+        for func, params in ((nw.tcp_probe, ("host", "port")),
+                             (nw.reconnect, ("wlan_uuid",))):
+            sig = inspect.signature(func)
+            for name in params:
+                with self.subTest(func=func.__name__, param=name):
+                    self.assertIs(sig.parameters[name].default,
+                                  inspect.Parameter.empty)
+
+    def test_the_module_exposes_no_topology_constant(self):
+        for gone in ("TARGETS", "TCP_PROBE_HOST", "WLAN_UUID"):
+            self.assertFalse(hasattr(nw, gone),
+                             f"{gone} is back as a module-level default")
+
+
+class TestShippedTemplate(unittest.TestCase):
+    def test_the_template_exists_and_documents_every_required_key(self):
+        text = TEMPLATE.read_text()
+        for key in nw.REQUIRED_KEYS + (nw.KEY_TCP_PORT,):
+            self.assertIn(f"{key}=", text, key)
+
+    def test_the_template_itself_is_REFUSED(self):
+        """Copying it into place unedited must not produce a working watchdog.
+        This is the test that makes 'no working default' true of the artifact
+        an operator actually handles, rather than only of the code."""
+        with self.assertRaises(nw.ConfigError) as ctx:
+            nw.build_config(nw.parse_env(TEMPLATE.read_text()))
+        self.assertEqual(ctx.exception.reason, "config_placeholder")
+
+    def test_the_real_config_is_ignored_and_the_template_is_NOT(self):
+        """Both directions, because each failure is silent in its own way.
+
+        Ignoring too little publishes one LAN's topology from a public repo.
+        Ignoring too much swallows the template and leaves a repository that
+        passes every secret scan and cannot be configured by anybody.
+        """
+        import shutil
+        import subprocess
+        if shutil.which("git") is None or not (REPO / ".git").exists():
+            self.skipTest("no git checkout to interrogate")
+
+        def ignored(path):
+            return subprocess.run(["git", "check-ignore", "-q", path],
+                                  cwd=REPO, capture_output=True).returncode == 0
+
+        # Positive control: prove check-ignore can say IGNORED here at all,
+        # or a clean sweep below would mean nothing.
+        self.assertTrue(ignored("definitely-a-secret.env"),
+                        "control failed - check-ignore reports nothing ignored")
+
+        for secret in ("netwatch.env", "services/etc/gardyn/netwatch.env",
+                       ".env", "sub/dir/x.env"):
+            with self.subTest(path=secret):
+                self.assertTrue(ignored(secret), f"{secret} is committable")
+
+        for template in ("services/etc/gardyn/netwatch.env.example", ".env-dist"):
+            with self.subTest(path=template):
+                self.assertFalse(ignored(template),
+                                 f"{template} is ignored - the repo cannot be set up")
+
+        tracked = subprocess.run(["git", "ls-files"], cwd=REPO,
+                                 capture_output=True, text=True).stdout.split()
+        self.assertIn("services/etc/gardyn/netwatch.env.example", tracked)
+        self.assertEqual([f for f in tracked if f.endswith(".env")], [])
+
+    def test_the_template_carries_no_real_address_or_uuid(self):
+        text = TEMPLATE.read_text()
+        for line in text.splitlines():
+            if not line.startswith("GARDYN_NETWATCH_"):
+                continue
+            key, _, value = line.partition("=")
+            if key == nw.KEY_TCP_PORT:
+                continue
+            with self.subTest(key=key):
+                self.assertIn(nw.PLACEHOLDER, value.upper())
 
 
 class TestDecideIsPure(unittest.TestCase):
