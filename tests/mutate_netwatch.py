@@ -63,6 +63,12 @@ _REBOOT_SAVE_LAST = """        print(format_record(action, reason, results, upti
             return 0"""
 SRC = "bin/gardyn-netwatch.py"
 UNIT = "services/etc/systemd/system/mqtt.service"
+INSTALLER = "bin/install-systemd-units.sh"
+
+# Taken verbatim from the source rather than retyped: this line is dense with
+# backslashes and quotes, and a retyped anchor that silently matches nothing
+# would report a survivor for a mutation that never happened.
+_ESCAPE_LINE = '        escaped = text.replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\')'
 TEMPLATE = "services/etc/gardyn/netwatch.env.example"
 
 TEST_MODULES = ("tests.test_netwatch", "tests.test_setup_units")
@@ -74,6 +80,7 @@ SUITES_FOR = {
     SRC: ("tests.test_netwatch",),
     TEMPLATE: ("tests.test_netwatch",),
     UNIT: TEST_MODULES,
+    INSTALLER: ("tests.test_setup_units",),
 }
 
 # (name, file, old, new) — `old` must appear exactly once in `file`.
@@ -101,9 +108,9 @@ MUTATIONS = [
      "MAX_PING_TARGETS = _max_ping_targets()", "MAX_PING_TARGETS = 99"),
     ("port range check dropped", SRC,
      "        if not 1 <= port <= 65535:", "        if False:"),
-    ("non-numeric port coerced instead of refused", SRC,
-     '            raise ConfigError("config_bad_port",\n                              f"{KEY_TCP_PORT} is not an integer") from None',
-     "            port = DEFAULT_TCP_PORT"),
+    ("non-numeric port coerced to the default instead of refused", SRC,
+     '            raise ConfigError("config_bad_port",\n                              f"{KEY_TCP_PORT} is not a plain decimal integer")\n        port = int(raw_port, 10)',
+     "            port = DEFAULT_TCP_PORT\n        else:\n            port = int(raw_port, 10)"),
     ("a connection NAME accepted where a UUID belongs", SRC,
      "    if not _UUID_RE.match(uuid):", "    if False:"),
     ("uuid trailing anchor dropped - a uuid with junk appended passes", SRC,
@@ -117,6 +124,41 @@ MUTATIONS = [
     ("config loaded AFTER the probes run", SRC,
      "    try:\n        cfg = load_config(CONFIG_PATH)",
      "    ping('probe-before-config-check')\n    try:\n        cfg = load_config(CONFIG_PATH)"),
+
+    ("host shape check removed - a target ping reads as a FLAG is accepted", SRC,
+     "        if not _HOST_RE.match(target):", "        if False:"),
+    ("host shape check loosened to allow a leading dash", SRC,
+     r'_HOST_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]*\Z")',
+     r'_HOST_RE = re.compile(r"\A[A-Za-z0-9-][A-Za-z0-9._:-]*\Z")'),
+    ("tcp host shape check removed", SRC,
+     "    if not _HOST_RE.match(tcp_host):", "    if False:"),
+    ("minimum target count dropped - one host answers for the whole LAN", SRC,
+     "    if len(targets) < MIN_PING_TARGETS:", "    if False:"),
+    ("minimum target count lowered to one", SRC,
+     "MIN_PING_TARGETS = 2", "MIN_PING_TARGETS = 1"),
+    ("port strictness dropped back to a bare int()", SRC,
+     "        if not (raw_port.isascii() and raw_port.isdigit()):",
+     "        if False:"),
+    ("undecodable config file raises instead of refusing", SRC,
+     "    except (OSError, UnicodeDecodeError):\n        return None",
+     "    except OSError:\n        return None"),
+    ("undecodable bytes SALVAGED into a config value", SRC,
+     "        with open(path) as handle:",
+     '        with open(path, errors="replace") as handle:'),
+    ("logfmt quoting no longer escapes an embedded quote", SRC,
+     _ESCAPE_LINE, "        escaped = text"),
+    # --------------------------------------------------- installer preflight
+    ("installer arms the watchdog with no config file", INSTALLER,
+     '            if [ ! -s "$NETWATCH_CONFIG" ]; then', "            if false; then"),
+    ("installer accepts a zero-byte config", INSTALLER,
+     '            if [ ! -s "$NETWATCH_CONFIG" ]; then',
+     '            if [ ! -e "$NETWATCH_CONFIG" ]; then'),
+    ("installer downgrades the missing config to a warning", INSTALLER,
+     '                record_failure "$u: NOT enabled - $NETWATCH_CONFIG is missing or empty.',
+     '                log_warn "$u: NOT enabled - $NETWATCH_CONFIG is missing or empty.'),
+    ("installer default config path silently changed", INSTALLER,
+     'NETWATCH_CONFIG="${GARDYN_NETWATCH_CONFIG:-/etc/gardyn/netwatch.env}"',
+     'NETWATCH_CONFIG="${GARDYN_NETWATCH_CONFIG:-/etc/gardyn/netwatch.env.bak}"'),
 
     # ------------------------------------------- reintroduced hardcoding
     # These ADD code back rather than break code that is present, which is the

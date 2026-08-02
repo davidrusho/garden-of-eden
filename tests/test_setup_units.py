@@ -113,7 +113,7 @@ class Sandbox:
     PI_FILES = ("venv/bin/python", "bin/gardyn-health-log.py",
                 "bin/gardyn-netwatch.py", "mqtt.py")
 
-    def __init__(self, units=None, runnable=True):
+    def __init__(self, units=None, runnable=True, netwatch_config=True):
         self.root = tempfile.mkdtemp(prefix="t477-")
         self.repo = os.path.join(self.root, "repo")
         self.src = os.path.join(self.repo, "services", "etc", "systemd", "system")
@@ -135,6 +135,18 @@ class Sandbox:
 
         shutil.copy(INSTALLER, os.path.join(self.repo, "bin",
                                             "install-systemd-units.sh"))
+
+        # gardyn-netwatch has no default network topology and refuses to run
+        # without this file, so the installer refuses to ARM it without one.
+        # A healthy Pi has it; `netwatch_config=False` reproduces a first
+        # deploy that does not.
+        self.netwatch_config = os.path.join(self.root, "netwatch.env")
+        if netwatch_config:
+            with open(self.netwatch_config, "w") as fh:
+                fh.write("GARDYN_NETWATCH_PING_TARGETS=192.0.2.1,192.0.2.9\n"
+                         "GARDYN_NETWATCH_TCP_HOST=192.0.2.9\n"
+                         "GARDYN_NETWATCH_WLAN_UUID="
+                         "11111111-2222-3333-4444-555555555555\n")
 
         self.fakeroot = os.path.join(self.root, "fakeroot")
         if runnable:
@@ -178,6 +190,7 @@ class Sandbox:
         env["SYSTEMCTL_LOG"] = self.log
         env["SYSTEMCTL_FAIL_ON"] = fail_on
         env["SUDO_LOG"] = self.sudo_log
+        env["GARDYN_NETWATCH_CONFIG"] = self.netwatch_config
         return subprocess.run(
             ["bash", os.path.join(self.repo, "bin", "install-systemd-units.sh")]
             + list(args),
@@ -584,6 +597,71 @@ class InstallerFailureTests(unittest.TestCase):
         proc = box.run(fail_on="start mqtt.service")
         self.assertNotEqual(0, proc.returncode)
         self.assertIn("start mqtt.service failed", proc.stderr)
+
+    def test_the_installer_and_the_watchdog_agree_on_the_config_PATH(self):
+        """Two files name /etc/gardyn/netwatch.env independently, and nothing
+        in the sandbox exercises either default - the harness always overrides
+        it. A silent drift between them is the worst shape available: the
+        installer would green-light a file the watchdog never reads, which is
+        exactly the false all-clear this check exists to remove."""
+        installer = read(INSTALLER).decode()
+        script = read(os.path.join(REPO, "bin", "gardyn-netwatch.py")).decode()
+        self.assertIn(
+            'NETWATCH_CONFIG="${GARDYN_NETWATCH_CONFIG:-/etc/gardyn/netwatch.env}"',
+            installer)
+        self.assertIn(
+            'os.environ.get("GARDYN_NETWATCH_CONFIG", "/etc/gardyn/netwatch.env")',
+            script)
+
+    def test_netwatch_is_NOT_armed_without_its_config(self):
+        """The same defect Type=exec closes for mqtt.service, one layer out.
+
+        gardyn-netwatch refuses to run without /etc/gardyn/netwatch.env, but
+        only once the TIMER has fired - which no part of install/enable/start
+        can observe. Without this check a first deploy onto a host with no
+        config is a fully green run over a watchdog that then fails every two
+        minutes forever.
+        """
+        box = Sandbox(netwatch_config=False)
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("netwatch.env", proc.stderr)
+        calls = box.systemctl_calls()
+        self.assertNotIn("enable gardyn-netwatch.timer", calls)
+        self.assertNotIn("start gardyn-netwatch.timer", calls)
+        self.assertNotIn("restart gardyn-netwatch.timer", calls)
+
+    def test_a_missing_netwatch_config_does_not_strand_the_other_units(self):
+        """It is recorded, not fatal. The grow-light controller is the thing
+        that must come up, and refusing to arm a watchdog is no reason to
+        leave the controller down."""
+        box = Sandbox(netwatch_config=False)
+        self.addCleanup(box.cleanup)
+        box.run()
+        calls = box.systemctl_calls()
+        self.assertIn("enable mqtt.service", calls)
+        self.assertIn("enable gardyn-health-log.timer", calls)
+
+    def test_an_EMPTY_netwatch_config_is_refused_like_a_missing_one(self):
+        """A truncated edit or a half-finished `install` leaves a zero-byte
+        file. gardyn-netwatch rejects it; so must the installer, or the two
+        disagree about whether the host is configured."""
+        box = Sandbox(netwatch_config=False)
+        self.addCleanup(box.cleanup)
+        open(box.netwatch_config, "w").close()
+        proc = box.run()
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("enable gardyn-netwatch.timer", box.systemctl_calls())
+
+    def test_netwatch_IS_armed_when_the_config_is_present(self):
+        """The positive control. Without it every assertion above is satisfied
+        by an installer that never arms the watchdog at all."""
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        proc = box.run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("enable gardyn-netwatch.timer", box.systemctl_calls())
 
     def test_a_masked_destination_is_refused_and_left_intact(self):
         """`systemctl mask` links the unit to /dev/null; GNU install would

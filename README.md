@@ -168,11 +168,16 @@ sudoedit /etc/gardyn/netwatch.env        # replace every CHANGEME
 
 Find the wlan0 profile's UUID with `nmcli -g UUID,NAME,DEVICE connection show`.
 
+`bin/install-systemd-units.sh` refuses to enable or start the watchdog while
+that file is missing or empty, and exits non-zero saying so — the other units
+are still installed and armed, so a missing config never keeps the grow-light
+controller down.
+
 Every incomplete state — the file absent, a key missing or blank, a `CHANGEME`
-left in place, a port that is not a number, a connection name where a UUID
-belongs — makes the watchdog refuse to run and exit non-zero, so `systemctl
-status gardyn-netwatch` shows a failed unit and the reason lands on the
-journal:
+left in place, a port that is not a number, fewer than two ping targets, a
+target `ping` would read as an option, a connection name where a UUID belongs —
+makes the watchdog refuse to run and exit non-zero, so `systemctl status
+gardyn-netwatch` shows a failed unit and the reason lands on the journal:
 
 ```
 journalctl -t gardyn-netwatch --since -1h
@@ -184,11 +189,17 @@ a watchdog quietly deciding a stranger's network is down and rebooting their
 machine is worse than one that does not start.
 
 > **Upgrading an existing install: create the file BEFORE deploying the new
-> script.** The unit is armed by a timer every two minutes, so a Pi that pulls
-> this change without `/etc/gardyn/netwatch.env` in place gets a failed
-> `gardyn-netwatch` run on every tick — noisy, and with no network watchdog
-> running until the file exists. Nothing else is affected: the grow-light
-> controller (`mqtt.service`) does not read this file.
+> script.** The timer is already enabled on a host that has been running the
+> watchdog, so the installer's refusal does not disarm it — it keeps firing
+> every two minutes and every run fails until the config exists. Noisy, and
+> with no network watchdog in the meantime. Nothing else is affected: the
+> grow-light controller (`mqtt.service`) does not read this file.
+>
+> That same deploy restarts `mqtt.service`, because its unit file changed. With
+> `Type=exec` the installer now blocks on that unit's `execve()` and **fails
+> the run if the venv is broken**, where it previously reported success. That
+> is the intent, but it means the first run after this change can go red on a
+> host whose Python environment was already unusable.
 
 ## Usage
 

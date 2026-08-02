@@ -34,10 +34,19 @@
 # NOTHING IS ENABLED THAT CANNOT RUN. A unit whose ExecStart names a path that
 # does not exist on this host is installed but not enabled, and the run exits
 # non-zero. That matters because this is a PUBLIC repository: gardyn-netwatch
-# is a watchdog that can REBOOT the host and is hardcoded for one specific LAN,
-# so a checkout somewhere else must not quietly end up with it armed. The gate
-# is not sufficient for a fork that happens to match these paths - see the
-# README - but it makes the common case safe.
+# is a watchdog that can REBOOT the host, so a checkout somewhere else must not
+# quietly end up with it armed. The gate is not sufficient for a fork that
+# happens to match these paths - see the README - but it makes the common case
+# safe.
+#
+# "Can run" now means more than "its ExecStart exists". gardyn-netwatch refuses
+# to start without /etc/gardyn/netwatch.env, which carries the ping targets and
+# the wlan0 profile it acts on; those have no default, deliberately. That
+# refusal is loud, but it only happens once the TIMER has fired, and nothing in
+# install/enable/start can see it - so a first deploy onto a host with no config
+# would produce a completely green run over a watchdog that then fails on every
+# tick. The check below is the same idea as mqtt.service's Type=exec, one layer
+# out: a component that cannot possibly work must not be reported as armed.
 #
 # Safe to re-run. A unit whose deployed copy already matches is re-installed
 # (cheap, idempotent) but NOT restarted, so routine setup runs do not bounce
@@ -77,8 +86,9 @@
 # the .needs-restart markers exist.
 #
 # Environment seams, both defaulted for real use and overridden only by tests:
-#   SYSTEMD_UNIT_DIR      where units are installed  (default /etc/systemd/system)
-#   GARDYN_UNIT_SRC_DIR   where they are read from   (default <repo>/services/...)
+#   SYSTEMD_UNIT_DIR        where units are installed  (default /etc/systemd/system)
+#   GARDYN_UNIT_SRC_DIR     where they are read from   (default <repo>/services/...)
+#   GARDYN_NETWATCH_CONFIG  the watchdog's config      (default /etc/gardyn/netwatch.env)
 
 # No `set -u`: macOS ships bash 3.2, where `${#arr[@]}` on an empty array is an
 # unbound-variable error. Failures are handled explicitly instead.
@@ -210,6 +220,7 @@ INSTALL_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 
 UNIT_SRC_DIR="${GARDYN_UNIT_SRC_DIR:-$INSTALL_DIR/services/etc/systemd/system}"
 UNIT_DEST_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+NETWATCH_CONFIG="${GARDYN_NETWATCH_CONFIG:-/etc/gardyn/netwatch.env}"
 
 [ -d "$UNIT_SRC_DIR" ] || fail "unit source directory not found: $UNIT_SRC_DIR"
 [ -d "$UNIT_DEST_DIR" ] || fail "systemd unit directory not found: $UNIT_DEST_DIR"
@@ -420,6 +431,19 @@ for u in ${installed[@]+"${installed[@]}"}; do
         record_failure "$u: NOT enabled - it names a path that does not exist on this host. These units are written for one specific deployment; see the README before running this elsewhere."
         continue
     fi
+
+    # `-s`, not `-e`: an empty file is a half-finished `install` or a truncated
+    # edit, and gardyn-netwatch rejects it exactly as it rejects an absent one.
+    # Deliberately NOT a ConditionPathExists= in the unit, which would SKIP the
+    # unit and report success - the quiet failure being removed, not a fix.
+    case "$u" in
+        gardyn-netwatch.*)
+            if [ ! -s "$NETWATCH_CONFIG" ]; then
+                record_failure "$u: NOT enabled - $NETWATCH_CONFIG is missing or empty. gardyn-netwatch has no default network topology and refuses to run without it; copy services/etc/gardyn/netwatch.env.example there and fill it in."
+                continue
+            fi
+            ;;
+    esac
 
     # A timer whose service was refused (masked destination, failed install) must
     # not be armed - it would fire against whatever is deployed instead.

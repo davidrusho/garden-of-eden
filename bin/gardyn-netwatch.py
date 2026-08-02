@@ -129,6 +129,12 @@ PLACEHOLDER = "CHANGEME"
 
 DEFAULT_TCP_PORT = 1883
 
+# Two independent hosts, minimum. With one, that host rebooting is
+# indistinguishable from this Pi's radio dying — which is the entire reason
+# the ladder pings more than one thing, and is the same defect the duplicate
+# check below refuses. A cap without a floor only closes half of it.
+MIN_PING_TARGETS = 2
+
 STATE_PATH = "/var/lib/gardyn-netwatch/state.json"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
@@ -227,6 +233,20 @@ def _max_ping_targets() -> int:
 
 MAX_PING_TARGETS = _max_ping_targets()
 
+# A host token that is safe to hand to `ping` as argv and to render into a
+# logfmt key. The FIRST character is the load-bearing part: a value beginning
+# with `-` is read by ping(8) as an OPTION rather than a destination, so a
+# target of `-V` or `--flood` would be an operator-supplied flag on a command
+# this script runs. Whitespace and `#` are excluded for a second reason — they
+# survive into `probe_<host>_<port>=` and produce a log line that no longer
+# parses as logfmt, which matters because during an outage that line is the
+# only artifact anyone reads back.
+#
+# Known limitation, deliberate: a bare-colon IPv6 literal (`::1`) is refused
+# because the first character must be alphanumeric. The ping invocation here is
+# IPv4-only in any case, and `fe80::1` is accepted.
+_HOST_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+
 _UUID_RE = re.compile(
     r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
     r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
@@ -280,6 +300,14 @@ def build_config(env: dict) -> NetwatchConfig:
     targets = tuple(t for t in re.split(r"[,\s]+", env[KEY_TARGETS].strip()) if t)
     if not targets:
         raise ConfigError("config_no_targets", f"{KEY_TARGETS} names no host")
+    for target in targets:
+        if not _HOST_RE.match(target):
+            raise ConfigError("config_bad_target",
+                              f"{KEY_TARGETS} contains an implausible host")
+    if len(targets) < MIN_PING_TARGETS:
+        raise ConfigError("config_too_few_targets",
+                          f"{KEY_TARGETS} needs at least {MIN_PING_TARGETS} "
+                          "independent hosts")
     if len(set(targets)) != len(targets):
         # Two entries that are the same host are one modality wearing a hat:
         # that host rebooting then looks exactly like this Pi's radio dying,
@@ -297,11 +325,12 @@ def build_config(env: dict) -> NetwatchConfig:
         if PLACEHOLDER in raw_port.upper():
             raise ConfigError("config_placeholder",
                               f"{KEY_TCP_PORT} still holds the template placeholder")
-        try:
-            port = int(raw_port, 10)
-        except ValueError:
+        # `int()` alone accepts "1_883", "+1883" and Arabic-Indic digits, none
+        # of which anybody meant to write in a config file.
+        if not (raw_port.isascii() and raw_port.isdigit()):
             raise ConfigError("config_bad_port",
-                              f"{KEY_TCP_PORT} is not an integer") from None
+                              f"{KEY_TCP_PORT} is not a plain decimal integer")
+        port = int(raw_port, 10)
         if not 1 <= port <= 65535:
             raise ConfigError("config_bad_port",
                               f"{KEY_TCP_PORT} is outside 1-65535")
@@ -316,7 +345,12 @@ def build_config(env: dict) -> NetwatchConfig:
         raise ConfigError("config_bad_uuid",
                           f"{KEY_WLAN_UUID} is not a UUID")
 
-    return NetwatchConfig(targets=targets, tcp_host=env[KEY_TCP_HOST].strip(),
+    tcp_host = env[KEY_TCP_HOST].strip()
+    if not _HOST_RE.match(tcp_host):
+        raise ConfigError("config_bad_tcp_host",
+                          f"{KEY_TCP_HOST} is not a plausible host")
+
+    return NetwatchConfig(targets=targets, tcp_host=tcp_host,
                           tcp_port=port, wlan_uuid=uuid)
 
 
@@ -477,13 +511,22 @@ def decide(uptime_s: float, reachable: bool, state: dict,
 
 
 def _fmt(value) -> str:
-    """logfmt value: quote anything with a space, render None as a bare -."""
+    """logfmt value: quote anything with a space, render None as a bare -.
+
+    Embedded quotes and backslashes are escaped rather than emitted raw. An
+    operator-supplied string reaches this via a ConfigError detail, and an
+    unescaped quote closes the field early — producing a line that parses, but
+    into the wrong fields, which is worse than one that visibly does not.
+    """
     if value is None:
         return "-"
     if isinstance(value, bool):
         return "true" if value else "false"
     text = str(value)
-    return f'"{text}"' if " " in text else text
+    if " " in text or '"' in text:
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return text
 
 
 def format_record(action: str, reason: str, results: dict, uptime_s: float | None,
@@ -619,10 +662,23 @@ def reboot() -> str:
 
 
 def _read(path: str) -> str | None:
+    """Read a file, or None if it cannot be read AS TEXT.
+
+    UnicodeDecodeError is caught alongside OSError because a file that exists
+    and is unreadable is the same fact to every caller here, and the decode
+    happens OUTSIDE load_state() — so without this, `load_state`'s "never
+    raises" promise is false for a state file corrupted into invalid UTF-8,
+    and a bad config file exits 1 with a traceback instead of 2 with a named
+    reason on the journal.
+
+    Deliberately NOT `errors="replace"`: measured, that ACCEPTS the corrupt
+    config and yields a ping target with a U+FFFD in it. Refusing to read is
+    the whole point; salvaging bytes is strictly worse than not reading them.
+    """
     try:
         with open(path) as handle:
             return handle.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 

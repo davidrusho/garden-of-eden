@@ -890,6 +890,13 @@ class TestFormatRecord(unittest.TestCase):
         self.assertIn("uptime_s=-", nw.format_record("stand_down", "no_uptime", {},
                                                      None, state(), CFG))
 
+    def test_an_embedded_quote_is_escaped_not_emitted_raw(self):
+        """An operator-supplied string reaches this through a ConfigError
+        detail. A raw quote closes the field early, so the line still parses -
+        into the wrong fields, which is worse than one that visibly does not."""
+        self.assertEqual(nw._fmt('a "weird" v'), '"a \\"weird\\" v"')
+        self.assertEqual(nw._fmt("back\\slash here"), '"back\\\\slash here"')
+
     def test_values_with_spaces_are_quoted(self):
         self.assertIn('outcome="a b"',
                       nw.format_record("none", "r", {}, 1.0, state(), CFG, "a b"))
@@ -1035,6 +1042,64 @@ class TestBuildConfig(unittest.TestCase):
         self._refuses("config_duplicate_targets",
                       GARDYN_NETWATCH_PING_TARGETS="192.0.2.1,192.0.2.1")
 
+    def test_a_single_target_is_refused(self):
+        """One host answering for the whole LAN means that host rebooting is
+        indistinguishable from this Pi's radio dying. The base version pinned
+        two DISTINCT targets as a module constant; with the value now supplied
+        by an operator, the floor has to be enforced rather than assumed."""
+        self._refuses("config_too_few_targets",
+                      GARDYN_NETWATCH_PING_TARGETS="192.0.2.1")
+
+    def test_the_minimum_is_two_and_the_cap_leaves_room_for_it(self):
+        self.assertEqual(nw.MIN_PING_TARGETS, 2)
+        self.assertGreaterEqual(nw.MAX_PING_TARGETS, nw.MIN_PING_TARGETS)
+
+    def test_a_target_that_ping_would_read_as_a_FLAG_is_refused(self):
+        """These reach `ping` as argv. A value starting with `-` is an option,
+        not a destination, so an operator-supplied config would be choosing
+        flags for a command this script runs — and a flag like `-V` exits 0,
+        which the probe reads as `reachable` forever."""
+        for bad in ("-V", "--flood", "-w", "-f"):
+            with self.subTest(target=bad):
+                self._refuses("config_bad_target",
+                              GARDYN_NETWATCH_PING_TARGETS=f"{bad},192.0.2.9")
+
+    def test_a_trailing_COMMENT_on_the_target_list_is_refused(self):
+        """`# gw` on the end of a value is not stripped - systemd does not
+        strip it either - and whitespace is a target SEPARATOR here, so the
+        line silently becomes three targets of which `#` is one. It would then
+        land in the logfmt key as `probe_#_...`, producing a record that no
+        longer parses. Refusing the token is the only place to catch it."""
+        self._refuses("config_bad_target",
+                      GARDYN_NETWATCH_PING_TARGETS="192.0.2.1 # gw")
+
+    def test_whitespace_between_targets_is_still_just_a_separator(self):
+        """The control for the test above: the refusal must come from the `#`,
+        not from whitespace, or space-separated lists stop working."""
+        cfg = nw.build_config(nw.parse_env(cfg_text(
+            GARDYN_NETWATCH_PING_TARGETS="192.0.2.1\t192.0.2.9")))
+        self.assertEqual(cfg.targets, ("192.0.2.1", "192.0.2.9"))
+
+    def test_an_implausible_tcp_host_is_refused(self):
+        """Same reasoning, and it bites harder: an unusable tcp_host resolves
+        to a permanent `None`, so the one probe the docstring says carries the
+        whole decision when wlan0 is down is silently dead."""
+        for bad in ("192.0.2.9 # broker", "-V", "", "  "):
+            with self.subTest(host=bad):
+                with self.assertRaises(nw.ConfigError) as ctx:
+                    nw.build_config(nw.parse_env(cfg_text(
+                        GARDYN_NETWATCH_TCP_HOST=bad)))
+                self.assertIn(ctx.exception.reason,
+                              ("config_bad_tcp_host", "config_missing_key"))
+
+    def test_a_hostname_is_still_accepted(self):
+        """The shape check must not force IP literals - the deployment may
+        move to names, and over-tightening here would refuse a valid config."""
+        cfg = nw.build_config(nw.parse_env(cfg_text(
+            GARDYN_NETWATCH_PING_TARGETS="gw.example,broker.example",
+            GARDYN_NETWATCH_TCP_HOST="broker.example")))
+        self.assertEqual(cfg.targets, ("gw.example", "broker.example"))
+
     def test_more_targets_than_the_run_budget_allows_is_refused(self):
         many = ",".join(f"192.0.2.{n}" for n in range(1, nw.MAX_PING_TARGETS + 2))
         self._refuses("config_too_many_targets", GARDYN_NETWATCH_PING_TARGETS=many)
@@ -1046,7 +1111,10 @@ class TestBuildConfig(unittest.TestCase):
         self.assertEqual(len(cfg.targets), nw.MAX_PING_TARGETS)
 
     def test_a_malformed_or_out_of_range_port_is_refused(self):
-        for bad in ("1883x", "", "-1", "0", "65536", "1e3", " 18 83"):
+        # "1_883", "+1883" and Arabic-Indic digits are all accepted by a bare
+        # int(), and none of them is something anyone meant to write.
+        for bad in ("1883x", "", "-1", "0", "65536", "1e3", " 18 83",
+                    "1_883", "+1883", "\u0661\u0668\u0668\u0663"):
             if bad == "":
                 continue  # empty means "use the default", covered below
             with self.subTest(port=bad):
@@ -1090,6 +1158,18 @@ class TestLoadConfig(unittest.TestCase):
             with self.assertRaises(nw.ConfigError) as ctx:
                 nw.load_config(str(path))
             self.assertEqual(ctx.exception.reason, "config_empty")
+
+    def test_a_file_that_is_not_valid_TEXT_is_refused_not_raised(self):
+        """A traceback is not a refusal: it exits 1 with nothing on the
+        journal, so the named reason the operator needs never appears. The
+        decode happens outside load_state(), so this also unblocks that
+        function's "never raises" promise for a corrupted state file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "binary.env"
+            path.write_bytes(b"GARDYN_NETWATCH_PING_TARGETS=192.0.2.1\xff\n")
+            with self.assertRaises(nw.ConfigError) as ctx:
+                nw.load_config(str(path))
+            self.assertEqual(ctx.exception.reason, "config_unreadable")
 
     def test_a_real_file_round_trips(self):
         with tempfile.TemporaryDirectory() as tmp:
