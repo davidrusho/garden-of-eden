@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Reviewed: 2026-08-01 against f3b7689 (T-478) — that review found the live AP's
+#   BSSID committed to a PUBLIC repo (a BSSID is the primary key in the Wi-Fi
+#   geolocation databases) and an unpinned timeout on the new iw call; both are
+#   fixed ABOVE that sha, each with its own mutation. It also confirmed the
+#   absent-vs-zero handling end to end against the real binary.
 # Reviewed: 2026-07-31 against 7d82d25 (T-473.2)
 # Reviewed: 2026-07-31 against 4e6edd0 (T-479) — that review found two real
 #   defects (a permanently-green freshness axis, a false page on timer re-arm)
@@ -508,9 +513,12 @@ def resolve_iw(candidates=IW_CANDIDATES) -> str | None:
 def parse_iw_station_dump(raw: str | None) -> dict:
     """Pull the uplink counters out of `iw dev <iface> station dump`.
 
-    Live shape on this host (tabs between key and value):
+    Live shape on this host (tabs between key and value). The BSSID below is a
+    locally-administered placeholder, NOT the real AP: this repo is public, and
+    a BSSID is the primary key in the public Wi-Fi geolocation databases, so
+    publishing the real one resolves to an approximate street address.
 
-        Station 04:bc:9f:63:37:76 (on wlan0)
+        Station 02:00:00:00:00:01 (on wlan0)
                 tx packets:     10178
                 tx failed:      947
                 tx bitrate:     5.5 MBit/s
@@ -710,8 +718,14 @@ def main() -> int:
 
     # T-478: the uplink half. One `iw` call yields both tx counters; keeping it
     # to one subprocess matters on a single-core ARMv6 host where the unit's
-    # 60s TimeoutStartSec already has only ~25s of margin. No unit-file change
-    # is needed for this, so deploying it is a file copy with no daemon-reload.
+    # 60s TimeoutStartSec is already spoken for. Be precise about the cost: the
+    # call is bounded by _run's 5s default, so the unit file's stated ~35s worst
+    # case becomes ~40s and its "~25s margin" comment now reads ~20s. Measured
+    # cost is 23-30ms, so the margin is theoretical, but it is not UNCHANGED --
+    # the unit file's arithmetic is stale until someone edits it, and that edit
+    # is deliberately not made here, because changing the unit turns this from a
+    # file copy into an install + restart. No unit-file change is needed for
+    # this, so deploying it is a file copy with no daemon-reload.
     iw_bin = resolve_iw()
     if iw_bin is None:
         station = {"error": "not_installed"}

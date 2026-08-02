@@ -112,6 +112,12 @@ MUTATIONS = [
      "PUSH_TIMEOUT_S = 5.0", "PUSH_TIMEOUT_S = 60.0"),
     ("push timeout removed entirely", SRC,
      "urlopen(f\"{base}?{query}\", timeout=timeout)", 'urlopen(f"{base}?{query}")'),
+    ("iw timeout widened past the unit's own bound", SRC,
+     '        st_out, st_err = _run([iw_bin, "dev", WLAN_IFACE, "station", "dump"])',
+     '        st_out, st_err = _run([iw_bin, "dev", WLAN_IFACE, "station", "dump"], timeout=90.0)'),
+    ("shared subprocess bound widened past the unit's own", SRC,
+     "def _run(cmd: list[str], timeout: float = 5.0)",
+     "def _run(cmd: list[str], timeout: float = 90.0)"),
     ("response read unbounded", SRC,
      "response.read(512)", "response.read()"),
 

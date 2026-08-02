@@ -12,6 +12,7 @@ Run from the repo root:
 """
 import contextlib
 import importlib.util
+import inspect
 import io
 import pathlib
 import shlex
@@ -952,9 +953,13 @@ class TestMainNetwatchWiring(unittest.TestCase):
 
 
 class TestParseIwStationDump(unittest.TestCase):
-    # Captured verbatim: `iw dev wlan0 station dump` on gardyn, 2026-08-01.
+    # Captured from `iw dev wlan0 station dump` on gardyn, 2026-08-01, then
+    # trimmed to the keys under test -- the real output also carries
+    # authenticated, WMM/WME, TDLS peer, DTIM period, short preamble and short
+    # slot time. The BSSID is a locally-administered placeholder, not the real
+    # AP: this repo is public and a BSSID geolocates.
     LIVE = (
-        "Station 04:bc:9f:63:37:76 (on wlan0)\n"
+        "Station 02:00:00:00:00:01 (on wlan0)\n"
         "\tinactive time:\t0 ms\n"
         "\trx bytes:\t9218850\n"
         "\trx packets:\t61996\n"
@@ -1142,9 +1147,15 @@ class TestStationEndToEnd(unittest.TestCase):
     def _drive(self, iw_result=None, iw_bin="/usr/sbin/iw"):
         buf = io.StringIO()
         calls = []
+        # Kept beside `calls` rather than folded into it: the assertions below
+        # compare `calls` to a plain command list, and widening those elements
+        # to tuples would have meant editing tests this one has nothing to do
+        # with.
+        self.run_timeouts = []
 
         def fake_run(cmd, timeout=5.0):
             calls.append(cmd)
+            self.run_timeouts.append((cmd, timeout))
             if cmd[0] == "vcgencmd":
                 return ("throttled=0x0\n", None)
             if cmd[0] == "nmcli":
@@ -1192,6 +1203,28 @@ class TestStationEndToEnd(unittest.TestCase):
         # the unit's remaining TimeoutStartSec margin on a single-core host.
         rc, rec, calls, out = self._drive()
         self.assertEqual(len([c for c in calls if c[0].endswith("iw")]), 1)
+
+    def test_the_iw_call_stays_within_the_shared_subprocess_bound(self):
+        # Nothing pinned this until a review went looking: adding
+        # `timeout=90.0` to the iw call survived the whole suite. The unit
+        # allows 60s in total, so a wedged radio would hold the oneshot past
+        # TimeoutStartSec and systemd would kill the SAMPLE - taking throttled,
+        # nm_state and the netwatch verdict down with the counters, which is
+        # the one outcome the "one line, always" contract exists to prevent.
+        # The push timeout already has two mutants; this call had none.
+        self._drive()
+        iw_timeouts = [t for cmd, t in self.run_timeouts if cmd[0].endswith("iw")]
+        self.assertEqual(len(iw_timeouts), 1)
+
+        # Two assertions, because they fail for different edits. The first
+        # catches an explicit widening at THIS call site; the second catches a
+        # widening of the shared default, which the first cannot see because
+        # both sides would move together.
+        shared_default = inspect.signature(hl._run).parameters["timeout"].default
+        self.assertEqual(iw_timeouts[0], shared_default)
+        self.assertLessEqual(
+            iw_timeouts[0], 10.0,
+            "the iw probe must stay far inside the unit's 60s TimeoutStartSec")
 
     def test_iw_absent_says_so_and_still_emits_the_sample(self):
         rc, rec, calls, out = self._drive(iw_bin=None)
