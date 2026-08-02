@@ -296,6 +296,38 @@ class TrackedUnitContentTests(unittest.TestCase):
         self.assertRegex(text, r"(?m)^Wants=network-online\.target$")
         self.assertRegex(text, r"(?m)^After=.*network-online\.target")
 
+    def test_mqtt_unit_declares_Type_exec_so_a_broken_start_is_VISIBLE(self):
+        """The default Type=simple made every guard in front of this unit
+        decorative. systemd.service(5): under `simple` "systemctl start command
+        lines ... will report success even if the service's binary cannot be
+        invoked successfully"; under `exec` they "report failure". Measured on
+        systemd 255 with an ExecStart naming a path that does not exist:
+        `systemctl start` exits 0 with no Type= and with Type=simple, and 1
+        with Type=exec.
+
+        Line-anchored for the same reason as the directives above - the unit's
+        own comment block names both `simple` and `exec`, so a substring test
+        would stay green after the directive was deleted.
+
+        Type=exec has been available since systemd 240; the Pi runs 252.
+        """
+        text = read(os.path.join(UNIT_SRC, "mqtt.service")).decode()
+        self.assertRegex(text, r"(?m)^Type=exec$")
+        self.assertNotRegex(text, r"(?m)^Type=simple$")
+
+    def test_no_shipped_service_relies_on_the_default_Type(self):
+        """A .service with no Type= at all is the shape the defect had: there
+        is nothing to grep for, so it reads as deliberate. Requiring the
+        declaration makes the choice explicit for every unit, including the
+        next one somebody adds."""
+        for name in sorted(EXPECTED_UNITS):
+            if not name.endswith(".service"):
+                continue
+            with self.subTest(unit=name):
+                text = read(os.path.join(UNIT_SRC, name)).decode()
+                self.assertRegex(text, r"(?m)^Type=\S+$",
+                                 f"{name} declares no Type=")
+
     def test_enableable_units_are_exactly_those_with_an_install_section(self):
         have_install = set()
         for name in EXPECTED_UNITS:

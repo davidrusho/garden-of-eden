@@ -12,6 +12,31 @@ After=network-online.target pigpiod.service
 StartLimitIntervalSec=0
 
 [Service]
+# NOT the default Type=simple. Under `simple` systemd considers the unit
+# started as soon as fork() returns, before execve() has been attempted at
+# all — systemd.service(5): "systemctl start command lines for simple
+# services will report success even if the service's binary cannot be invoked
+# successfully (for example because the selected User= doesn't exist, or the
+# service binary is missing)." That made the `|| record_failure` guard in
+# bin/install-systemd-units.sh unable to fire for the one unit that matters:
+# a rebuilt-but-broken venv, a missing interpreter or an import error at
+# startup all produced a green `systemctl start` and a green installer run
+# over a dead grow-light controller.
+#
+# Type=exec waits for both fork() AND execve() to succeed — same page:
+# "systemctl start command lines for exec services will report failure when
+# the service's binary cannot be invoked successfully." Measured, not
+# assumed: with an ExecStart naming a path that does not exist, `systemctl
+# start` exits 0 under no-Type and under Type=simple, and exits 1 under
+# Type=exec.
+#
+# It does NOT wait for readiness — a process that execs and then dies on its
+# first broker connection still reports started. Closing that would need
+# Type=notify plus sd_notify() support in mqtt.py. Restart=always below is
+# what covers it today.
+#
+# Available since systemd 240; this host runs 252.
+Type=exec
 User=gardyn
 WorkingDirectory=/home/gardyn/garden-of-eden
 ExecStart=/home/gardyn/garden-of-eden/venv/bin/python /home/gardyn/garden-of-eden/mqtt.py
