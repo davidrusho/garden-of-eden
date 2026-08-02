@@ -24,8 +24,9 @@ Mechanics that have bitten this repo before, all handled here:
     file loads its target via spec_from_file_location, where that bites hardest.
   * stderr merged into stdout - unittest reports there, and 2>/dev/null would
     blank the very output being grepped.
-  * each mutated file diffed against a pristine copy, because a replacement
-    that matches nothing is indistinguishable from one that changed nothing.
+  * each mutated file compared against the source captured before the run,
+    because a replacement that matches nothing is indistinguishable from one
+    that changed nothing.
   * the tree is asserted byte-identical at the end.
 """
 import hashlib
@@ -33,7 +34,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIGHT = os.path.join(REPO, "app", "sensors", "light", "light.py")
@@ -131,11 +131,47 @@ def sha(path):
 
 
 def main():
-    pristine = tempfile.mkdtemp(prefix="lightmut-")
-    backup = os.path.join(pristine, "light.py")
-    shutil.copyfile(LIGHT, backup)          # not copy2: do NOT preserve mtime
+    originals = {LIGHT: open(LIGHT).read(), MQTT: open(MQTT).read()}
+    try:
+        return _run(originals)
+    finally:
+        _restore(originals)
+
+
+def _restore(originals):
+    """Put every mutated file back, whatever happened.
+
+    Without this a battery killed part-way through - ^C, a timeout, an
+    exception in the harness itself - leaves a mutant applied in the working
+    tree, which is a silent and plausible-looking change to shipping code.
+    Both files here run the garden: light.py drives the grow light and mqtt.py
+    is the controller.
+    """
+    errors = []
+    for path, text in originals.items():
+        # Each file independently: one loop abandons the rest the moment one
+        # raises, and it raises out of a `finally`, so the second file stays
+        # mutated with nothing reporting it.
+        try:
+            if sha(path) == hashlib.sha256(text.encode()).hexdigest():
+                continue
+        except OSError:
+            pass
+        try:
+            with open(path, "w") as fh:
+                fh.write(text)
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+    if errors:
+        raise OSError("could not restore: " + "; ".join(errors))
+
+
+def _run(originals):
+    # No stash directory: every early `return 2` below leaked one, and the copy
+    # it held was never read - _restore() rebuilds from `originals`, which is
+    # captured before anything runs.
     original_sha = sha(LIGHT)
-    original_src = open(LIGHT).read()
+    original_src = originals[LIGHT]
 
     print("=" * 68)
     print("CONTROL A - clean tree must be GREEN")
@@ -198,7 +234,7 @@ def main():
     # --- mqtt.py pass -------------------------------------------------------
     print("\n" + "=" * 68)
     print("mqtt.py policy mutants (scored by " + MQTT_SUITE + ")")
-    mqtt_src = open(MQTT).read()
+    mqtt_src = originals[MQTT]
     mqtt_sha = sha(MQTT)
 
     ok_m, _ = run_suite(MQTT_SUITE)
@@ -208,7 +244,11 @@ def main():
         return 2
     broken_m = mqtt_src.replace("logger.setLevel(logging.INFO)",
                                 "logger.setLevel(logging.CRITICAL)")
-    assert broken_m != mqtt_src, "control-B anchor missed"
+    if broken_m == mqtt_src:
+        # Not a bare `assert`: those are stripped under `python -O`, and every
+        # other control-B abort in this file prints and returns 2.
+        print("  ABORT: mqtt control-B anchor did not match. Harness is broken.")
+        return 2
     open(MQTT, "w").write(broken_m)
     ok_mb, _ = run_suite(MQTT_SUITE)
     open(MQTT, "w").write(mqtt_src)
@@ -245,7 +285,6 @@ def main():
 
     restored = sha(LIGHT) == original_sha and sha(MQTT) == mqtt_sha
     print(f"tree restored byte-identical: {restored}")
-    shutil.rmtree(pristine, ignore_errors=True)
 
     if survived:
         print("\nSURVIVORS - a survivor is a question about the CODE and the")

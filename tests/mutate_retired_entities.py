@@ -242,6 +242,30 @@ def sha(path):
 def main():
     original_src = open(MQTT).read()
     original_sha = sha(MQTT)
+    try:
+        return _run(original_src, original_sha)
+    finally:
+        _restore(original_src)
+
+
+def _restore(original_src):
+    """Put mqtt.py back, whatever happened.
+
+    Without this a battery killed part-way through - ^C, a timeout, an
+    exception in the harness itself - leaves a mutant applied in the working
+    tree, which is a silent and entirely plausible-looking change to the file
+    that runs the garden.
+    """
+    try:
+        if sha(MQTT) == hashlib.sha256(original_src.encode()).hexdigest():
+            return
+    except OSError:
+        pass
+    with open(MQTT, "w") as fh:
+        fh.write(original_src)
+
+
+def _run(original_src, original_sha):
 
     print("=" * 70)
     print("CONTROL A - clean tree must be GREEN")
