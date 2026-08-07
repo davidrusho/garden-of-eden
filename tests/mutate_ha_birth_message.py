@@ -134,12 +134,12 @@ MUTANTS = [
 
     # --- 9-11: the new branch's placement in on_message ----------------------
     ("delete the birth branch entirely - falls through, nothing announced",
-     "        if msg.topic == HA_STATUS_TOPIC:",
-     "        if False:"),
+     "        elif msg.topic == HA_STATUS_TOPIC:",
+     "        elif False:"),
 
     ("match by SUBSTRING - any topic ending in the right characters triggers",
-     "        if msg.topic == HA_STATUS_TOPIC:",
-     "        if HA_STATUS_TOPIC in msg.topic:"),
+     "        elif msg.topic == HA_STATUS_TOPIC:",
+     "        elif HA_STATUS_TOPIC in msg.topic:"),
 
     ("announce on EVERY message, not only the birth topic",
      "    try:\n        # === Home Assistant lifecycle ===",
@@ -152,9 +152,9 @@ MUTANTS = [
     # available in the change and it is mutated explicitly rather than left to
     # the kill count to imply.
     ("LEAK publisher threads: start them inside the shared announce",
-     "    publish_light_state(client)\n\n\ndef on_connect",
-     "    publish_light_state(client)\n"
-     "    start_publisher_threads(client)\n\n\ndef on_connect"),
+     "    _last_birth_announce = monotonic()\n",
+     "    _last_birth_announce = monotonic()\n"
+     "    start_publisher_threads(client)\n"),
 
     ("over-correct: drop start_publisher_threads from the connect path",
      "    start_publisher_threads(client)\n",
@@ -177,8 +177,8 @@ MUTANTS = [
      ""),
 
     ("drop the light-state republish - HA rebuilds the entity at `unknown`",
-     "    publish_light_state(client)\n\n\ndef on_connect",
-     "\n\ndef on_connect"),
+     "    publish_light_state(client)\n    # The single writer",
+     "    # The single writer"),
 
     ("drop the retired-entity clear from the announce",
      "    clear_retired_entities(client)\n",
@@ -215,23 +215,25 @@ MUTANTS = [
      "                if False:"),
 
     ("INVERT the debounce - announces only when it should be suppressed",
-     "    if (_last_birth_announce is not None\n"
-     "            and now - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS):",
-     "    if (_last_birth_announce is not None\n"
-     "            and now - _last_birth_announce > BIRTH_DEBOUNCE_SECONDS):"),
+     "            and monotonic() - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS)",
+     "            and monotonic() - _last_birth_announce > BIRTH_DEBOUNCE_SECONDS)"),
 
     ("make the debounce NEVER expire - one announce per process, ever",
      "    BIRTH_DEBOUNCE_SECONDS = 10",
      "    BIRTH_DEBOUNCE_SECONDS = 10"),  # placeholder, replaced below
 
     # --- 24-25: the topic-collision refusal ---------------------------------
-    ("delete the collision refusal - MQTT_BASETOPIC=homeassistant loops forever",
-     "    if STATUS_TOPIC == HA_STATUS_TOPIC:",
-     "    if False:"),
+    ("delete the subscribe-site collision refusal (the weaker half)",
+     "    if STATUS_TOPIC == HA_STATUS_TOPIC:\n"
+     "        logger.error(\n"
+     "            f\"NOT subscribing to {HA_STATUS_TOPIC}: BASE_TOPIC is \"",
+     "    if False:\n"
+     "        logger.error(\n"
+     "            f\"NOT subscribing to {HA_STATUS_TOPIC}: BASE_TOPIC is \""),
 
-    ("INVERT the collision check - healthy deployments stop self-healing",
-     "    if STATUS_TOPIC == HA_STATUS_TOPIC:",
-     "    if STATUS_TOPIC != HA_STATUS_TOPIC:"),
+    ("INVERT the handler collision guard - healthy deploys stop self-healing",
+     "        if msg.topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:",
+     "        if msg.topic == HA_STATUS_TOPIC and STATUS_TOPIC != HA_STATUS_TOPIC:"),
 
     # --- 26: an assumption the changed line rests on ------------------------
     ("drop .strip() - a padded payload silently stops being a birth message",
@@ -258,11 +260,59 @@ MUTANTS = [
      "                        announce_to_home_assistant(client)\n"
      "                    except Exception:\n"
      "                        pass"),
+
+    # --- 30-34: EVERY ONE OF THESE SURVIVED A REVIEWER'S RUN ----------------
+    # Built from the survivors of an independent battery rather than from my own
+    # list, which is the whole point: a kill count bounds only the mutants you
+    # thought of, and 29/29 was a perfect score on a set that missed all five.
+    ("read the WALL clock instead of monotonic() - NTP steps break the window",
+     "    return (_last_birth_announce is not None\n"
+     "            and monotonic() - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS)",
+     "    import time as _t\n"
+     "    return (_last_birth_announce is not None\n"
+     "            and _t.time() - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS)"),
+
+    ("SLIDING window - a suppressed birth pushes the deadline forward forever",
+     "    return (_last_birth_announce is not None\n"
+     "            and monotonic() - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS)",
+     "    global _last_birth_announce\n"
+     "    if (_last_birth_announce is not None\n"
+     "            and monotonic() - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS):\n"
+     "        _last_birth_announce = monotonic()\n"
+     "        return True\n"
+     "    return False"),
+
+    ("logger.exception -> logger.error, losing the traceback",
+     "        logger.exception(f\"Error handling message on topic {msg.topic}: {e}\")",
+     "        logger.error(f\"Error handling message on topic {msg.topic}: {e}\")"),
+
+    ("drop the handler-side collision guard - the echo loop comes back",
+     "        if msg.topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:",
+     "        if False:"),
+
+    ("stop stamping the clock on announce - the retained birth doubles up",
+     "    global _last_birth_announce\n"
+     "    _last_birth_announce = monotonic()\n",
+     ""),
+
+    # --- 35: the offline reset, which is what makes the window SAFE ---------
+    ("drop the offline reset - a genuine HA restart pair can be suppressed",
+     "                _last_birth_announce = None\n",
+     ""),
 ]
 
 # Mutant 23 needs a module-level anchor rather than the indented one above.
-MUTANTS[22] = (
-    "make the debounce NEVER expire - one announce per process, ever",
+# Located BY LABEL, not by index. It used to be `MUTANTS[22] = (...)`, which
+# review flagged: inserting any mutant above index 22 silently overwrites a
+# different one. That failed loudly rather than quietly (the orphaned
+# placeholder trips "replacement changed nothing" and lands in `unapplied`,
+# which returns non-zero) - but "fails loudly" is not a reason to keep a
+# footgun that a later edit re-arms.
+_DEBOUNCE_NEVER_EXPIRES = "make the debounce NEVER expire - one announce per process, ever"
+_idx = [i for i, m in enumerate(MUTANTS) if m[0] == _DEBOUNCE_NEVER_EXPIRES]
+assert len(_idx) == 1, f"expected exactly one {_DEBOUNCE_NEVER_EXPIRES!r} mutant"
+MUTANTS[_idx[0]] = (
+    _DEBOUNCE_NEVER_EXPIRES,
     "BIRTH_DEBOUNCE_SECONDS = 10",
     "BIRTH_DEBOUNCE_SECONDS = 86400",
 )

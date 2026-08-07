@@ -336,17 +336,115 @@ class TestTheBirthPathIsDebounced(BirthMessageTestBase):
         self.assertEqual(len(self.client.to(SURVIVING_DISCOVERY[0])), 1)
 
     def test_the_window_is_measured_on_the_monotonic_clock(self):
-        # This Pi has no RTC and takes its time from NTP after boot, so a wall
-        # clock can step - backwards, which would disable the debounce, or
-        # forwards, which would extend it past a real HA restart. Asserted by
-        # stepping a fake wall clock and checking the debounce does not care.
+        """Discriminating in exactly one direction, which the first try was not.
+
+        The original version advanced a fake monotonic clock by +1s and asserted
+        nothing was published. A mutant swapping monotonic() for time.time()
+        SURVIVED it: the fake was derived from whatever clock the module had just
+        used, and the assertion was the SUPPRESSED direction, which both clocks
+        produce (against a wall clock, `0 - 1.78e9` is also less than 10). The
+        test was satisfied by its own input twice over.
+
+        This version puts the two clocks in DISAGREEMENT and asserts the
+        announcing direction: monotonic says the window has passed, the wall
+        clock says it has not. Only a monotonic read announces.
+
+        The property matters because this Pi has no RTC and takes its time from
+        NTP after boot, so the wall clock steps - backwards, which would disable
+        the debounce, or forwards, which would extend it past a real HA restart.
+        """
         self._birth()
         self.client.calls.clear()
-        with patch.object(mqtt_mod, "monotonic",
-                          return_value=mqtt_mod._last_birth_announce + 1):
-            with patch("time.time", return_value=0):
+        stamped = mqtt_mod._last_birth_announce
+        with patch.object(mqtt_mod, "monotonic", return_value=stamped + 11):
+            with patch("time.time", return_value=stamped + 1):
                 self._birth()
-        self.assertEqual(self.client.calls, [])
+        self.assertEqual(
+            len(self.client.to(SURVIVING_DISCOVERY[0])), 1,
+            "the debounce is reading a clock other than monotonic()",
+        )
+
+    def test_the_debounce_reads_monotonic_in_the_source(self):
+        # The behavioural test above is the real one; this pins the SYMBOL,
+        # because the property is "which clock does it call" and a behavioural
+        # test can only ever reach that through its effects.
+        import inspect
+        src = inspect.getsource(mqtt_mod._birth_is_debounced)
+        self.assertIn("monotonic()", src)
+
+    def test_a_suppressed_birth_does_not_push_the_deadline_forward(self):
+        """The window is FIXED, not sliding - and nothing held that before.
+
+        Added after review, which ran the mutant and watched it survive. If a
+        suppressed birth also re-stamped the clock, a publisher writing `online`
+        every five seconds would suppress Home Assistant's genuine birth message
+        forever. That converts a rate limit into a permanent mute, which is the
+        outage this whole ticket exists to prevent, reached from the other side.
+
+        Neither existing case could see it: the flood test sends 50 births in a
+        tight loop, all inside the window either way, and the expiry test sets
+        the timestamp by hand and so bypasses the line entirely.
+        """
+        self._birth()
+        first_stamp = mqtt_mod._last_birth_announce
+        # A burst that must all be suppressed, and must not move the deadline.
+        for offset in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+            with patch.object(mqtt_mod, "monotonic",
+                              return_value=first_stamp + offset):
+                self._birth()
+        self.client.calls.clear()
+        # Just past the window measured from the FIRST announce. Under a sliding
+        # window this is only 2s after the last suppressed birth, and silent.
+        with patch.object(mqtt_mod, "monotonic",
+                          return_value=first_stamp + 11):
+            self._birth()
+        self.assertEqual(
+            len(self.client.to(SURVIVING_DISCOVERY[0])), 1,
+            "a suppressed birth pushed the deadline forward - a hostile "
+            "publisher could mute genuine re-announces indefinitely",
+        )
+
+    def test_an_offline_resets_the_debounce(self):
+        """An `online` after an `offline` is a new HA and is never suppressed.
+
+        This is what makes the 10-second window safe rather than merely short.
+        The window's justification is that HA takes tens of seconds to start -
+        true of HA's PROCESS, but HA publishes its birth on every MQTT CLIENT
+        connect, which is far cheaper: a broker restart, a network blip on HA's
+        side, or a config-entry reload, and a reload is exactly what unloads and
+        rediscovers every MQTT entity. Two of those inside ten seconds is
+        reachable.
+
+        HA publishes its LWT on both a clean shutdown and a crash, so the
+        offline branch is the boundary between two lifecycles. Resetting there
+        makes suppressing a genuine restart pair structurally impossible rather
+        than merely unlikely.
+        """
+        self._birth()
+        self.client.calls.clear()
+        self._birth("offline")
+        self._birth()  # immediately - well inside the window
+        self.assertEqual(
+            len(self.client.to(SURVIVING_DISCOVERY[0])), 1,
+            "a genuine HA restart inside the debounce window was suppressed",
+        )
+
+    def test_the_connect_announce_suppresses_a_retained_birth(self):
+        """The redundant announce LIFECYCLE_SUBSCRIPTIONS predicts by name.
+
+        If HA retains its birth message, this client receives an `online` the
+        moment it subscribes - milliseconds after on_connect already announced.
+        When only the birth path stamped the clock, that produced two full
+        announces back to back: the most predictable redundant announce in the
+        design, going straight through the mechanism built to stop it.
+        """
+        mqtt_mod.on_connect(self.client, None, None, 0)
+        self.client.calls.clear()
+        self._birth()
+        self.assertEqual(
+            self.client.calls, [],
+            "a retained birth arriving just after connect announced twice",
+        )
 
     def test_connect_is_never_debounced(self):
         # A reconnect must ALWAYS announce, whatever happened moments ago. The
@@ -421,6 +519,13 @@ class TestTheBirthPathSaysWhatItDid(BirthMessageTestBase):
         # command. But swallowed is not the same as observed: without this, a
         # re-announce that fails EVERY time is indistinguishable from one that
         # never fires, and both look like the original bug.
+        # ASSERTS THE TRACEBACK, not the message. The first version matched
+        # `any("boom" in line)`, and a mutant downgrading logger.exception() to
+        # logger.error() survived it - the formatted message contains "boom"
+        # either way. That is the same defect as the "offline" one two classes
+        # up, surviving in the neighbouring method after the first was fixed.
+        # Without the traceback there is no frame, no line number, and no cause
+        # chain for a failure on a host nobody can attach a debugger to.
         with patch.object(mqtt_mod, "announce_to_home_assistant",
                           side_effect=RuntimeError("boom")):
             with self.assertLogs("mqtt", level="ERROR") as captured:
@@ -429,6 +534,11 @@ class TestTheBirthPathSaysWhatItDid(BirthMessageTestBase):
             any("boom" in line for line in captured.output),
             f"a failing re-announce was silent: {captured.output}",
         )
+        self.assertIsNotNone(
+            captured.records[0].exc_info,
+            "logged without a traceback - no frame, no line, no cause chain",
+        )
+        self.assertTrue(any("Traceback" in line for line in captured.output))
 
 
 class TestTheTopicCollisionIsRefused(BirthMessageTestBase):
@@ -446,6 +556,38 @@ class TestTheTopicCollisionIsRefused(BirthMessageTestBase):
     unrecoverable, while a device without the birth re-announce still drives the
     light and is merely back to the pre-T-527.1 behaviour.
     """
+
+    def test_the_delivered_birth_is_ignored_even_though_nobody_subscribed(self):
+        """THE test this class was missing, and the one that actually matters.
+
+        The subscribe-site refusal below stops the client ASKING for the topic.
+        It cannot stop it RECEIVING it: this client runs clean_session=False
+        with a stable client_id, so the BROKER holds the subscription list
+        across restarts, and MQTT_IDENTIFIER is independent of MQTT_BASETOPIC.
+        A device that ever ran normally is still subscribed after the base topic
+        is changed, and the refusal does nothing at all.
+
+        Measured before this guard existed: the announce ran, published "online"
+        to a topic that is now its own, and the echo re-entered the handler -
+        21 publishes, then 42, one round every 10 seconds forever.
+
+        So the guard has to be in the HANDLER, and this drives the handler
+        directly rather than going through on_connect.
+        """
+        with patch.object(mqtt_mod, "STATUS_TOPIC", HA_STATUS):
+            self._birth()
+        self.assertEqual(
+            self.client.calls, [],
+            "a birth delivered from a broker-held subscription still "
+            "re-announced, which echoes back to this client and loops",
+        )
+
+    def test_no_echo_is_published_to_the_colliding_topic(self):
+        # Named for the mechanism rather than the trigger: what makes it a loop
+        # is publishing "online" to the very topic being handled.
+        with patch.object(mqtt_mod, "STATUS_TOPIC", HA_STATUS):
+            self._birth()
+        self.assertEqual(self.client.to(HA_STATUS), [])
 
     def test_the_colliding_config_does_not_subscribe(self):
         with patch.object(mqtt_mod, "STATUS_TOPIC", HA_STATUS):

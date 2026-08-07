@@ -89,9 +89,15 @@ HA_BIRTH_PAYLOAD = "online"
 #
 # Whether HA retains its birth message is a per-installation setting, so this
 # client may receive an `online` immediately on subscribing, moments after
-# on_connect already announced. That is harmless: announce_to_home_assistant()
-# is idempotent by construction — every publish in it is retained and
-# overwrites, and the clear is a no-op after the first one.
+# on_connect already announced.
+#
+# That case is COVERED, not harmless — and this comment said "harmless" until
+# review pointed out it was the copy attached to the one redundant announce the
+# design predicts by name. announce_to_home_assistant() is idempotent in EFFECT
+# (every publish is retained and overwrites, and the clear is a no-op after the
+# first), but it is not free: 21 publishes and ~1.8 KB each time. The connect
+# path stamps the debounce clock precisely so this retained `online` is
+# suppressed instead of doubling the announce. See _birth_is_debounced().
 LIFECYCLE_SUBSCRIPTIONS = [(HA_STATUS_TOPIC, 1)]
 
 # Minimum seconds between two re-announces. Review measured one birth message
@@ -722,22 +728,35 @@ def send_discovery_messages(client):
 def _birth_is_debounced():
     """True if a birth message arrived too soon after the last re-announce.
 
-    Called only from the birth path, never from on_connect: a genuine
-    (re)connect must always announce, whatever happened ten seconds ago.
+    READS the clock; never writes it. announce_to_home_assistant() is the single
+    writer, so every announce is stamped however it was reached - including the
+    connect path, which does not consult this function.
+
+    That split fixes a case LIFECYCLE_SUBSCRIPTIONS predicts by name: if HA
+    retains its birth message, this client receives an `online` the instant it
+    subscribes, milliseconds after on_connect already announced. When only the
+    birth path stamped the clock, that produced two full announces back to back
+    - the most predictable redundant announce in the design, sailing straight
+    through the thing built to stop it.
+
+    A (re)connect still announces UNCONDITIONALLY. It records that it did; it
+    never asks permission. The broker drops this client roughly 25 times a day
+    and a debounced reconnect is a device that comes back with no entities.
 
     Single-threaded by construction and deliberately not locked. paho dispatches
     on_connect and on_message from the same network-loop thread (both come from
     _packet_handle), so two birth messages are handled strictly in sequence and
     there is no window for a lock to protect. A lock here would imply a
     concurrency that does not exist and invite someone to relax it.
+
+    FIXED window, not sliding: a suppressed birth must NOT push the deadline
+    forward. If it did, a publisher writing `online` every five seconds would
+    suppress Home Assistant's genuine birth message forever - turning a rate
+    limit into a permanent mute, which is the exact outage this file exists to
+    prevent, reached from the opposite direction.
     """
-    global _last_birth_announce
-    now = monotonic()
-    if (_last_birth_announce is not None
-            and now - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS):
-        return True
-    _last_birth_announce = now
-    return False
+    return (_last_birth_announce is not None
+            and monotonic() - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS)
 
 
 def announce_to_home_assistant(client):
@@ -798,6 +817,11 @@ def announce_to_home_assistant(client):
     # Announce real device state on every (re)connect. Retained, so HA gets it
     # immediately on subscribe instead of sitting at `unknown`.
     publish_light_state(client)
+    # The single writer of the debounce clock. Stamped here rather than in
+    # _birth_is_debounced() so that EVERY announce counts, including the connect
+    # path's - see that function for the retained-birth case this covers.
+    global _last_birth_announce
+    _last_birth_announce = monotonic()
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
@@ -819,15 +843,25 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # option and is the wrong one here — a service that will not boot on a host
     # nobody can reach by hand is unrecoverable, while a device that runs
     # without the birth re-announce is merely back to the pre-T-527.1 behaviour
-    # and still drives the light. The debounce above would blunt the loop but
-    # not stop it; this stops it.
+    # and still drives the light.
+    #
+    # THIS IS THE WEAKER HALF OF THE GUARD, and an earlier version of this
+    # comment had it exactly backwards — it claimed "the debounce would blunt
+    # the loop but not stop it; this stops it." Reversed. Refusing to SUBSCRIBE
+    # cannot refuse to RECEIVE: the durable session means the broker keeps a
+    # subscription this client asked for on any earlier run, so on the
+    # transition path (a device that ran normally, then had MQTT_BASETOPIC
+    # changed) the birth message still arrives and this branch never sees it.
+    # The guard that actually closes the loop is in on_message; this one only
+    # stops a FRESH session from acquiring the subscription in the first place.
     if STATUS_TOPIC == HA_STATUS_TOPIC:
         logger.error(
             f"NOT subscribing to {HA_STATUS_TOPIC}: BASE_TOPIC is "
             f"{BASE_TOPIC!r}, which collides with Home Assistant's discovery "
             f"prefix and would make this client re-announce in a loop. "
-            f"Discovery will not self-heal after an HA restart until "
-            f"MQTT_BASETOPIC is changed."
+            f"A birth message may still be delivered from a subscription the "
+            f"broker already holds; the handler ignores it. Discovery will not "
+            f"self-heal until MQTT_BASETOPIC is changed."
         )
     else:
         client.subscribe(LIFECYCLE_SUBSCRIPTIONS)
@@ -847,7 +881,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     start_publisher_threads(client)
 
 def on_message(client, userdata, msg):
-    global brightness, speed, WATER_LOW_CM
+    global brightness, speed, WATER_LOW_CM, _last_birth_announce
 
     try:
         payload = msg.payload.decode("utf-8").strip()
@@ -870,7 +904,43 @@ def on_message(client, userdata, msg):
         #
         # First in the chain so the reason it exists is the first thing read,
         # and so no future BASE_TOPIC branch can shadow it.
-        if msg.topic == HA_STATUS_TOPIC:
+        if msg.topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:
+            # THE COLLISION GUARD THAT ACTUALLY WORKS. Its twin at the subscribe
+            # site in on_connect refuses to ASK for this topic; it cannot refuse
+            # to RECEIVE it, and that distinction is the whole finding.
+            #
+            # This client runs clean_session=False with a stable client_id, so
+            # the BROKER holds the subscription list across restarts. A device
+            # that ever ran with the default BASE_TOPIC subscribed to
+            # homeassistant/status; MQTT_IDENTIFIER is independent of
+            # MQTT_BASETOPIC, so changing the base topic to "homeassistant" and
+            # restarting resumes the same session with that subscription intact.
+            # The refusal then does nothing, the announce publishes "online" to
+            # STATUS_TOPIC — which now IS this topic — the broker echoes it back,
+            # and the client re-announces every 10 seconds forever: ~181k
+            # publishes and ~15 MB a day, with HA reprocessing four discovery
+            # configs each time.
+            #
+            # Measured, not reasoned: 21 publishes on the first pass, 42 after
+            # the echo re-entered. The debounce BOUNDS that loop; it does not
+            # stop it. An earlier version of the comment at the subscribe site
+            # claimed the reverse.
+            #
+            # This file already knew the rule and the new guard was written as
+            # if it did not — see the note on COMMAND_SUBSCRIPTIONS about the
+            # broker still delivering temperature/get and humidity/get long
+            # after they left that list. ON THIS CLIENT A SUBSCRIPTION LIST IS A
+            # STATEMENT OF INTENT, NOT OF WHAT ARRIVES, so any guard whose safety
+            # depends on not RECEIVING a topic has to live in the handler.
+            logger.error(
+                f"Ignoring {HA_STATUS_TOPIC}: BASE_TOPIC is {BASE_TOPIC!r}, so "
+                f"this device's own status topic collides with Home Assistant's "
+                f"discovery prefix. Re-announcing would echo back to this client "
+                f"and loop. Discovery cannot self-heal until MQTT_BASETOPIC is "
+                f"set to something other than {HA_STATUS_TOPIC.split('/')[0]!r}."
+            )
+
+        elif msg.topic == HA_STATUS_TOPIC:
             if payload.lower() == HA_BIRTH_PAYLOAD:
                 # The whole point of T-527.1. HA has just come up and has no
                 # idea this device exists: retained discovery is delivered once
@@ -900,11 +970,32 @@ def on_message(client, userdata, msg):
                     )
                     announce_to_home_assistant(client)
             else:
-                # Almost always HA's own LWT saying "offline". Nothing to do:
-                # this device's availability is its own retained STATUS_TOPIC,
-                # which HA re-reads when it returns. Logged rather than ignored
-                # because "HA went away at 16:38" is the single most useful line
-                # to have when reconstructing an outage like 2026-08-05.
+                # Almost always HA's own LWT saying "offline". Nothing to
+                # publish: this device's availability is its own retained
+                # STATUS_TOPIC, which HA re-reads when it returns. Logged rather
+                # than ignored because "HA went away at 16:38" is the single most
+                # useful line to have when reconstructing an outage like
+                # 2026-08-05.
+                #
+                # But it DOES clear the debounce, and that is what makes the
+                # debounce safe rather than merely short. An `online` that
+                # follows an `offline` is by definition a new Home Assistant
+                # lifecycle, so it must never be suppressed - HA publishes its
+                # LWT on both a clean shutdown and a crash, so this branch is
+                # the boundary between two lifecycles.
+                #
+                # Without this the 10-second window rests on "HA takes tens of
+                # seconds to start", which is a claim about HA's PROCESS. HA
+                # publishes its birth on every MQTT CLIENT connect, which is a
+                # much cheaper event: a broker restart, a network blip on HA's
+                # side, or a config-entry reload - and a reload is precisely
+                # what unloads and rediscovers every MQTT entity. Two of those
+                # inside ten seconds is reachable. Resetting here makes the
+                # debounce structurally incapable of suppressing a genuine
+                # restart pair, and leaves it protecting only the case it is
+                # actually for: repeated `online` with no intervening `offline`,
+                # which is a flapping or hostile publisher.
+                _last_birth_announce = None
                 logger.info(f"Home Assistant status: {payload!r} - no action")
 
         # === Pump Logic ===
@@ -1139,6 +1230,21 @@ if __name__ == "__main__":
     # against systemd's default start-limit, burns through the restart budget in
     # seconds and parks the unit in `failed` permanently. A router reboot that
     # brought this Pi up before the broker used to leave the garden dark.
+    # Report a colliding BASE_TOPIC at STARTUP, not at first connect. The two
+    # runtime guards for this both live in callbacks, so if the broker is down
+    # at boot — the case connect_async(retry_first_connection=True) exists for —
+    # neither fires and the misconfiguration is reported nowhere until the
+    # broker returns. This puts it in `journalctl -u mqtt` at the moment anyone
+    # would look. Aborts nothing: see the guards for why a service that refuses
+    # to boot is the wrong answer on a host with no console.
+    if STATUS_TOPIC == HA_STATUS_TOPIC:
+        logger.error(
+            f"MISCONFIGURED: BASE_TOPIC is {BASE_TOPIC!r}, so this device's "
+            f"status topic is {HA_STATUS_TOPIC}, which is Home Assistant's own. "
+            f"Discovery will not self-heal after an HA restart. Set "
+            f"MQTT_BASETOPIC to something else."
+        )
+
     client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)
 
     # The periodic publishers are started from on_connect, not here — see
