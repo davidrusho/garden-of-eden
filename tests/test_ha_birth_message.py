@@ -92,6 +92,12 @@ class BirthMessageTestBase(unittest.TestCase):
         # file, and it is only meaningful if the real function would have been
         # observable had it been called.
         self.threads = patch.object(mqtt_mod, "start_publisher_threads").start()
+        # MODULE-SCOPED STATE, reset per test. _last_birth_announce persists
+        # across test methods otherwise, so whether a case sees a debounce would
+        # depend on unittest's method ordering - the kind of coupling that makes
+        # one test fail only when the whole class runs.
+        mqtt_mod._last_birth_announce = None
+        self.addCleanup(setattr, mqtt_mod, "_last_birth_announce", None)
         self.addCleanup(patch.stopall)
 
     def _deliver(self, topic, payload):
@@ -206,28 +212,41 @@ class TestBirthMessageReAnnounces(BirthMessageTestBase):
         self.assertLess(last_clear, first_announce)
 
     def test_a_second_birth_message_publishes_the_same_set(self):
-        # HA restarts are not rare, and this path is reachable by anyone with
-        # broker access. It has to be a no-op the second time.
+        # HA restarts are not rare. Two announces must produce the same wire
+        # traffic - no accumulating state, no growing payload.
+        #
+        # The debounce is cleared between them ON PURPOSE: this asserts that
+        # announce_to_home_assistant() is idempotent, which is a different
+        # question from whether the birth path rate-limits. Testing both in one
+        # case would mean neither is pinned - the debounce alone would satisfy a
+        # naive "same set" assertion by publishing nothing at all the second
+        # time. TestTheBirthPathIsDebounced owns the other half.
         self._birth()
         first = sorted(self.client.topics)
         self.client.calls.clear()
+        mqtt_mod._last_birth_announce = None
         self._birth()
         self.assertEqual(sorted(self.client.topics), first)
 
 
-class TestTheAnnounceDoesNotLeakThreads(BirthMessageTestBase):
-    """The worst outcome available in this change, asserted on its own.
+class TestTheAnnounceStaysNarrowerThanConnect(BirthMessageTestBase):
+    """announce_to_home_assistant() is deliberately less than on_connect does.
 
-    start_publisher_threads() spawns the PCB and camera loops with no check for
-    threads it already started. Moving it inside the shared announce sequence
-    would leak a full set on every HA restart - unbounded, on a 512 MB Zero W
-    that has no console, no keyboard and no SD-card recovery. Nothing would look
-    wrong from the outside: the device would keep publishing, faster and faster,
-    until it died.
+    CORRECTED AFTER REVIEW, and worth recording because the original framing was
+    wrong in a way that felt rigorous. This class was called
+    TestTheAnnounceDoesNotLeakThreads and argued that start_publisher_threads()
+    spawns threads unchecked, so calling it per HA restart would leak a set each
+    time and eventually exhaust a 512 MB Zero W. It does not: it carries a
+    lock-guarded once-only flag and returns immediately on every call after the
+    first. The danger was imaginary.
 
-    This is the reason announce_to_home_assistant() exists as a narrower thing
-    than "what on_connect does", and the reason that is written in its docstring
-    rather than left to be inferred.
+    The assertions below are unchanged and still earn their place - they pin the
+    boundary between per-announcement work and per-process work, and a mutant
+    moving the call into the shared function does fail them. What changed is the
+    STAKE. Naming a false catastrophe is not harmless: it was the loudest thing
+    in this file, and it is exactly the kind of claim that stops anyone asking
+    whether there is a real worst case. There was one, and it was somewhere else
+    entirely - see TestTheBirthPathIsDebounced.
     """
 
     def test_a_birth_message_starts_no_publisher_threads(self):
@@ -252,6 +271,212 @@ class TestTheAnnounceDoesNotLeakThreads(BirthMessageTestBase):
         # pointless traffic on the single antenna this device has.
         self._birth()
         self.assertEqual(self.client.subscriptions, [])
+
+
+class TestTheBirthPathIsDebounced(BirthMessageTestBase):
+    """The real worst case, found by review after the imaginary one was removed.
+
+    homeassistant/status is the first topic this client subscribes to OUTSIDE
+    its own namespace, so it is writable by anyone with broker publish rights
+    rather than only by Home Assistant. Measured against the real on_message:
+    ONE ~30-byte inbound birth message produces 21 outbound publishes and
+    ~1.8 KB, plus a synchronous pigpio round-trip for the light's real duty
+    cycle, all on paho's network-loop thread - a ~90x byte amplification, on a
+    single-antenna Zero W whose Wi-Fi headroom this file's own comments describe
+    as already spent, writing into an unrotated log.
+
+    The direction of the trade is deliberate and is the thing to preserve if
+    this is ever tuned: SUPPRESSING A LEGITIMATE RE-ANNOUNCE IS THE WORSE
+    FAILURE, because a missed announce is the outage this whole ticket exists to
+    fix. Ten seconds stops a flap or a hostile publisher while being far shorter
+    than any real HA startup, so no genuine restart pair can land inside it.
+    """
+
+    def test_a_second_birth_inside_the_window_announces_nothing(self):
+        self._birth()
+        self.client.calls.clear()
+        self._birth()
+        self.assertEqual(
+            self.client.calls, [],
+            "a burst of birth messages is amplified onto the wire unthrottled",
+        )
+
+    def test_a_flood_costs_exactly_one_announce(self):
+        for _ in range(50):
+            self._birth()
+        self.assertEqual(len(self.client.to(SURVIVING_DISCOVERY[0])), 1)
+
+    def test_the_window_is_ten_seconds(self):
+        """Pin the VALUE, not just the mechanism.
+
+        Every other test in this class expresses itself relative to
+        BIRTH_DEBOUNCE_SECONDS, which means they all move with it: a mutant
+        setting it to 86400 SURVIVED the first version of this battery, because
+        the expiry test computed its own fake timestamp from the same constant
+        it was supposed to be checking. The module agreed with itself.
+
+        The number is a policy decision with a direction, so it is pinned as
+        one. Ten seconds is long enough to kill a flap and far shorter than any
+        real Home Assistant startup, so no genuine restart pair can land inside
+        it. Raising this materially trades away the guarantee the ticket exists
+        for - a suppressed legitimate re-announce IS the 2026-08-05 outage.
+        """
+        self.assertEqual(mqtt_mod.BIRTH_DEBOUNCE_SECONDS, 10)
+
+    def test_a_birth_after_the_window_announces_again(self):
+        # The paired assertion, and the one that stops the fix over-correcting.
+        # A debounce that never expires is just a broken feature: HA would
+        # restart an hour later and find nothing had been re-announced.
+        self._birth()
+        self.client.calls.clear()
+        mqtt_mod._last_birth_announce = (
+            mqtt_mod.monotonic() - mqtt_mod.BIRTH_DEBOUNCE_SECONDS - 1
+        )
+        self._birth()
+        self.assertEqual(len(self.client.to(SURVIVING_DISCOVERY[0])), 1)
+
+    def test_the_window_is_measured_on_the_monotonic_clock(self):
+        # This Pi has no RTC and takes its time from NTP after boot, so a wall
+        # clock can step - backwards, which would disable the debounce, or
+        # forwards, which would extend it past a real HA restart. Asserted by
+        # stepping a fake wall clock and checking the debounce does not care.
+        self._birth()
+        self.client.calls.clear()
+        with patch.object(mqtt_mod, "monotonic",
+                          return_value=mqtt_mod._last_birth_announce + 1):
+            with patch("time.time", return_value=0):
+                self._birth()
+        self.assertEqual(self.client.calls, [])
+
+    def test_connect_is_never_debounced(self):
+        # A reconnect must ALWAYS announce, whatever happened moments ago. The
+        # broker drops this client roughly 25 times a day; a debounced reconnect
+        # is a device that reappears with no entities.
+        self._birth()
+        self.client.calls.clear()
+        mqtt_mod.on_connect(self.client, None, None, 0)
+        for topic in SURVIVING_DISCOVERY:
+            with self.subTest(topic=topic):
+                self.assertEqual(len(self.client.to(topic)), 1)
+
+    def test_a_debounced_birth_is_logged_loudly(self):
+        # WARNING, not INFO. A sustained burst means something is wrong with HA
+        # or with another client on the broker, and the root logger sits at
+        # WARNING - so an INFO line here would be recorded in the file handler
+        # and invisible to anything watching the journal at default level.
+        self._birth()
+        with self.assertLogs("mqtt", level="WARNING") as captured:
+            self._birth()
+        self.assertTrue(
+            any("skipping" in line for line in captured.output),
+            f"a suppressed birth message left no loud trace: {captured.output}",
+        )
+
+
+class TestTheBirthPathSaysWhatItDid(BirthMessageTestBase):
+    """The log lines, asserted rather than assumed.
+
+    ADDED AFTER REVIEW. Three extra mutants run by the reviewer deleted these
+    lines one at a time and every one SURVIVED the suite - including the
+    else-branch line, which this file's own header argues matters because it is
+    the artifact an outage gets reconstructed from. Arguing that a line is
+    load-bearing while nothing asserts it exists is the gap those mutants found.
+
+    It matters more here than logging usually does. This device's failure mode
+    is defined as silence - it keeps publishing, keeps answering ICMP, and HA
+    simply has no entities - so the log is the only evidence that the fix ever
+    fired, and the only way to tell "HA never sent a birth message" from "we
+    ignored it".
+    """
+
+    def test_a_re_announce_is_logged(self):
+        with self.assertLogs("mqtt", level="INFO") as captured:
+            self._birth()
+        self.assertTrue(
+            any("re-announcing discovery" in line for line in captured.output),
+            f"the fix fired and left no trace: {captured.output}",
+        )
+
+    def test_ha_going_offline_is_logged(self):
+        # "HA went away at 16:38" is the single most useful line to have when
+        # reconstructing an incident like 2026-08-05.
+        #
+        # MATCHED ON "no action", NOT ON "offline". The first version of this
+        # test asserted `any("offline" in line)` and a mutant deleting the line
+        # outright SURVIVED it - because on_message's generic decode line at the
+        # top of the function echoes the payload, so it emits
+        # `Decoded payload on homeassistant/status: 'offline'` whatever this
+        # branch does. The assertion was satisfied by the test's own input.
+        # "no action" appears in exactly one place in the codebase.
+        with self.assertLogs("mqtt", level="INFO") as captured:
+            self._birth("offline")
+        self.assertTrue(
+            any("no action" in line for line in captured.output),
+            f"HA's departure was silent: {captured.output}",
+        )
+
+    def test_a_failing_announce_is_logged_with_a_traceback(self):
+        # on_message's catch-all swallows the exception, which is correct - an
+        # escape would kill paho's network loop thread and with it every inbound
+        # command. But swallowed is not the same as observed: without this, a
+        # re-announce that fails EVERY time is indistinguishable from one that
+        # never fires, and both look like the original bug.
+        with patch.object(mqtt_mod, "announce_to_home_assistant",
+                          side_effect=RuntimeError("boom")):
+            with self.assertLogs("mqtt", level="ERROR") as captured:
+                self._birth()
+        self.assertTrue(
+            any("boom" in line for line in captured.output),
+            f"a failing re-announce was silent: {captured.output}",
+        )
+
+
+class TestTheTopicCollisionIsRefused(BirthMessageTestBase):
+    """BASE_TOPIC is env-configurable, and one value is a self-feeding loop.
+
+    Set MQTT_BASETOPIC=homeassistant and STATUS_TOPIC becomes HA_STATUS_TOPIC.
+    The announce publishes "online" to STATUS_TOPIC, the broker echoes it back
+    to this client (MQTT 3.1.1 has no no-local option), the birth branch fires,
+    and it re-announces forever - on the network-loop thread, on the device with
+    no console. The debounce would slow that to one announce per 10s rather than
+    stop it.
+
+    The refusal DEGRADES rather than aborting. Refusing to start looks safer and
+    is not: a service that will not boot on a host nobody can reach by hand is
+    unrecoverable, while a device without the birth re-announce still drives the
+    light and is merely back to the pre-T-527.1 behaviour.
+    """
+
+    def test_the_colliding_config_does_not_subscribe(self):
+        with patch.object(mqtt_mod, "STATUS_TOPIC", HA_STATUS):
+            mqtt_mod.on_connect(self.client, None, None, 0)
+        subscribed = [t for t, _ in self.client.subscriptions]
+        self.assertNotIn(HA_STATUS, subscribed)
+
+    def test_the_colliding_config_still_runs_everything_else(self):
+        # The degrade half. The light must still work.
+        with patch.object(mqtt_mod, "STATUS_TOPIC", HA_STATUS):
+            mqtt_mod.on_connect(self.client, None, None, 0)
+        subscribed = [t for t, _ in self.client.subscriptions]
+        self.assertIn("gardyn/light/command", subscribed)
+        self.threads.assert_called_once()
+        for topic in SURVIVING_DISCOVERY:
+            with self.subTest(topic=topic):
+                self.assertEqual(len(self.client.to(topic)), 1)
+
+    def test_the_refusal_is_logged_at_error(self):
+        with patch.object(mqtt_mod, "STATUS_TOPIC", HA_STATUS):
+            with self.assertLogs("mqtt", level="ERROR") as captured:
+                mqtt_mod.on_connect(self.client, None, None, 0)
+        self.assertTrue(any("NOT subscribing" in l for l in captured.output))
+
+    def test_the_normal_config_is_unaffected(self):
+        # Positive control. A collision check with the comparison inverted would
+        # silently disable the subscription on every healthy deployment, and
+        # every assertion above would stay green.
+        mqtt_mod.on_connect(self.client, None, None, 0)
+        subscribed = [t for t, _ in self.client.subscriptions]
+        self.assertIn(HA_STATUS, subscribed)
 
 
 class TestOnlyABirthPayloadTriggers(BirthMessageTestBase):

@@ -228,9 +228,26 @@ class ModuleScopeLeakTests(unittest.TestCase):
                 continue
             with open(os.path.join(tests_dir, name)) as fh:
                 text = fh.read()
+            # The transitive clause used to name ONE module:
+            # "from tests.test_water_interlock import". That was the only
+            # inheritance route in the tree when it was written, and it went
+            # stale silently the moment a second stubbing module was imported
+            # from - which T-527.1 is the first change to do
+            # (tests/test_ha_birth_message.py imports RecordingClient from
+            # tests.test_retired_entities). Demonstrated during review: a module
+            # importing only from test_retired_entities passed this check while
+            # unlisted, so nothing ever probed it for leaks.
+            #
+            # Matched against the LIST rather than one hardcoded name, so a new
+            # stubbing module is covered by adding it to STUBBING_MODULES - the
+            # one place that already has to be edited - instead of needing this
+            # regex widened too. A guard whose completeness depends on somebody
+            # remembering to update the guard is not a completeness guard.
+            inherits = any(f"from {mod} import" in text
+                           for mod in STUBBING_MODULES)
             if ("sys.modules[" in text or "sys.modules.pop" in text
                     or "sys.modules.setdefault" in text
-                    or "from tests.test_water_interlock import" in text):
+                    or inherits):
                 writers.add("tests." + name[:-3])
         self.assertEqual(
             writers, set(STUBBING_MODULES),

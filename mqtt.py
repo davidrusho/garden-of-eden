@@ -12,7 +12,7 @@ import base64
 import json
 # import picamera
 # import cv2
-from time import sleep
+from time import monotonic, sleep
 from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_TOPIC, IDENTIFIER, MODEL, VERSION, WATER_LOW_CM, WATER_VALID_MIN_CM, WATER_VALID_MAX_CM, UPPER_CAMERA_DEVICE, LOWER_CAMERA_DEVICE, UPPER_IMAGE_PATH, LOWER_IMAGE_PATH, CAMERA_RESOLUTION, UPPER_CAMERA_RESOLUTION, LOWER_CAMERA_RESOLUTION, UPPER_CAMERA_JPEG_QUALITY, LOWER_CAMERA_JPEG_QUALITY, IMAGE_INTERVAL_SECONDS
 
 from gpiozero import Button  # Import gpiozero Button
@@ -93,6 +93,26 @@ HA_BIRTH_PAYLOAD = "online"
 # is idempotent by construction — every publish in it is retained and
 # overwrites, and the clear is a no-op after the first one.
 LIFECYCLE_SUBSCRIPTIONS = [(HA_STATUS_TOPIC, 1)]
+
+# Minimum seconds between two re-announces. Review measured one birth message
+# as 21 publishes / ~1.8 KB outbound, plus a synchronous pigpio round-trip for
+# the light's real duty cycle, all on paho's network-loop thread - a ~90x byte
+# amplification of a ~30-byte inbound message, on a topic OUTSIDE this device's
+# namespace that any client with broker publish rights can write to.
+#
+# Ten seconds, chosen against the failure that matters. Suppressing a LEGITIMATE
+# re-announce is far worse than serving a redundant one: a missed announce is
+# the 2026-08-05 outage. Home Assistant takes tens of seconds to start, so two
+# genuine births inside ten seconds is not a shape that occurs, while a flapping
+# or hostile publisher is stopped dead. Longer would start trading away the
+# thing this file exists to guarantee.
+#
+# time.monotonic(), never time.time(): this Pi has no RTC and gets its clock
+# from NTP after boot, so a wall clock that steps backwards mid-window would
+# disable the debounce, and one that steps forward would extend it. monotonic()
+# is immune to both, which matters more here than on a host with a battery.
+BIRTH_DEBOUNCE_SECONDS = 10
+_last_birth_announce = None
 
 # Retired hardware (T-475).
 #
@@ -699,6 +719,27 @@ def send_discovery_messages(client):
     }
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
+def _birth_is_debounced():
+    """True if a birth message arrived too soon after the last re-announce.
+
+    Called only from the birth path, never from on_connect: a genuine
+    (re)connect must always announce, whatever happened ten seconds ago.
+
+    Single-threaded by construction and deliberately not locked. paho dispatches
+    on_connect and on_message from the same network-loop thread (both come from
+    _packet_handle), so two birth messages are handled strictly in sequence and
+    there is no window for a lock to protect. A lock here would imply a
+    concurrency that does not exist and invite someone to relax it.
+    """
+    global _last_birth_announce
+    now = monotonic()
+    if (_last_birth_announce is not None
+            and now - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS):
+        return True
+    _last_birth_announce = now
+    return False
+
+
 def announce_to_home_assistant(client):
     """Publish everything HA needs to (re)build this device's four entities.
 
@@ -708,23 +749,36 @@ def announce_to_home_assistant(client):
     new shape: HA came back, this client never re-sent discovery, and four
     entities sat `unavailable` while every light command failed log-only.
 
-    What is deliberately NOT in here, and must not be moved in:
+    What is deliberately NOT in here, and must not be moved in. Both are
+    PER-CONNECTION or PER-PROCESS lifecycle, and an announcement is neither:
 
-      client.subscribe(...)      per-CONNECTION, not per-announcement. The
-                                 session is durable (clean_session=False), so
-                                 the broker already holds the subscriptions;
-                                 re-subscribing on every birth message is
-                                 pointless traffic on a single-antenna Zero W.
-      start_publisher_threads()  starts the PCB and camera loops. Each call
-                                 spawns new threads with no check for existing
-                                 ones, so putting it here would leak a full set
-                                 of publisher threads every time HA restarts -
-                                 unbounded, on a device with 512 MB of RAM, and
-                                 invisible until the Pi ran out of memory.
+      client.subscribe(...)      per-CONNECTION. The session is durable
+                                 (clean_session=False), so the broker already
+                                 holds the subscriptions; re-subscribing on
+                                 every birth message is pointless traffic on a
+                                 single-antenna Zero W.
+      start_publisher_threads()  per-PROCESS. It carries its own lock-guarded
+                                 once-only flag (see its definition), so
+                                 calling it from here would not leak threads -
+                                 it would return immediately, every time. That
+                                 is the argument for leaving it out rather than
+                                 against: a call that is always a no-op reads
+                                 to the next maintainer as though it does
+                                 something, and hides where the publishers
+                                 actually start.
 
-    Idempotent by construction, which is what makes it safe to call from a
-    message handler on a topic anyone can publish to: every publish is retained
-    and overwrites, and clear_retired_entities() is a no-op after the first run.
+    An earlier version of this docstring claimed the opposite - that
+    start_publisher_threads() spawns threads unchecked and would leak a set per
+    HA restart. That was wrong; review caught it. The exclusion was right and
+    its stated reason was not, which is the more dangerous of the two to leave
+    in place: it would send someone hunting a leak that cannot happen, or
+    adding a second guard while the real one silently returns early.
+
+    Idempotent in EFFECT, which is what makes it safe to call from a message
+    handler. Note that is not the same as free: every call puts 21 publishes
+    (~1.8 KB) on the wire, 14 of them the retired-entity clear, whose no-op-ness
+    is about what HA ends up with rather than about what crosses the link. That
+    cost is why the caller debounces - see _birth_is_debounced().
     """
     # FIRST, and before anything is announced. Retiring an entity is a delete,
     # and a delete that arrives after the announcement races it: HA would see
@@ -752,7 +806,31 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(COMMAND_SUBSCRIPTIONS)
     # HA's birth topic, subscribed separately — see LIFECYCLE_SUBSCRIPTIONS for
     # why it is not folded into the list above.
-    client.subscribe(LIFECYCLE_SUBSCRIPTIONS)
+    #
+    # Refused when BASE_TOPIC collides with HA's discovery prefix. BASE_TOPIC is
+    # env-configurable (MQTT_BASETOPIC, default "gardyn"), so setting it to
+    # "homeassistant" makes STATUS_TOPIC == HA_STATUS_TOPIC — and the announce
+    # publishes "online" to STATUS_TOPIC. The broker would echo that straight
+    # back to this client (MQTT 3.1.1 has no no-local option), re-enter the
+    # birth branch, and re-announce forever: a tight loop on the network-loop
+    # thread, on a device with no console and no physical recovery.
+    #
+    # DEGRADE, do not abort. Refusing to start would be the safest-looking
+    # option and is the wrong one here — a service that will not boot on a host
+    # nobody can reach by hand is unrecoverable, while a device that runs
+    # without the birth re-announce is merely back to the pre-T-527.1 behaviour
+    # and still drives the light. The debounce above would blunt the loop but
+    # not stop it; this stops it.
+    if STATUS_TOPIC == HA_STATUS_TOPIC:
+        logger.error(
+            f"NOT subscribing to {HA_STATUS_TOPIC}: BASE_TOPIC is "
+            f"{BASE_TOPIC!r}, which collides with Home Assistant's discovery "
+            f"prefix and would make this client re-announce in a loop. "
+            f"Discovery will not self-heal after an HA restart until "
+            f"MQTT_BASETOPIC is changed."
+        )
+    else:
+        client.subscribe(LIFECYCLE_SUBSCRIPTIONS)
     announce_to_home_assistant(client)
     # A water-state refresh stood here, wrapped in a try/except so a sensor
     # explosion could not leave the publisher threads unstarted (T-475 removed
@@ -809,10 +887,18 @@ def on_message(client, userdata, msg):
                 # this callback runs on paho's network loop thread, so a sleep
                 # stalls keepalives and inbound command delivery for its
                 # duration, on the one radio the Pi has.
-                logger.info(
-                    "Home Assistant birth message - re-announcing discovery"
-                )
-                announce_to_home_assistant(client)
+                if _birth_is_debounced():
+                    logger.warning(
+                        f"Home Assistant birth message within "
+                        f"{BIRTH_DEBOUNCE_SECONDS}s of the last re-announce - "
+                        f"skipping. Repeated at length this means a flapping "
+                        f"HA or another publisher on {HA_STATUS_TOPIC}."
+                    )
+                else:
+                    logger.info(
+                        "Home Assistant birth message - re-announcing discovery"
+                    )
+                    announce_to_home_assistant(client)
             else:
                 # Almost always HA's own LWT saying "offline". Nothing to do:
                 # this device's availability is its own retained STATUS_TOPIC,

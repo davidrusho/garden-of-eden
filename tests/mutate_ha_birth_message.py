@@ -20,16 +20,39 @@ The mutants are chosen against three questions rather than by walking the diff:
      publish to homeassistant/status. Mutants 9-11 attack it: the announce
      called too often, called with the wrong things in it, or shadowing the
      command chain it now sits in front of.
-  2. WHAT IS THE IRREVERSIBLE ACTION? Leaking publisher threads. start_publisher
-     _threads() spawns PCB and camera loops with no check for existing ones, so
-     one call per HA restart is an unbounded leak on a 512 MB Zero W with no
-     console and no physical recovery path (T-258's hard constraint). Mutant 12
-     plants it inside the shared announce; mutant 13 removes it from the connect
-     path, which is the over-correction in the other direction.
+  2. WHAT IS THE COSTLY ACTION? Re-announcing. One inbound birth message is 21
+     publishes and ~1.8 KB outbound plus a pigpio round-trip, on paho's
+     network-loop thread, triggered by a topic outside this device's namespace
+     that anyone with broker publish rights can write. Mutants 21-25 attack the
+     debounce and the topic-collision refusal that bound it.
+
+     THIS ITEM USED TO SAY SOMETHING ELSE, and the correction is the most
+     useful thing in this file. It read: "the irreversible action is leaking
+     publisher threads - start_publisher_threads() spawns loops with no check
+     for existing ones." That is false; it has a lock-guarded once-only flag.
+     The battery was built around a danger that did not exist, scored 20/20
+     against it, and the real hazard above went unmutated until review found
+     it. A kill count bounds only the mutants you thought of, and the mutants
+     you think of are bounded by the threat model you wrote down first.
+
+     Mutants 12 and 13 survive the correction and still earn their place: they
+     pin the boundary between per-announcement and per-process work. What
+     changed is that they are no longer the point.
   3. WHAT DOES THE CHANGED LINE ASSUME? That on_message decodes and strips
      before dispatch, that its catch-all still wraps the new branch, and that
-     announce_to_home_assistant() is idempotent. Mutants 7, 8 and 16 attack
-     those rather than the lines the diff touched.
+     announce_to_home_assistant() is idempotent. Mutant 8 drops .lower(),
+     mutant 20 moves the branch outside the catch-all, and mutant 26 drops
+     .strip(). An earlier version of this paragraph cited "mutants 7, 8 and 16"
+     for these, which was simply wrong - 7 inverts the birth check and 16 drops
+     the availability re-assert, and .strip() had no mutant at all. A numbered
+     mapping is what a reader uses to decide the assumptions were covered, so a
+     wrong one is worse than none.
+
+  A FOURTH QUESTION, added after review: WHAT DOES THIS CHANGE CLAIM IN PROSE
+  that nothing asserts? Three log lines were argued to be load-bearing - the
+  device's failure mode is silence, so the log is the only evidence the fix
+  ever fired - and all three could be deleted with the suite staying green.
+  Mutants 27-29 cover them.
 
 Run:  python3 tests/mutate_ha_birth_message.py
 
@@ -182,7 +205,67 @@ MUTANTS = [
      "        announce_to_home_assistant(client)\n"
      "        return\n\n"
      "    try:\n        # === Home Assistant lifecycle ==="),
+
+    # --- 21-23: the debounce, mutated in BOTH directions ---------------------
+    # Removing it re-opens the amplification; making it permanent or too long
+    # suppresses a LEGITIMATE re-announce, which is the outage this whole
+    # ticket exists to fix. Both directions have a mutant on purpose.
+    ("delete the debounce - a birth flood is amplified onto the wire",
+     "                if _birth_is_debounced():",
+     "                if False:"),
+
+    ("INVERT the debounce - announces only when it should be suppressed",
+     "    if (_last_birth_announce is not None\n"
+     "            and now - _last_birth_announce < BIRTH_DEBOUNCE_SECONDS):",
+     "    if (_last_birth_announce is not None\n"
+     "            and now - _last_birth_announce > BIRTH_DEBOUNCE_SECONDS):"),
+
+    ("make the debounce NEVER expire - one announce per process, ever",
+     "    BIRTH_DEBOUNCE_SECONDS = 10",
+     "    BIRTH_DEBOUNCE_SECONDS = 10"),  # placeholder, replaced below
+
+    # --- 24-25: the topic-collision refusal ---------------------------------
+    ("delete the collision refusal - MQTT_BASETOPIC=homeassistant loops forever",
+     "    if STATUS_TOPIC == HA_STATUS_TOPIC:",
+     "    if False:"),
+
+    ("INVERT the collision check - healthy deployments stop self-healing",
+     "    if STATUS_TOPIC == HA_STATUS_TOPIC:",
+     "    if STATUS_TOPIC != HA_STATUS_TOPIC:"),
+
+    # --- 26: an assumption the changed line rests on ------------------------
+    ("drop .strip() - a padded payload silently stops being a birth message",
+     '        payload = msg.payload.decode("utf-8").strip()',
+     '        payload = msg.payload.decode("utf-8")'),
+
+    # --- 27-29: the claims made in PROSE that nothing asserted --------------
+    # All three of these SURVIVED the reviewer's run of this battery. On a
+    # device whose failure mode is defined as silence, the log is the only
+    # evidence the fix ever fired.
+    ("delete the re-announce log line - the fix fires with no trace",
+     '                    logger.info(\n'
+     '                        "Home Assistant birth message - re-announcing discovery"\n'
+     '                    )\n',
+     ""),
+
+    ("delete the HA-offline log line - the outage record loses its timestamp",
+     '                logger.info(f"Home Assistant status: {payload!r} - no action")',
+     "                pass"),
+
+    ("swallow announce failures silently - a permanent failure looks like a no-op",
+     "                    announce_to_home_assistant(client)",
+     "                    try:\n"
+     "                        announce_to_home_assistant(client)\n"
+     "                    except Exception:\n"
+     "                        pass"),
 ]
+
+# Mutant 23 needs a module-level anchor rather than the indented one above.
+MUTANTS[22] = (
+    "make the debounce NEVER expire - one announce per process, ever",
+    "BIRTH_DEBOUNCE_SECONDS = 10",
+    "BIRTH_DEBOUNCE_SECONDS = 86400",
+)
 
 # Control B. A deliberately broken tree that MUST score RED. Without it, Control
 # A is scored by the same path that may itself be broken.
@@ -240,8 +323,6 @@ def apply_mutation(anchor, replacement):
     if mutated == src:
         print("  replacement changed nothing - mutation NOT applied, no verdict")
         return False
-    with open(MQTT, "w") as fh:
-        fh.write(mutated)
 
     # A mutant MUST be valid Python, and this gate is not paranoia - it caught a
     # real false kill in this file's own first run. Mutant 11 inserted a line at
@@ -249,16 +330,26 @@ def apply_mutation(anchor, replacement):
     # and the battery scored it KILLED. The behaviour it was written to test was
     # never exercised. A syntax error reddens everything, and "everything red"
     # is indistinguishable from "the assertion fired" if you only read the
-    # colour - so refuse the mutant here rather than scoring it.
+    # colour - so refuse the mutant rather than scoring it.
     #
     # The tell in the output was `killed (0 failing case(s))`: a real kill names
     # the cases it broke. That is why the runner prints the count.
+    #
+    # CHECKED BEFORE THE WRITE, not after. The first version wrote the file and
+    # then compiled it, which put invalid Python on disk for the length of a
+    # function call - short, but a window of exactly the kind the atexit and
+    # SIGTERM apparatus in this file exists to close, and the file in question
+    # is the one that runs the garden. Review flagged it; compiling the
+    # candidate string costs nothing and removes the window entirely.
     try:
         compile(mutated, MQTT, "exec")
     except SyntaxError as exc:
         print(f"  MUTANT IS NOT VALID PYTHON ({exc.msg}, line {exc.lineno}) - "
               f"no verdict; a syntax error reddens the suite for the wrong reason")
         return False
+
+    with open(MQTT, "w") as fh:
+        fh.write(mutated)
     return True
 
 
