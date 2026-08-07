@@ -53,6 +53,47 @@ logger = logging.getLogger(__name__)
 # when this client stops answering keepalives (~1.5x KEEP_ALIVE_INTERVAL).
 STATUS_TOPIC = BASE_TOPIC + "/status"
 
+# Home Assistant's OWN lifecycle topic — the opposite direction to STATUS_TOPIC
+# above. That one is this device telling HA it is alive; this one is HA telling
+# the world that HA is alive, and it is the trigger for re-announcing discovery.
+#
+# The MQTT integration docs are explicit that this is the device's job:
+#
+#   "By default, Home Assistant sends `online` and `offline` to
+#    `homeassistant/status`."
+#   "A device or service that exposes the MQTT discovery should subscribe to
+#    the Birth message and use this as a trigger to send the discovery
+#    payload."
+#
+# This client did neither until T-527.1, and that is the root cause of the
+# 2026-08-05 outage's PERSISTENCE. HA's MQTT integration reconnected at
+# 16:38:50, dropped all four gardyn* entities during entity setup, and they
+# stayed `unavailable` until a manual config-entry reload — while the Pi was
+# healthy the whole time, publishing camera frames. Retained discovery is
+# delivered once per subscribe, so nothing ever re-sent it. zigbee2mqtt and
+# govee2mqtt both subscribe here and recovered on their own; the broker log
+# shows the birth message delivered to exactly those two clients and no others.
+#
+# The prefix must match the one every discovery topic in send_discovery_
+# messages() is published under. Both are the literal "homeassistant" — this
+# file has never carried a configurable discovery prefix, and introducing one
+# here would put the two halves out of sync the first time it was changed.
+HA_STATUS_TOPIC = "homeassistant/status"
+HA_BIRTH_PAYLOAD = "online"
+
+# Subscribed at QoS 1, and kept OUT of COMMAND_SUBSCRIPTIONS on purpose: that
+# list is scoped to BASE_TOPIC and documents what this device consumes as
+# commands. This is neither — it is somebody else's lifecycle announcement, and
+# folding it in there would make the QoS-1 rationale in that block (the broker
+# queuing commands against the durable session) read as if it applied here too.
+#
+# Whether HA retains its birth message is a per-installation setting, so this
+# client may receive an `online` immediately on subscribing, moments after
+# on_connect already announced. That is harmless: announce_to_home_assistant()
+# is idempotent by construction — every publish in it is retained and
+# overwrites, and the clear is a no-op after the first one.
+LIFECYCLE_SUBSCRIPTIONS = [(HA_STATUS_TOPIC, 1)]
+
 # Retired hardware (T-475).
 #
 # Seven entities are permanently non-functional by HARDWARE fact, not by
@@ -658,10 +699,33 @@ def send_discovery_messages(client):
     }
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
-def on_connect(client, userdata, flags, rc, properties=None):
-    logger.warning(f"Connected with result code {rc}")
-    # Explicit topic list, not BASE_TOPIC + "/#" — see COMMAND_SUBSCRIPTIONS.
-    client.subscribe(COMMAND_SUBSCRIPTIONS)
+def announce_to_home_assistant(client):
+    """Publish everything HA needs to (re)build this device's four entities.
+
+    Extracted from on_connect() by T-527.1 so the birth-message path and the
+    connect path run the IDENTICAL sequence. Two half-implementations of an
+    announce would be the obvious way to reintroduce the 2026-08-05 outage in a
+    new shape: HA came back, this client never re-sent discovery, and four
+    entities sat `unavailable` while every light command failed log-only.
+
+    What is deliberately NOT in here, and must not be moved in:
+
+      client.subscribe(...)      per-CONNECTION, not per-announcement. The
+                                 session is durable (clean_session=False), so
+                                 the broker already holds the subscriptions;
+                                 re-subscribing on every birth message is
+                                 pointless traffic on a single-antenna Zero W.
+      start_publisher_threads()  starts the PCB and camera loops. Each call
+                                 spawns new threads with no check for existing
+                                 ones, so putting it here would leak a full set
+                                 of publisher threads every time HA restarts -
+                                 unbounded, on a device with 512 MB of RAM, and
+                                 invisible until the Pi ran out of memory.
+
+    Idempotent by construction, which is what makes it safe to call from a
+    message handler on a topic anyone can publish to: every publish is retained
+    and overwrites, and clear_retired_entities() is a no-op after the first run.
+    """
     # FIRST, and before anything is announced. Retiring an entity is a delete,
     # and a delete that arrives after the announcement races it: HA would see
     # the surviving device's discovery and the retired entities' clears in
@@ -680,6 +744,16 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # Announce real device state on every (re)connect. Retained, so HA gets it
     # immediately on subscribe instead of sitting at `unknown`.
     publish_light_state(client)
+
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    logger.warning(f"Connected with result code {rc}")
+    # Explicit topic list, not BASE_TOPIC + "/#" — see COMMAND_SUBSCRIPTIONS.
+    client.subscribe(COMMAND_SUBSCRIPTIONS)
+    # HA's birth topic, subscribed separately — see LIFECYCLE_SUBSCRIPTIONS for
+    # why it is not folded into the list above.
+    client.subscribe(LIFECYCLE_SUBSCRIPTIONS)
+    announce_to_home_assistant(client)
     # A water-state refresh stood here, wrapped in a try/except so a sensor
     # explosion could not leave the publisher threads unstarted (T-475 removed
     # it with the entities it refreshed). Nothing between the subscribe and the
@@ -688,6 +762,10 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # threads() is the last statement, and an exception escaping above it leaves
     # the PCB and camera loops permanently unstarted while gardyn/status sits at
     # "online" and the device looks perfectly healthy.
+    #
+    # That hazard now has a second entrance: announce_to_home_assistant() above
+    # is the whole announce sequence, so a raise anywhere inside it skips this
+    # line just as surely. TestConnectSequencing asserts this call is reached.
     start_publisher_threads(client)
 
 def on_message(client, userdata, msg):
@@ -703,8 +781,48 @@ def on_message(client, userdata, msg):
     topic_suffix = msg.topic.replace(BASE_TOPIC + "/", "")
 
     try:
+        # === Home Assistant lifecycle ===
+        #
+        # Matched on msg.topic, NOT topic_suffix. The suffix is produced by
+        # stripping a BASE_TOPIC prefix this topic does not have, so it would
+        # arrive here as the full "homeassistant/status" and match nothing —
+        # which is exactly how this went unnoticed: an unhandled topic falls
+        # through the chain silently and looks identical to a topic nobody
+        # subscribed to.
+        #
+        # First in the chain so the reason it exists is the first thing read,
+        # and so no future BASE_TOPIC branch can shadow it.
+        if msg.topic == HA_STATUS_TOPIC:
+            if payload.lower() == HA_BIRTH_PAYLOAD:
+                # The whole point of T-527.1. HA has just come up and has no
+                # idea this device exists: retained discovery is delivered once
+                # per subscribe, so if HA dropped these entities during its own
+                # entity setup, nothing re-sends them and they stay
+                # `unavailable` until somebody reloads the config entry by hand.
+                #
+                # No random delay, in a deliberate departure from the MQTT
+                # integration docs' "adding some random delay in sending the
+                # discovery payload is recommended". That advice is aimed at an
+                # estate of devices all answering one birth message at once;
+                # this is a single client publishing four small retained
+                # configs. Sleeping here would be actively worse than useless —
+                # this callback runs on paho's network loop thread, so a sleep
+                # stalls keepalives and inbound command delivery for its
+                # duration, on the one radio the Pi has.
+                logger.info(
+                    "Home Assistant birth message - re-announcing discovery"
+                )
+                announce_to_home_assistant(client)
+            else:
+                # Almost always HA's own LWT saying "offline". Nothing to do:
+                # this device's availability is its own retained STATUS_TOPIC,
+                # which HA re-reads when it returns. Logged rather than ignored
+                # because "HA went away at 16:38" is the single most useful line
+                # to have when reconstructing an outage like 2026-08-05.
+                logger.info(f"Home Assistant status: {payload!r} - no action")
+
         # === Pump Logic ===
-        if topic_suffix == "pump/command":
+        elif topic_suffix == "pump/command":
             if payload.upper() == "ON":
                 # The interlock lives in start_pump(). The pump entity is
                 # retired (T-475) so there is no state to publish back, but the

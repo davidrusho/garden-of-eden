@@ -77,6 +77,10 @@ STUBBING_MODULES = (
     "tests.test_light_logging",
     "tests.test_retired_entities",
     "tests.test_pump_api_interlock",
+    # Imports the stub apparatus transitively, via test_water_interlock (for
+    # mqtt_mod) and test_retired_entities (for RecordingClient), rather than
+    # installing any stub of its own (T-527.1).
+    "tests.test_ha_birth_message",
 )
 
 # Names that may legitimately appear in sys.modules after an import, outside
@@ -367,6 +371,7 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                                   "services/etc/systemd/system/mqtt.service",
                                   "services/etc/systemd/system/gardyn-netwatch.timer"],
         "mutate_pump_api_interlock.py": ["app/sensors/pump/routes.py"],
+        "mutate_ha_birth_message.py": ["mqtt.py"],
     }
 
     # Harnesses that copy the repository and mutate the COPY. They cannot leave
