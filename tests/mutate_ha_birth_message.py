@@ -297,8 +297,27 @@ MUTANTS = [
 
     # --- 35: the offline reset, which is what makes the window SAFE ---------
     ("drop the offline reset - a genuine HA restart pair can be suppressed",
-     "                _last_birth_announce = None\n",
+     "                if payload.lower() == HA_DEATH_PAYLOAD:\n"
+     "                    _last_birth_announce = None\n",
      ""),
+
+    # --- 36-39: round three, from the reviewer's surviving mutant + gaps -----
+    ("WIDEN the reset to any non-online payload - junk bypasses the debounce",
+     "                if payload.lower() == HA_DEATH_PAYLOAD:\n"
+     "                    _last_birth_announce = None",
+     "                _last_birth_announce = None"),
+
+    ("reset on the BIRTH payload instead of the LWT",
+     "                if payload.lower() == HA_DEATH_PAYLOAD:",
+     "                if payload.lower() != HA_DEATH_PAYLOAD:"),
+
+    ("delete the startup collision warning - silent when the broker is down",
+     "    warn_if_topic_collides()\n",
+     ""),
+
+    ("make the startup check never fire",
+     "def warn_if_topic_collides():",
+     "def warn_if_topic_collides():\n    return False"),
 ]
 
 # Mutant 23 needs a module-level anchor rather than the indented one above.

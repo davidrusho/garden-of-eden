@@ -80,6 +80,11 @@ STATUS_TOPIC = BASE_TOPIC + "/status"
 # here would put the two halves out of sync the first time it was changed.
 HA_STATUS_TOPIC = "homeassistant/status"
 HA_BIRTH_PAYLOAD = "online"
+# HA's last-will payload on the same topic, published by the broker on an
+# unclean drop and by HA itself on a clean shutdown. It marks the boundary
+# between two HA lifecycles, which is why the birth handler treats it as a
+# debounce reset rather than as noise.
+HA_DEATH_PAYLOAD = "offline"
 
 # Subscribed at QoS 1, and kept OUT of COMMAND_SUBSCRIPTIONS on purpose: that
 # list is scoped to BASE_TOPIC and documents what this device consumes as
@@ -725,6 +730,34 @@ def send_discovery_messages(client):
     }
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
+def warn_if_topic_collides():
+    """Report a colliding BASE_TOPIC at STARTUP, not at first connect.
+
+    The two runtime guards for this both live in callbacks, so if the broker is
+    down at boot - the case connect_async(retry_first_connection=True) exists
+    for - neither fires and the misconfiguration is reported nowhere until the
+    broker comes back. This puts it in `journalctl -u mqtt` at the moment anyone
+    would look.
+
+    Aborts nothing. See the guards for why a service that refuses to boot is the
+    wrong answer on a host with no console.
+
+    A MODULE-LEVEL FUNCTION rather than three lines inside `if __name__ ==
+    "__main__"`, because nothing can reach code in that block: it was written
+    there first, and deleting it survived the whole suite. It is only a log
+    line, but it was the one fix in this change with no evidence behind it.
+    """
+    if STATUS_TOPIC == HA_STATUS_TOPIC:
+        logger.error(
+            f"MISCONFIGURED: BASE_TOPIC is {BASE_TOPIC!r}, so this device's "
+            f"status topic is {HA_STATUS_TOPIC}, which is Home Assistant's own. "
+            f"Discovery will not self-heal after an HA restart. Set "
+            f"MQTT_BASETOPIC to something else."
+        )
+        return True
+    return False
+
+
 def _birth_is_debounced():
     """True if a birth message arrived too soon after the last re-announce.
 
@@ -860,8 +893,10 @@ def on_connect(client, userdata, flags, rc, properties=None):
             f"{BASE_TOPIC!r}, which collides with Home Assistant's discovery "
             f"prefix and would make this client re-announce in a loop. "
             f"A birth message may still be delivered from a subscription the "
-            f"broker already holds; the handler ignores it. Discovery will not "
-            f"self-heal until MQTT_BASETOPIC is changed."
+            f"broker already holds; the handler ignores it. NOTE this device "
+            f"still PUBLISHES retained 'online' to that topic on every connect, "
+            f"which other discovery clients read as Home Assistant restarting. "
+            f"Discovery will not self-heal until MQTT_BASETOPIC is changed."
         )
     else:
         client.subscribe(LIFECYCLE_SUBSCRIPTIONS)
@@ -990,12 +1025,37 @@ def on_message(client, userdata, msg):
                 # much cheaper event: a broker restart, a network blip on HA's
                 # side, or a config-entry reload - and a reload is precisely
                 # what unloads and rediscovers every MQTT entity. Two of those
-                # inside ten seconds is reachable. Resetting here makes the
-                # debounce structurally incapable of suppressing a genuine
-                # restart pair, and leaves it protecting only the case it is
-                # actually for: repeated `online` with no intervening `offline`,
-                # which is a flapping or hostile publisher.
-                _last_birth_announce = None
+                # inside ten seconds is reachable.
+                #
+                # BE HONEST ABOUT WHAT THIS GIVES UP, because the first version
+                # of this comment was not. It claimed the reset "leaves the
+                # debounce protecting the case it is actually for: a flapping or
+                # hostile publisher." Both of those are the cases it does NOT
+                # protect. A flapping HA is DEFINED by intervening `offline`s -
+                # the broker publishes the LWT on an unclean drop and HA
+                # publishes it itself on a clean one - so every flap clears the
+                # clock and announces. Measured: ten flaps inside one window
+                # cost 210 publishes, not 21.
+                #
+                # That is not a bug, and it cannot be fixed by tuning: "never
+                # suppress a genuine HA reconnect" and "rate-limit HA
+                # reconnects" are requirements about THE SAME EVENT, so one has
+                # to lose. This picks the first, deliberately - a suppressed
+                # re-announce is the 2026-08-05 outage, a redundant one is
+                # 1.8 KB. For scale, an HA flapping every 10s costs ~10.8 KB/min
+                # against the camera pair's ~12 KB/min baseline: comparable, and
+                # not dangerous.
+                #
+                # What the debounce still bounds is a repeated `online` with no
+                # `offline` between - the retained-birth-after-connect case, and
+                # a publisher stuck sending one payload.
+                #
+                # MATCHED ON THE LWT PAYLOAD, not on "any non-online". The first
+                # version reset on anything that was not `online`, so a single
+                # junk payload between two births bypassed the debounce - wider
+                # than the reasoning above justifies, and nothing pinned it.
+                if payload.lower() == HA_DEATH_PAYLOAD:
+                    _last_birth_announce = None
                 logger.info(f"Home Assistant status: {payload!r} - no action")
 
         # === Pump Logic ===
@@ -1230,20 +1290,7 @@ if __name__ == "__main__":
     # against systemd's default start-limit, burns through the restart budget in
     # seconds and parks the unit in `failed` permanently. A router reboot that
     # brought this Pi up before the broker used to leave the garden dark.
-    # Report a colliding BASE_TOPIC at STARTUP, not at first connect. The two
-    # runtime guards for this both live in callbacks, so if the broker is down
-    # at boot — the case connect_async(retry_first_connection=True) exists for —
-    # neither fires and the misconfiguration is reported nowhere until the
-    # broker returns. This puts it in `journalctl -u mqtt` at the moment anyone
-    # would look. Aborts nothing: see the guards for why a service that refuses
-    # to boot is the wrong answer on a host with no console.
-    if STATUS_TOPIC == HA_STATUS_TOPIC:
-        logger.error(
-            f"MISCONFIGURED: BASE_TOPIC is {BASE_TOPIC!r}, so this device's "
-            f"status topic is {HA_STATUS_TOPIC}, which is Home Assistant's own. "
-            f"Discovery will not self-heal after an HA restart. Set "
-            f"MQTT_BASETOPIC to something else."
-        )
+    warn_if_topic_collides()
 
     client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)
 

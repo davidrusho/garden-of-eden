@@ -429,6 +429,42 @@ class TestTheBirthPathIsDebounced(BirthMessageTestBase):
             "a genuine HA restart inside the debounce window was suppressed",
         )
 
+    def test_only_the_lwt_payload_clears_the_debounce(self):
+        """The reset is narrow, and nothing pinned that before.
+
+        The first version reset on any payload that was not `online`, so a
+        single junk message between two births bypassed the debounce entirely -
+        measured at the time: online -> 'z' -> online produced two full
+        announces zero seconds apart. Wider than the reasoning for the reset
+        justifies, and a mutant restoring the broad form survived.
+        """
+        self._birth()
+        self.client.calls.clear()
+        self._birth("z")          # not the LWT - must NOT clear the clock
+        self._birth()             # still inside the window
+        self.assertEqual(
+            self.client.calls, [],
+            "an arbitrary payload cleared the debounce",
+        )
+
+    def test_a_flapping_ha_is_not_rate_limited_and_that_is_deliberate(self):
+        """Pins the trade-off the comment now states, so it cannot drift back.
+
+        A flapping HA emits `offline`/`online` pairs, so every flap clears the
+        clock and re-announces - ten flaps cost ten announces, not one. This is
+        asserted rather than merely documented because the two requirements
+        ("never suppress a genuine reconnect" and "rate-limit reconnects") are
+        about the same event, so a later attempt to bound the flap WILL be an
+        attempt to suppress genuine reconnects. This test is what says no.
+        """
+        for _ in range(5):
+            self._birth("offline")
+            self._birth()
+        self.assertEqual(
+            len(self.client.to(SURVIVING_DISCOVERY[0])), 5,
+            "a genuine HA reconnect was suppressed to save bandwidth",
+        )
+
     def test_the_connect_announce_suppresses_a_retained_birth(self):
         """The redundant announce LIFECYCLE_SUBSCRIPTIONS predicts by name.
 
@@ -611,6 +647,53 @@ class TestTheTopicCollisionIsRefused(BirthMessageTestBase):
             with self.assertLogs("mqtt", level="ERROR") as captured:
                 mqtt_mod.on_connect(self.client, None, None, 0)
         self.assertTrue(any("NOT subscribing" in l for l in captured.output))
+
+    def test_the_startup_check_reports_a_collision(self):
+        # warn_if_topic_collides() is module-level rather than three lines inside
+        # `if __name__ == "__main__"` precisely so this test can reach it. In the
+        # main block it was unreachable, and deleting it survived the suite.
+        with patch.object(mqtt_mod, "STATUS_TOPIC", HA_STATUS):
+            with self.assertLogs("mqtt", level="ERROR") as captured:
+                self.assertTrue(mqtt_mod.warn_if_topic_collides())
+        self.assertTrue(any("MISCONFIGURED" in l for l in captured.output))
+
+    def test_the_startup_check_is_quiet_on_a_healthy_config(self):
+        self.assertFalse(mqtt_mod.warn_if_topic_collides())
+
+    def test_the_startup_check_is_actually_called_at_startup(self):
+        """Asserted against the SOURCE, because `__main__` cannot be imported.
+
+        Extracting warn_if_topic_collides() made the FUNCTION testable and left
+        its CALL SITE just as unreachable - a mutant deleting the call from the
+        `if __name__ == "__main__"` block survived every test above, because
+        they all invoke the function directly. A function nobody calls is the
+        same silence as a check nobody wrote.
+
+        Same technique tests/test_retired_entities.py uses for the publisher
+        loops, and for the same reason: the code cannot be run from a test, so
+        the source is the only available instrument. It pins that the call
+        exists and that it precedes connect_async, which is the whole point -
+        reporting the collision before the client can block on a broker that is
+        down.
+        """
+        import inspect
+        source = inspect.getsource(mqtt_mod)
+        main_block = source.split('if __name__ == "__main__":')[-1]
+        self.assertIn(
+            "warn_if_topic_collides()", main_block,
+            "the startup collision check is defined but never called",
+        )
+        # `client.connect_async(`, not `connect_async` - the bare name also
+        # appears in the comment block that explains why connect_async is used,
+        # which sits ABOVE the check and made this assertion fail against
+        # correct code. A source assertion has to match a form that only the
+        # code can produce; matching a name matches the prose about it too.
+        self.assertLess(
+            main_block.index("warn_if_topic_collides()"),
+            main_block.index("client.connect_async("),
+            "the collision check runs after connect_async, so a broker that is "
+            "down at boot delays the one report that does not need a broker",
+        )
 
     def test_the_normal_config_is_unaffected(self):
         # Positive control. A collision check with the comparison inverted would
