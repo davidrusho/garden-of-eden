@@ -1,5 +1,8 @@
 # mqtt.py
 #
+# Reviewed: 2026-08-07 against c1549f8 (T-527.1) - three rounds; each found a
+#           confident comment that was wrong, and the third found one in the
+#           fix for the second. The code was never the weak part.
 # Reviewed: 2026-08-01 against 3181aac (T-475, T-478)
 # Reviewed: 2026-07-31 against b0f8f92 (T-472)
 import math
