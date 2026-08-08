@@ -892,11 +892,18 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # A REFUSED CONNACK REACHES THIS CALLBACK. paho calls on_connect from
     # _handle_connack whatever the reason code says — the `if result == 0`
     # blocks around the call site gate the client's own state, not the
-    # callback. One CONNACK does not arrive here: the v3.1.1 protocol-version
-    # rejection, which paho answers itself by downgrading to MQTT v3.1 and
-    # reconnecting. Its sibling early return, for a rejected client identifier,
-    # is guarded by `self._client_id == b''` — this client is constructed with
-    # client_id=IDENTIFIER, so a rejected identifier DOES land here.
+    # callback. Only one CONNACK is answered by paho instead of by us, and only
+    # on its FIRST occurrence: a v3.1.1 protocol-version rejection, which paho
+    # handles by setting self._protocol = MQTTv31 and reconnecting. The guard
+    # around that is `if self._protocol == MQTTv311`, so once the downgrade has
+    # happened it no longer matches — a broker that rejects the version again
+    # after the downgrade DOES reach this callback, measured, as ReasonCode 132.
+    # (There is a second route to non-arrival that is not the downgrade at all:
+    # with reconnect_on_failure=False paho returns MQTT_ERR_PROTOCOL instead.
+    # Nothing here sets that.) Its sibling early return, for a rejected client
+    # identifier, is guarded by `self._client_id == b''` — this client is
+    # constructed with client_id=IDENTIFIER, so that one never fires and a
+    # rejected identifier lands here too.
     #
     # Without this gate the refusal ran the entire connected path against a
     # socket the broker is in the middle of closing: it logged "Connected with
@@ -906,15 +913,28 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # BE EXACT ABOUT THE MECHANISM, because the tempting shorthand — "the
     # publishers never start" — is wrong and points at the wrong fix.
     # start_publisher_threads() sets its once-only flag AND spawns both loops,
-    # so a refused CONNACK spawns them against a client that is not connected:
-    # each loop's first publish returns MQTT_ERR_NO_CONN and is dropped, and
-    # both then sleep 30 minutes. The connect that succeeds seconds later finds
-    # the flag already set and correctly returns early, so nothing re-sends.
-    # Nothing is leaked and nothing looks broken — the device is simply up with
-    # sensor.gardyn_pcb_temperature `unknown` for up to half an hour. That is
-    # the exact race start_publisher_threads()'s own docstring says its guard
-    # exists to prevent, arriving through the one door the guard cannot see:
-    # a callback that is not a connection.
+    # so a refused CONNACK spawns them against a client that is not connected.
+    # Their first publish is then LOST — by whichever of two routes wins the
+    # race, which is why neither is named as the mechanism: _send_publish()
+    # returns MQTT_ERR_NO_CONN once the network loop has closed the socket, and
+    # a publish that got queued before that is discarded by reconnect(), which
+    # clears _out_packet. Each loop then sleeps to its own period — 30 minutes
+    # for publish_pcb_temperature, IMAGE_INTERVAL_SECONDS (an hour, as shipped)
+    # for publish_images.
+    #
+    # The connect that succeeds seconds later finds the flag already set and
+    # correctly returns early, so nothing re-sends. Nothing is leaked and
+    # nothing looks broken — the device is simply up with
+    # sensor.gardyn_pcb_temperature `unknown` for up to half an hour and both
+    # camera images `unknown` for up to an hour.
+    #
+    # This is the race start_publisher_threads()'s docstring describes, but do
+    # NOT say its once-only guard exists to prevent it — an earlier draft of
+    # this comment did, and review caught it. That docstring credits two
+    # different things: moving the start out of __main__ and into on_connect is
+    # what avoids the NO_CONN race, and the guard is for on_connect firing on
+    # every reconnect. The guard never prevented the race; a refused CONNACK
+    # simply satisfies "on_connect fired" without a connection behind it.
     #
     # Returning is not giving up. The broker drops the socket, loop_forever()
     # takes its _reconnect_wait() branch and reconnects on the backoff set by
@@ -991,20 +1011,22 @@ def on_message(client, userdata, msg):
 
     try:
         payload = msg.payload.decode("utf-8").strip()
-        # !r, not '{payload}'. This line is the one place an arbitrary remote
-        # string reaches gardyn.log verbatim, and since T-527.1 the subscription
-        # list reaches OUTSIDE this device's namespace. Every other subscribed
-        # topic is under BASE_TOPIC and is addressed to this device;
-        # homeassistant/status belongs to Home Assistant, and whatever any
-        # client on the broker publishes there lands on this line. Bare
-        # interpolation writes a newline, a CR or an ANSI escape to the file
-        # exactly as sent, so a payload can forge whole log lines - timestamp,
-        # level and all - in the artifact these incidents get reconstructed
-        # from. repr() escapes them to \n / \r / \x1b. Nothing in this repo
-        # rotates gardyn.log - no logrotate unit, and basicConfig() above uses a
-        # plain FileHandler - so what lands here is what a reader sees months
-        # later. The Home Assistant status branch below already used
-        # {payload!r}; this line was the one that did not.
+        # !r, not '{payload}'. THE RULE, because this line is not special and an
+        # earlier version of this comment claimed it was: EVERY log line that
+        # interpolates a payload uses !r. A payload is remote input on every
+        # subscribed topic, not only on homeassistant/status - being under
+        # BASE_TOPIC means a topic is ADDRESSED to this device, not that the
+        # broker vouches for who wrote it. Review found the sibling this comment
+        # had just declared nonexistent, still raw, in the water/low/cm/set
+        # handler below.
+        #
+        # Bare interpolation writes a newline, a CR or an ANSI escape to the
+        # file exactly as sent, so a payload can forge whole log lines -
+        # timestamp, logger name, level and all - in the artifact these
+        # incidents get reconstructed from. repr() escapes them to \n / \r /
+        # \x1b. Nothing in this repo rotates gardyn.log - no logrotate unit, and
+        # basicConfig() above uses a plain FileHandler - so a forged line stays
+        # there for as long as anyone will be reading it.
         logger.info(f"Decoded payload on {msg.topic}: {payload!r}")
     except UnicodeDecodeError:
         logger.error(f"Failed to decode message on topic {msg.topic}. Likely binary.")
@@ -1208,7 +1230,13 @@ def on_message(client, userdata, msg):
             try:
                 candidate = float(payload)
             except ValueError:
-                logger.error(f"Invalid water low cm value: {payload}")
+                # !r for the same reason as the decode line at the top of this
+                # function: water/low/cm/set is in COMMAND_SUBSCRIPTIONS, so
+                # this payload is whatever a broker client sent, and everything
+                # that fails float() reaches this line. It is the more dangerous
+                # of the two - ERROR is above the root logger's WARNING, so it
+                # survives the INFO line being filtered out.
+                logger.error(f"Invalid water low cm value: {payload!r}")
             else:
                 # The validation is UNCHANGED and stays load-bearing: this is
                 # the runtime path by which the pump interlock's threshold can
@@ -1320,9 +1348,18 @@ def start_publisher_threads(client):
     They used to start in __main__ ahead of a blocking connect(), which was safe
     only because the socket already existed by then. Under connect_async the
     connection is established by loop_forever(), so a thread's first publish
-    would race it and be dropped with MQTT_ERR_NO_CONN — and these loops sleep 30
-    minutes, so a lost first publish means an entity sits `unknown` for half an
-    hour. on_connect fires on every reconnect, hence the once-only guard.
+    would race it and be lost — and these loops sleep a long time between
+    passes, so a lost first publish means an entity sits `unknown` until the
+    next one: half an hour for publish_pcb_temperature, and
+    IMAGE_INTERVAL_SECONDS (an hour, as shipped) for publish_images. This
+    docstring said "these loops sleep 30 minutes" until T-527.11; it was right
+    about one of the two.
+
+    on_connect fires on every reconnect, hence the once-only guard. NOTE the
+    guard and the placement fix different things — the placement is what avoids
+    the race above, the guard only stops a second set of threads being spawned.
+    Neither covers on_connect firing for a CONNACK that was REFUSED, which is
+    what _connack_refused() is for.
     """
     global _publisher_threads_started
     with _publisher_threads_lock:

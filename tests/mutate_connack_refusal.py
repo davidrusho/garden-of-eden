@@ -22,16 +22,17 @@ prescribes, rather than by walking the diff:
   2. WHAT IS THE IRREVERSIBLE ACTION? Burning start_publisher_threads()'s
      once-only flag. It is per-PROCESS and nothing retries it: the refused pass
      spawns both loops against a client that is not connected, their first
-     publish is dropped with MQTT_ERR_NO_CONN, and the connect that succeeds
-     finds the flag set and correctly declines to re-start them - so the PCB
-     temperature entity is `unknown` for up to 30 minutes on a host nobody can
-     reach by hand. It gets mutants in both directions:
-     22 stops the flag ever being set, 23 removes the early return that makes
-     it once-only. Neither line is in the diff. They are here because the fix's
-     entire rationale rests on them, and a rationale nothing pins is a comment.
+     publish is lost, and the connect that succeeds finds the flag set and
+     correctly declines to re-start them - so the PCB temperature entity is
+     `unknown` for up to 30 minutes and the camera images for up to an hour
+     (the loops have different periods), on a host nobody can reach by hand.
+     It gets mutants in both directions: 24 stops the flag ever being set, 25
+     removes the early return that makes it once-only. Neither line is in the
+     diff. They are here because the fix's entire rationale rests on them, and
+     a rationale nothing pins is a comment.
 
   3. WHAT DOES THE CHANGED LINE ASSUME? That `rc` is a paho ReasonCode whose
-     `is_failure` is the right question. Mutants 9-16 attack _connack_refused()
+     `is_failure` is the right question. Mutants 9-17 attack _connack_refused()
      directly, including two that swap `is_failure` for `rc != 0`. Those two
      matter more than they look: for CONNACK the two spellings agree on every
      reachable input, so nothing about a real connection distinguishes them and
@@ -39,7 +40,15 @@ prescribes, rather than by walking the diff:
 
   4. WHAT DOES THE CHANGE CLAIM IN PROSE THAT NOTHING ASSERTS? On a device
      whose failure mode is defined as silence, the log is the only evidence
-     either fix ever fired. Mutants 6-8 and 20 delete or downgrade log lines.
+     either fix ever fired. Mutants 6-8 and 21 delete or downgrade log lines.
+
+A SECOND PAYLOAD SINK was found by review AFTER the first version of this
+battery scored 25/25: `logger.error(f"Invalid water low cm value: {payload}")`
+in the water/low/cm/set handler, still raw. No mutant could have caught it -
+there was nothing to perturb, because the guard was simply absent from that
+line, and a kill count cannot go down for code nobody wrote a mutant against.
+Mutant 22 covers it now, and mutant 23 covers the source-level rule, which is
+the only thing able to notice a THIRD sink being added raw.
 
 WHAT IS DELIBERATELY NOT HERE, and this is a finding rather than an omission:
 `{payload!r}` -> `{payload!a}` is not scored. ascii() escapes control characters
@@ -160,7 +169,7 @@ MUTANTS = [
      '            f"Connection REFUSED by broker: {rc}. Not subscribing, not "',
      '            f"Connection REFUSED by broker. Not subscribing, not "'),
 
-    # --- 9-16: what question _connack_refused() asks ------------------------
+    # --- 9-17: what question _connack_refused() asks ------------------------
     ("always report NOT refused - the gate is present and inert",
      "    is_failure = getattr(rc, \"is_failure\", None)\n"
      "    if is_failure is None:\n"
@@ -206,7 +215,7 @@ MUTANTS = [
      "        return rc != 0",
      "        return False"),
 
-    # --- 18-21: the decode line ---------------------------------------------
+    # --- 18-23: the payload sinks -------------------------------------------
     ("restore the raw interpolation - the second defect, exactly as it was",
      '        logger.info(f"Decoded payload on {msg.topic}: {payload!r}")',
      "        logger.info(f\"Decoded payload on {msg.topic}: '{payload}'\")"),
@@ -223,7 +232,15 @@ MUTANTS = [
      '        logger.info(f"Decoded payload on {msg.topic}: {payload!r}")\n',
      ""),
 
-    # --- 22-23: the invariant the fix RELIES on, in both directions ---------
+    ("un-escape the water threshold rejection - the sink review found raw",
+     '                logger.error(f"Invalid water low cm value: {payload!r}")',
+     '                logger.error(f"Invalid water low cm value: {payload}")'),
+
+    ("escape it with !s instead - reads right, escapes nothing",
+     '                logger.error(f"Invalid water low cm value: {payload!r}")',
+     '                logger.error(f"Invalid water low cm value: {payload!s}")'),
+
+    # --- 24-25: the invariant the fix RELIES on, in both directions ---------
     # Neither line is in the diff. The fix's whole argument is that the flag is
     # per-process and once-only; if it were neither, burning it would cost
     # nothing and this ticket would not exist.
@@ -235,7 +252,7 @@ MUTANTS = [
      "        if _publisher_threads_started:\n            return",
      "        if False:\n            return"),
 
-    # --- 24-25: the announce sequence the gate now stands in front of -------
+    # --- 26-27: the announce sequence the gate now stands in front of -------
     # An over-correction is not a smaller bug. These pin that the ACCEPTED path
     # still does its work, from the other side.
     ("drop the announce from the connect path entirely",

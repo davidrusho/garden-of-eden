@@ -15,27 +15,43 @@ REACHES THIS DEVICE.
    start_publisher_threads() does NOT heal, and the shorthand for why is wrong
    in a way worth stating: it is not that the publishers never start. It sets
    its once-only flag AND spawns both loops, so a refused CONNACK starts them
-   against a client that is not connected - each loop's first publish returns
-   MQTT_ERR_NO_CONN and is dropped, and both then sleep 30 minutes. The connect
+   against a client that is not connected - each loop's first publish is lost,
+   by whichever of two routes wins the race (MQTT_ERR_NO_CONN once the network
+   loop has closed the socket, or discarded by reconnect() clearing the out
+   queue), and each then sleeps to its own period. The connect
    that succeeds seconds later finds the flag set and returns early, so nothing
    re-sends. Nothing leaks and nothing looks broken; the device is simply up
-   with sensor.gardyn_pcb_temperature `unknown` for up to half an hour. That is
-   the precise race start_publisher_threads()'s own docstring says its guard
-   exists to prevent, reached through the one door the guard cannot see.
+   with sensor.gardyn_pcb_temperature `unknown` for up to half an hour and both
+   camera images `unknown` for up to an hour - the two loops have different
+   periods (30 minutes, and IMAGE_INTERVAL_SECONDS which ships as 3600).
+
+   Not to be shortened to "the guard exists to prevent this". It does not:
+   start_publisher_threads()'s docstring credits the PLACEMENT with avoiding
+   that race and the guard only with not spawning a second set of threads. A
+   refused CONNACK satisfies "on_connect fired" without a connection behind it,
+   which is what neither of them covers.
 
    The credential case is the one that matters on this device: a broker
    password rotated while the Pi is running produces exactly this, repeatedly,
    on a host with no console and no physical recovery path.
 
-2. The generic decode line interpolated the payload raw.
+2. Log lines interpolated the payload raw. TWO of them.
 
-   Since T-527.1 the subscription list reaches outside BASE_TOPIC:
-   homeassistant/status is Home Assistant's topic, not this device's, so its
-   contents are whatever some other client on the broker published. `'{payload}'`
-   wrote a newline or an ANSI escape into gardyn.log byte for byte, which is
-   enough to forge a whole log line - timestamp, logger name, level - in the
-   file these incidents get reconstructed from. Nothing in this repo rotates
-   that file, so a forged line stays there.
+   `'{payload}'` wrote a newline or an ANSI escape into gardyn.log byte for
+   byte, which is enough to forge a whole log line - timestamp, logger name,
+   level - in the file these incidents get reconstructed from. Nothing in this
+   repo rotates that file, so a forged line stays there.
+
+   The generic decode line was the one the ticket named. Review found a second,
+   in the water/low/cm/set handler, still raw after the first was fixed - and
+   at ERROR, above the root logger's WARNING, so it is the more exposed of the
+   two. Both are covered here, plus a source-level test for the RULE, because
+   two case-by-case tests cannot notice a third sink being added.
+
+   The framing that produced the miss is worth keeping: a topic under
+   BASE_TOPIC is ADDRESSED to this device, which is not the same as the broker
+   vouching for who published it. Every subscribed topic carries remote input,
+   not just homeassistant/status.
 
 WHAT `rc` ACTUALLY IS, AND HOW THAT WAS ESTABLISHED
 
@@ -46,6 +62,8 @@ non-empty client_id, which is how mqtt.py constructs its client:
 
     v3 rc=0  -> on_connect CALLED, ReasonCode(Connack, 'Success')                   value=0   is_failure=False
     v3 rc=1  -> on_connect NOT called; paho downgrades to v3.1 and reconnects
+                (only the FIRST time - the guard is `self._protocol == MQTTv311`,
+                 so a repeat rejection after the downgrade DOES arrive, as 132)
     v3 rc=2  -> on_connect CALLED, ReasonCode(Connack, 'Client identifier not valid') value=133 is_failure=True
     v3 rc=3  -> on_connect CALLED, ReasonCode(Connack, 'Server unavailable')          value=136 is_failure=True
     v3 rc=4  -> on_connect CALLED, ReasonCode(Connack, 'Bad user name or password')   value=134 is_failure=True
@@ -180,7 +198,8 @@ class ConnackTestBase(unittest.TestCase):
             "the publisher-threads once-only guard was burned on a connection "
             "that never came up, so the loops are running against a dead "
             "socket and the connect that succeeds will correctly decline to "
-            "re-start them - PCB temperature `unknown` for up to 30 minutes",
+            "re-start them - PCB temperature `unknown` for up to 30 minutes "
+            "and the camera images for up to an hour",
         )
 
 
@@ -331,8 +350,8 @@ class TestTheGuardTheFixProtects(ConnackTestBase):
             self.assertEqual(
                 0, thread.call_count,
                 "publisher loops were spawned against a refused connection; "
-                "their first publish is dropped with MQTT_ERR_NO_CONN and the "
-                "PCB temperature entity is `unknown` for the next 30 minutes",
+                "their first publish is lost and the PCB temperature entity is "
+                "`unknown` for the next 30 minutes",
             )
             self._connect(ACCEPTED)
         self.assertEqual(
@@ -457,6 +476,57 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
         message = self._decode_record(HA_STATUS, b"online\x1b[2Jcleared")
         self.assertNotIn("\x1b", message)
         self.assertIn("\\x1b", message)
+
+    def test_a_rejected_water_threshold_cannot_forge_a_log_line_either(self):
+        """The sibling the first version of this suite missed.
+
+        gardyn/water/low/cm/set is in COMMAND_SUBSCRIPTIONS at QoS 1, so its
+        payload is remote input like any other, and everything that fails
+        float() reaches a second log line further down on_message. Review found
+        it still raw after the decode line had been fixed - and it is the worse
+        of the two, because it logs at ERROR, above the root logger's WARNING,
+        so it survives the INFO decode line being filtered out.
+
+        Asserted on the record that names this handler, not on the whole
+        capture: the decode line above logs the same payload (escaped, now) and
+        would satisfy a looser search on its own.
+        """
+        forged = b"x\n2026-08-08 12:00:00,000 - mqtt - ERROR - pump seized"
+        self.assertIn(b"\n", forged)  # the fixture can exhibit the defect
+
+        msg = MagicMock()
+        msg.topic = "gardyn/water/low/cm/set"
+        msg.payload = forged
+        with self.assertLogs(mqtt_mod.logger, level="INFO") as captured:
+            mqtt_mod.on_message(self.client, None, msg)
+
+        rejections = [r.getMessage() for r in captured.records
+                      if r.getMessage().startswith("Invalid water low cm value")]
+        self.assertEqual(1, len(rejections),
+                         [r.getMessage() for r in captured.records])
+        self.assertNotIn("\n", rejections[0],
+                         "a rejected threshold put a line break into "
+                         "gardyn.log at ERROR level")
+        self.assertIn("\\n", rejections[0])
+
+    def test_no_log_line_in_on_message_interpolates_a_payload_raw(self):
+        """The rule rather than the instances, so a THIRD sink cannot be added
+        raw without this failing.
+
+        Source-level on purpose: the two cases above pin the lines that exist,
+        and neither can notice a new one. Matched on the f-string braces a raw
+        interpolation must produce - `{payload}` with the closing brace and no
+        conversion - which `{payload!r}` cannot match.
+        """
+        import inspect
+        source = inspect.getsource(mqtt_mod.on_message)
+        offenders = [line.strip() for line in source.splitlines()
+                     if "logger." in line and "{payload}" in line]
+        self.assertEqual(
+            [], offenders,
+            "a log line interpolates the payload without !r, so a remote "
+            "client can write arbitrary lines into gardyn.log",
+        )
 
     def test_an_ordinary_payload_still_reads_naturally(self):
         """repr() of a plain string is the quoted form the line already had, so
