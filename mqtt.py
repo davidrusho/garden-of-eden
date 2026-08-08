@@ -860,7 +860,75 @@ def announce_to_home_assistant(client):
     _last_birth_announce = monotonic()
 
 
+def _connack_refused(rc):
+    """True when the CONNACK carried a refusal rather than an acceptance.
+
+    `rc`'s TYPE is decided by the callback API version, so this reads both
+    rather than assuming one. Both forms are in paho 2.0.0's _handle_connack():
+
+      VERSION2 — what this file registers — always hands over a ReasonCode, on
+        the v5 and the v3.1.1 path alike; a v3 return code is passed through
+        convert_connack_rc_to_reason_code() first. That mapping is why the v3
+        NUMBERS must not be compared against: "server unavailable" is 3 on the
+        wire and arrives here as ReasonCode 136. `is_failure` is the property
+        paho provides for this question and it is `value >= 0x80`; every CONNACK
+        refusal maps at or above 128, so it answers the whole space.
+      VERSION1 with MQTTv3 hands over the bare int return code instead, 0 being
+        accepted. Nothing here registers that today. The int branch is also what
+        the test suite's on_connect(client, None, None, 0) call sites take.
+
+    Measured against paho 2.0.0 rather than reasoned about: driving a synthetic
+    CONNACK through Client._handle_connack with client_id set and VERSION2
+    registered produced ReasonCode 133/136/134/135 for v3 codes 2/3/4/5, every
+    one of them is_failure=True.
+    """
+    is_failure = getattr(rc, "is_failure", None)
+    if is_failure is None:
+        return rc != 0
+    return bool(is_failure)
+
+
 def on_connect(client, userdata, flags, rc, properties=None):
+    # A REFUSED CONNACK REACHES THIS CALLBACK. paho calls on_connect from
+    # _handle_connack whatever the reason code says — the `if result == 0`
+    # blocks around the call site gate the client's own state, not the
+    # callback. One CONNACK does not arrive here: the v3.1.1 protocol-version
+    # rejection, which paho answers itself by downgrading to MQTT v3.1 and
+    # reconnecting. Its sibling early return, for a rejected client identifier,
+    # is guarded by `self._client_id == b''` — this client is constructed with
+    # client_id=IDENTIFIER, so a rejected identifier DOES land here.
+    #
+    # Without this gate the refusal ran the entire connected path against a
+    # socket the broker is in the middle of closing: it logged "Connected with
+    # result code Not authorized", subscribed, and announced. Those three are
+    # wasted work and heal on the next connect. The last statement does not.
+    #
+    # BE EXACT ABOUT THE MECHANISM, because the tempting shorthand — "the
+    # publishers never start" — is wrong and points at the wrong fix.
+    # start_publisher_threads() sets its once-only flag AND spawns both loops,
+    # so a refused CONNACK spawns them against a client that is not connected:
+    # each loop's first publish returns MQTT_ERR_NO_CONN and is dropped, and
+    # both then sleep 30 minutes. The connect that succeeds seconds later finds
+    # the flag already set and correctly returns early, so nothing re-sends.
+    # Nothing is leaked and nothing looks broken — the device is simply up with
+    # sensor.gardyn_pcb_temperature `unknown` for up to half an hour. That is
+    # the exact race start_publisher_threads()'s own docstring says its guard
+    # exists to prevent, arriving through the one door the guard cannot see:
+    # a callback that is not a connection.
+    #
+    # Returning is not giving up. The broker drops the socket, loop_forever()
+    # takes its _reconnect_wait() branch and reconnects on the backoff set by
+    # reconnect_delay_set() above — so a credential fixed at the broker heals on
+    # the next attempt with nothing to restart by hand, which matters on a host
+    # with no console.
+    if _connack_refused(rc):
+        logger.error(
+            f"Connection REFUSED by broker: {rc}. Not subscribing, not "
+            f"announcing discovery, and NOT starting the publisher threads - "
+            f"their once-only guard must survive for the connect that succeeds. "
+            f"paho will retry with backoff."
+        )
+        return
     logger.warning(f"Connected with result code {rc}")
     # Explicit topic list, not BASE_TOPIC + "/#" — see COMMAND_SUBSCRIPTIONS.
     client.subscribe(COMMAND_SUBSCRIPTIONS)
@@ -923,7 +991,21 @@ def on_message(client, userdata, msg):
 
     try:
         payload = msg.payload.decode("utf-8").strip()
-        logger.info(f"Decoded payload on {msg.topic}: '{payload}'")
+        # !r, not '{payload}'. This line is the one place an arbitrary remote
+        # string reaches gardyn.log verbatim, and since T-527.1 the subscription
+        # list reaches OUTSIDE this device's namespace. Every other subscribed
+        # topic is under BASE_TOPIC and is addressed to this device;
+        # homeassistant/status belongs to Home Assistant, and whatever any
+        # client on the broker publishes there lands on this line. Bare
+        # interpolation writes a newline, a CR or an ANSI escape to the file
+        # exactly as sent, so a payload can forge whole log lines - timestamp,
+        # level and all - in the artifact these incidents get reconstructed
+        # from. repr() escapes them to \n / \r / \x1b. Nothing in this repo
+        # rotates gardyn.log - no logrotate unit, and basicConfig() above uses a
+        # plain FileHandler - so what lands here is what a reader sees months
+        # later. The Home Assistant status branch below already used
+        # {payload!r}; this line was the one that did not.
+        logger.info(f"Decoded payload on {msg.topic}: {payload!r}")
     except UnicodeDecodeError:
         logger.error(f"Failed to decode message on topic {msg.topic}. Likely binary.")
         return

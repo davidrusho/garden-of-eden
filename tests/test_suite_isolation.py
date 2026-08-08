@@ -81,6 +81,8 @@ STUBBING_MODULES = (
     # mqtt_mod) and test_retired_entities (for RecordingClient), rather than
     # installing any stub of its own (T-527.1).
     "tests.test_ha_birth_message",
+    # Same transitive route, same two sources, no stub of its own (T-527.11).
+    "tests.test_connack_refusal",
 )
 
 # Names that may legitimately appear in sys.modules after an import, outside
@@ -389,6 +391,7 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                                   "services/etc/systemd/system/gardyn-netwatch.timer"],
         "mutate_pump_api_interlock.py": ["app/sensors/pump/routes.py"],
         "mutate_ha_birth_message.py": ["mqtt.py"],
+        "mutate_connack_refusal.py": ["mqtt.py"],
     }
 
     # Harnesses that copy the repository and mutate the COPY. They cannot leave
