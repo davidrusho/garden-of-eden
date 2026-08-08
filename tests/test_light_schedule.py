@@ -411,6 +411,57 @@ class ClampingTests(unittest.TestCase):
         )
         self.assertEqual(ls.decide(self.schedule, _at("12:00"), False, 1e308)[0], 100)
 
+    def test_every_shape_a_caller_can_produce_lands_in_the_same_place(self):
+        # The string column is the one that was broken. int() refuses any
+        # string with a decimal point, so "55.0" - which the docstring itself
+        # cites as a legitimate brightness - used to become 0, a dark garden
+        # from a well-formed publish, while 55.9 became 55. A caller cannot
+        # know which shape it holds when a payload arrives as bytes on a wire.
+        cases = [
+            (55.9, 55), ("55", 55), ("55.0", 55), (55, 55),
+            (float("inf"), 100), ("inf", 100), (1e308, 100), ("1e999", 100),
+            (-1, 0), ("-1", 0), (float("-inf"), 0),
+            (float("nan"), 0), ("nan", 0), ("abc", 0), (b"xyz", 0), ([], 0),
+            (10 ** 400, 100), (-(10 ** 400), 0),
+            # float() accepts bytes, so an undecoded MQTT payload clamps
+            # correctly rather than becoming 0. Worth pinning: it means the
+            # T-527.5 seam does not have to decode before clamping, and a
+            # future switch back to int()-style parsing would break it
+            # silently in the dark-garden direction.
+            (b"55", 55), (b"55.0", 55), (b"999", 100),
+        ]
+        for value, expected in cases:
+            # _clamped directly, because `None` is a SENTINEL at the decide()
+            # boundary (it means "no history", routing to the fallback branch)
+            # rather than a value to clamp. Going through decide() here would
+            # conflate the two, which is how the first draft of this test
+            # failed. The branch-level tests below cover the routing.
+            self.assertEqual(
+                ls._clamped(value), expected, f"{value!r} should clamp to {expected}"
+            )
+        self.assertEqual(ls._clamped(None), 0)
+        self.assertEqual(
+            ls.decide(self.schedule, _at("12:00"), False, None)[1],
+            "fallback_unsynced",
+            "None must stay a sentinel at the decide() boundary, not a clamped 0",
+        )
+
+    def test_the_clamp_is_applied_on_the_SCHEDULE_branch_too(self):
+        # A Schedule built through the bare NamedTuple constructor skips
+        # Schedule.of's validation - which the Schedule docstring now says out
+        # loud, and which is exactly what makes this clamp load-bearing rather
+        # than decorative. Deleting it survived the whole suite until this
+        # existed, while decide()'s docstring claimed EVERY returned brightness
+        # goes through _clamped.
+        rogue = ls.Schedule((ls.Boundary(time(0, 0), 999),), 100)
+        self.assertEqual(ls.decide(rogue, _at("12:00"), True), (100, "schedule"))
+
+    def test_the_clamp_is_applied_on_the_FALLBACK_branch_too(self):
+        rogue = ls.Schedule((ls.Boundary(time(0, 0), 50),), 4096)
+        self.assertEqual(
+            ls.decide(rogue, _at("12:00"), False, None), (100, "fallback_unsynced")
+        )
+
     def test_an_object_that_overflows_AND_refuses_comparison_does_not_raise(self):
         # The inner guard in _clamped's OverflowError branch. Unreachable from
         # a payload or a state file - only a custom object gets here - but the
@@ -418,7 +469,7 @@ class ClampingTests(unittest.TestCase):
         # thread is the failure mode the whole module is built around. Given a
         # test, it is also mutable; without one it is unfalsifiable prose.
         class Awkward:
-            def __int__(self):
+            def __float__(self):
                 raise OverflowError("too big to say")
 
             def __gt__(self, other):
@@ -531,10 +582,35 @@ class ParseTests(unittest.TestCase):
                 ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": bad})
 
     def test_junk_before_a_valid_entry_is_refused(self):
-        # The `^` anchor, the other half.
+        # NOT a test of the `^` anchor, though an earlier version of this
+        # comment said it was. `.match()` anchors at position 0 by itself, so
+        # this passes identically with `^` removed — review caught the comment
+        # claiming coverage that does not exist, which is worse than the gap,
+        # because it is what stops the next reader looking. See the note on
+        # _ENTRY_RE: `^` is dormant insurance and nothing can pin it today.
         for bad in ("x03:00=50", " -03:00=50"):
             with self.assertRaises(ls.ScheduleConfigError, msg=bad):
                 ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": bad})
+
+    def test_a_trailing_newline_is_refused_by_the_pattern_itself(self):
+        # `\Z`, not `$` — in Python `$` also matches before a trailing newline,
+        # so "03:00=50\n" satisfied the old pattern and was stopped only by the
+        # .strip() at the call site. Asserted against _ENTRY_RE directly
+        # because parse_schedule strips first, which would hide it.
+        self.assertIsNone(ls._ENTRY_RE.match("03:00=50\n"))
+        self.assertIsNotNone(ls._ENTRY_RE.match("03:00=50"))
+
+    def test_a_non_iterable_schedule_is_refused_as_a_config_error(self):
+        # Not a TypeError. The module tells callers to catch
+        # ScheduleConfigError and fall back to DEFAULT_SCHEDULE rather than
+        # exit; anything escaping that lineage makes the instruction wrong, and
+        # on Restart=always with StartLimitIntervalSec=0 the cost is a
+        # permanent crash loop. Materialising `pairs` introduced exactly that
+        # regression and this is what would have caught it.
+        for bad in (None, 0, 3.5):
+            with self.assertRaises(ls.ScheduleConfigError, msg=repr(bad)):
+                ls.Schedule.of(bad, 100)
+            self.assertTrue(issubclass(ls.ScheduleConfigError, ValueError))
 
     def test_non_ascii_digits_are_refused(self):
         # \d matches Unicode decimal digits in Python 3, so the pattern used to
@@ -720,8 +796,14 @@ class PurityTests(unittest.TestCase):
     def test_the_forbidden_set_names_the_things_that_would_break_the_promise(self):
         # Literals, not a derivation. Emptying or narrowing FORBIDDEN is the
         # quiet way to make the purity test pass forever.
-        for name in ("gpiozero", "pigpio", "paho", "flask", "mqtt", "app", "config"):
+        # `dotenv` was missing from this list while being present in FORBIDDEN,
+        # so dropping it survived the battery — the one-name-narrower gap the
+        # comment above warns about, sitting in the test written to close it.
+        # It is also the transitive tell for config.py, which calls load_dotenv
+        # at import, so it is the least safe name to lose.
+        for name in ("gpiozero", "pigpio", "paho", "flask", "dotenv", "mqtt", "app", "config"):
             self.assertIn(name, self.FORBIDDEN)
+        self.assertEqual(len(self.FORBIDDEN), 8)
 
 
 if __name__ == "__main__":

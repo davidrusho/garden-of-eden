@@ -29,6 +29,19 @@ are questions about the CODE rather than about the suite:
     dormant insurance against a later switch to .search(); nothing can observe
     it until that switch happens, so there is no honest assertion to write.
     See the comment on _ENTRY_RE in light_schedule.py.
+
+  * Deleting `override is not None and` from decide()'s first gate changes
+    nothing, because override_is_live() performs the same None check itself.
+    The clause is kept so the attribute access on the next line is provably
+    safe to a reader and a type checker without holding a fact from another
+    function in your head — decide()'s own comment says so.
+
+A SECOND, INDEPENDENT REVIEW WROTE 17 MUTANTS OVER CONSTRUCTS THIS BATTERY HAD
+NONE FOR, AND SEVEN SURVIVED — five of them undeclared, including both clamps
+in decide() that its docstring claimed were universal. Those are now covered
+above. Read that as the standing caution about any score here: a kill count
+bounds only the mutants somebody thought to write, and the ones you write are
+biased toward the code you were already thinking about.
 """
 import atexit
 import hashlib
@@ -101,11 +114,11 @@ MUTANTS = [
         "return Decision(_clamped(last_applied), SOURCE_HOLD)",
         "return Decision(_clamped(last_applied), SOURCE_SCHEDULE)",
     ),
-    (
-        "_clamped: returns the value unclamped, so set_duty_cycle can raise",
-        "    return max(MIN_BRIGHTNESS, min(MAX_BRIGHTNESS, number))",
-        "    return number",
-    ),
+    # (The old single "returns the value unclamped" mutant is gone: _clamped's
+    # min/max one-liner was replaced by explicit bound checks during the second
+    # remediation, and those have a mutant each — which is strictly better,
+    # since one anchor could only ever test whichever bound it happened to hit
+    # first.)
     (
         "_clamped: a non-numeric value raises instead of degrading",
         "    except (TypeError, ValueError):\n        return MIN_BRIGHTNESS",
@@ -143,8 +156,8 @@ MUTANTS = [
     ),
     (
         "parse_schedule: unpadded hours and minutes accepted",
-        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})$")',
-        r'_ENTRY_RE = re.compile(r"^([0-9]+):([0-9]+)=([0-9]{1,3})$")',
+        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})\Z")',
+        r'_ENTRY_RE = re.compile(r"^([0-9]+):([0-9]+)=([0-9]{1,3})\Z")',
     ),
     (
         "parse_schedule: the minute bound is not checked",
@@ -176,12 +189,12 @@ MUTANTS = [
     # remediation battery from somebody else's survivors rather than from your
     # own list: a kill count bounds only the mutants you thought of.
     (
-        "_clamped: OverflowError escapes, so int(inf) kills the tick thread",
+        "_clamped: OverflowError escapes, so a huge int kills the tick thread",
         "    except OverflowError:",
         "    except ZeroDivisionError:",
     ),
     (
-        "_clamped: an infinite brightness collapses to darkness instead of "
+        "_clamped: an overflowing magnitude collapses to darkness instead of "
         "clamping, reintroducing the discontinuity at the float limit",
         "        return MAX_BRIGHTNESS if positive else MIN_BRIGHTNESS",
         "        return MIN_BRIGHTNESS",
@@ -192,19 +205,76 @@ MUTANTS = [
         "            raise\n        return MAX_BRIGHTNESS if positive",
     ),
     (
-        "_clamped: ValueError escapes, so int(nan) kills the tick thread",
+        "_clamped: ValueError escapes, so float('abc') kills the tick thread",
         "    except (TypeError, ValueError):\n        return MIN_BRIGHTNESS",
         "    except (TypeError,):\n        return MIN_BRIGHTNESS",
     ),
+    # --- Added after the SECOND review, from the mutants it wrote and found
+    # surviving. Its supplementary battery ran 17 over constructs this one had
+    # none for; seven survived. That is the whole argument for building a
+    # remediation battery from somebody else's list.
+    (
+        "_clamped: converts through int(), so '55.0' becomes a dark garden",
+        "        number = float(value)",
+        "        number = int(value)",
+    ),
+    (
+        "_clamped: NaN is not caught, so it reaches int() and raises",
+        "    if number != number:  # NaN, which compares false against everything",
+        "    if False:  # NaN, which compares false against everything",
+    ),
+    (
+        "_clamped: the lower bound is dropped",
+        "    if number < MIN_BRIGHTNESS:\n        return MIN_BRIGHTNESS",
+        "    if False:\n        return MIN_BRIGHTNESS",
+    ),
+    (
+        "_clamped: the upper bound is dropped",
+        "    if number > MAX_BRIGHTNESS:\n        return MAX_BRIGHTNESS",
+        "    if False:\n        return MAX_BRIGHTNESS",
+    ),
+    (
+        "decide: the SCHEDULE branch stops clamping (a Schedule built through "
+        "the bare NamedTuple constructor carries whatever it was given)",
+        "    return Decision(_clamped(phase_at(schedule, now.time())), SOURCE_SCHEDULE)",
+        "    return Decision(phase_at(schedule, now.time()), SOURCE_SCHEDULE)",
+    ),
+    (
+        "decide: the FALLBACK branch stops clamping",
+        "            return Decision(_clamped(schedule.unsynced_fallback), SOURCE_FALLBACK)",
+        "            return Decision(schedule.unsynced_fallback, SOURCE_FALLBACK)",
+    ),
+    (
+        "Schedule.of: a non-iterable raises TypeError, escaping the "
+        "ScheduleConfigError contract the fallback instruction depends on",
+        "        except TypeError:\n            raise ScheduleConfigError(",
+        "        except ZeroDivisionError:\n            raise ScheduleConfigError(",
+    ),
+    (
+        "parse_schedule: the end anchor weakens to $, which matches before a "
+        "trailing newline",
+        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})\Z")',
+        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})$")',
+    ),
+    (
+        "PurityTests: the forbidden-import set quietly drops dotenv, the "
+        "transitive tell for config.py",
+        '    FORBIDDEN = frozenset(\n'
+        '        {"gpiozero", "pigpio", "paho", "flask", "dotenv", "mqtt", "app", "config"}\n'
+        "    )",
+        '    FORBIDDEN = frozenset(\n'
+        '        {"gpiozero", "pigpio", "paho", "flask", "mqtt", "app", "config"}\n'
+        "    )",
+    ),
     (
         "parse_schedule: the entry pattern loses its end anchor",
-        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})$")',
+        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})\Z")',
         r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})")',
     ),
     (
         "parse_schedule: digits widen to Unicode decimals again",
-        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})$")',
-        r'_ENTRY_RE = re.compile(r"^(\d{2}):(\d{2})=(\d{1,3})$")',
+        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})\Z")',
+        r'_ENTRY_RE = re.compile(r"^(\d{2}):(\d{2})=(\d{1,3})\Z")',
     ),
     (
         "parse_schedule: the missing-key guard is dropped (the empty-entry "
@@ -221,8 +291,8 @@ MUTANTS = [
     (
         "Schedule.of: pairs is not materialised, so an exhausted iterator "
         "builds an empty schedule",
-        "        pairs = tuple(pairs)\n        if not pairs:",
-        "        if not pairs:",
+        "            pairs = tuple(pairs)",
+        "            pairs = pairs",
     ),
     (
         "PurityTests: the probe is redirected at an innocuous module",

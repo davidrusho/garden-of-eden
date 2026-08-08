@@ -63,7 +63,11 @@ KEY_UNSYNCED_FALLBACK = "GARDYN_LIGHT_UNSYNCED_FALLBACK"
 # "HH:MM=BB", comma-separated. A schedule is edited by hand under sudoedit, so
 # a typo must be loud. Three separate properties do that, and each is pinned by
 # its own test and its own mutant:
-#   $         rejects trailing junk. Without it "03:00=50x" and "03:00=50 50"
+#   \Z        rejects trailing junk. NOT `$`, which in Python also matches
+#             just before a trailing newline — "03:00=50\n" satisfied `$` and
+#             was only stopped by the .strip() at the call site, so the
+#             pattern was relying on a caller it does not control.
+#             Without it "03:00=50x" and "03:00=50 50"
 #             parse as three o'clock at 50 and the rest is dropped in silence,
 #             which is exactly what a truncated or fat-fingered edit looks like.
 #   ^         is DORMANT INSURANCE and is documented as such rather than
@@ -78,7 +82,7 @@ KEY_UNSYNCED_FALLBACK = "GARDYN_LIGHT_UNSYNCED_FALLBACK"
 #   [0-9]     rather than \d, which in Python 3 also matches Unicode decimal
 #             digits — "٠٣:٠٠=٥٠" would otherwise parse, and int() would accept
 #             it. Harmless in value, but it makes the "loud" claim above false.
-_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})$")
+_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})\Z")
 
 
 class ScheduleConfigError(ValueError):
@@ -128,7 +132,20 @@ class Schedule(NamedTuple):
         # container and an exhausted iterator answers "truthy" — Schedule.of
         # (iter([])) used to build an empty Schedule and defer the failure to
         # an IndexError inside phase_at. Ask the count, not the object.
-        pairs = tuple(pairs)
+        #
+        # WRAPPED, because the first version of this line was a regression:
+        # tuple(None) raises TypeError, which is outside ScheduleConfigError's
+        # ValueError lineage, so a caller following this module's instruction
+        # to catch and fall back to DEFAULT_SCHEDULE would have propagated it
+        # instead — and on Restart=always with StartLimitIntervalSec=0 that is
+        # the permanent crash loop. Every refusal in this module must be a
+        # ScheduleConfigError or the fallback contract is a lie.
+        try:
+            pairs = tuple(pairs)
+        except TypeError:
+            raise ScheduleConfigError(
+                f"a schedule must be iterable, got {type(pairs).__name__}"
+            ) from None
         if not pairs:
             raise ScheduleConfigError("a schedule needs at least one boundary")
         seen = set()
@@ -216,14 +233,22 @@ def _clamped(value) -> int:
     `Light.set_duty_cycle` raises ValueError outside 0..100 (confirmed at
     app/sensors/light/light.py).
 
-    OverflowError IS IN THE except CLAUSE AND HAS TO BE. It is a subclass of
-    neither TypeError nor ValueError, and `int()` raises it — not ValueError —
-    for float('inf'), float('-inf') and anything that overflows to them, which
-    includes `float("1e999")`. A caller parsing a brightness payload with
-    float() (the natural choice, since "55.0" is a legitimate brightness) hands
-    inf straight through. An earlier version of this function caught only the
-    first two and this docstring still said "Never raises"; review found it.
-    NaN is safe by a different route: int(nan) raises ValueError.
+    IT CONVERTS THROUGH float(), NOT int(), AND THAT IS THE POINT. `int()`
+    refuses every string carrying a decimal point, so an int()-based version
+    turned "55.0" into 0 — a DARK GARDEN from a well-formed brightness — while
+    turning 55.9 into 55. Two reviews were needed to find that, because the
+    float shape was tested and the string shape was not, and the docstring
+    itself cited "55.0" as legitimate while the code rejected it. Every shape a
+    caller can produce now lands in the same place:
+
+        55.9  "55"  "55.0"  ->  55        inf  "inf"  1e308  "1e999"  ->  100
+        -1    "-1"          ->   0        nan  "nan"  "abc"  b"55"    ->   0
+
+    The remaining OverflowError branch is for a Python int too large to become
+    a float (10**400); its magnitude is meaningful, so it clamps rather than
+    reading as garbage. NaN is caught explicitly because it compares false
+    against every bound, so a plain min/max would let it through to int() and
+    raise there.
 
     WHY A RAISE HERE WOULD BE EXPENSIVE, stated as measured rather than as
     intuition. The scheduler runs on its own thread, and an unhandled exception
@@ -238,26 +263,30 @@ def _clamped(value) -> int:
     the boring outcome and the boring outcome is correct.
     """
     try:
-        number = int(value)
+        number = float(value)
     except OverflowError:
-        # inf and -inf get CLAMPED, not treated as garbage, because their
-        # magnitude is meaningful and clamping is precisely the operation for
-        # an out-of-range magnitude. Lumping them in with the branch below
-        # produced a discontinuity a test caught immediately: 1e308 returned
-        # 100 and 1e309 returned 0, so "too bright" and "unreadable" gave
-        # opposite answers either side of a floating-point limit nobody chose.
+        # A Python int too large to become a float. Its MAGNITUDE is still
+        # meaningful, and clamping is precisely the operation for an
+        # out-of-range magnitude, so it must not fall through to the garbage
+        # branch below.
         try:
             positive = value > 0
         except TypeError:
-            # Reachable only from an object whose __int__ overflows and which
-            # refuses comparison - never from a payload or a state file. It is
+            # Reachable only from an object that overflows on conversion AND
+            # refuses ordering - never from a payload or a state file. It is
             # here because the alternative is raising, and the entire contract
             # of this function is that it does not.
             return MIN_BRIGHTNESS
         return MAX_BRIGHTNESS if positive else MIN_BRIGHTNESS
     except (TypeError, ValueError):
         return MIN_BRIGHTNESS
-    return max(MIN_BRIGHTNESS, min(MAX_BRIGHTNESS, number))
+    if number != number:  # NaN, which compares false against everything
+        return MIN_BRIGHTNESS
+    if number < MIN_BRIGHTNESS:
+        return MIN_BRIGHTNESS
+    if number > MAX_BRIGHTNESS:
+        return MAX_BRIGHTNESS
+    return int(number)
 
 
 # The photoperiod this garden has actually been running, read live from
