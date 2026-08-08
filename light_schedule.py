@@ -60,10 +60,25 @@ MAX_BRIGHTNESS = 100
 KEY_SCHEDULE = "GARDYN_LIGHT_SCHEDULE"
 KEY_UNSYNCED_FALLBACK = "GARDYN_LIGHT_UNSYNCED_FALLBACK"
 
-# "HH:MM=BB", comma-separated. Anchored, and \d{2} rather than \d+, so "3:00"
-# and "003:00" are refused rather than silently accepted as three o'clock —
-# a schedule is edited by hand under sudoedit and a typo must be loud.
-_ENTRY_RE = re.compile(r"^(\d{2}):(\d{2})=(\d{1,3})$")
+# "HH:MM=BB", comma-separated. A schedule is edited by hand under sudoedit, so
+# a typo must be loud. Three separate properties do that, and each is pinned by
+# its own test and its own mutant:
+#   $         rejects trailing junk. Without it "03:00=50x" and "03:00=50 50"
+#             parse as three o'clock at 50 and the rest is dropped in silence,
+#             which is exactly what a truncated or fat-fingered edit looks like.
+#   ^         is DORMANT INSURANCE and is documented as such rather than
+#             claimed as active, because the call site below uses .match(),
+#             which anchors at position 0 on its own. A battery mutant
+#             removing ^ therefore survives, correctly: it changes nothing
+#             today. It is kept so that a later switch to .search() — a
+#             one-word edit that looks harmless — cannot silently start
+#             accepting leading junk. Nothing can test it until that happens,
+#             which is the honest reason there is no mutant for it.
+#   {2}       rejects "3:00" and "003:00" rather than reading them as 03:00.
+#   [0-9]     rather than \d, which in Python 3 also matches Unicode decimal
+#             digits — "٠٣:٠٠=٥٠" would otherwise parse, and int() would accept
+#             it. Harmless in value, but it makes the "loud" claim above false.
+_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})$")
 
 
 class ScheduleConfigError(ValueError):
@@ -86,8 +101,16 @@ class Boundary(NamedTuple):
 class Schedule(NamedTuple):
     """A full day's photoperiod plus the unsynced-clock fallback.
 
-    `boundaries` is sorted ascending and non-empty; both are enforced by
-    `parse_schedule` and by `Schedule.of`, so nothing downstream re-checks.
+    `boundaries` is sorted ascending and non-empty.
+
+    THAT IS A CONVENTION UPHELD BY `Schedule.of`, NOT AN ENFORCED INVARIANT,
+    and the difference matters to anyone writing new callers. This is a plain
+    NamedTuple, so `Schedule((), 100)` and `Schedule((late, early), 100)` both
+    construct happily and both make `phase_at` and `next_boundary_after` raise
+    IndexError or return nonsense. An earlier draft of this docstring claimed
+    the invariants were enforced "so nothing downstream re-checks"; review
+    pointed out that the public constructor walks straight past `of()`.
+    **Build every Schedule through `Schedule.of` or `parse_schedule`.**
     """
 
     boundaries: tuple
@@ -101,6 +124,11 @@ class Schedule(NamedTuple):
         test — or DEFAULT_SCHEDULE below — can build one without going through
         string formatting, while still getting every invariant checked.
         """
+        # Materialised BEFORE the emptiness check, because `not pairs` asks the
+        # container and an exhausted iterator answers "truthy" — Schedule.of
+        # (iter([])) used to build an empty Schedule and defer the failure to
+        # an IndexError inside phase_at. Ask the count, not the object.
+        pairs = tuple(pairs)
         if not pairs:
             raise ScheduleConfigError("a schedule needs at least one boundary")
         seen = set()
@@ -141,6 +169,16 @@ class Override(NamedTuple):
     scheduled brightness immediately; an override that survived a restart
     would contradict that, and a crash loop would then pin the lamp off
     schedule with nothing able to clear it.
+
+    THE SEAM CONTRACT FOR T-527.5, because the two fields are defended
+    differently and the asymmetry is otherwise invisible. `brightness` is
+    untrusted and is clamped at decision time, so a hostile MQTT publish is
+    handled. `applied_at` is NOT defended: it must be a NAIVE datetime taken
+    from the same clock decide() is given. Passing None raises AttributeError
+    and passing a tz-aware datetime raises TypeError, both inside the
+    scheduler thread, which is the expensive failure shape _clamped's docstring
+    describes. The caller stamps this field itself — it never comes off the
+    wire — so the fix is to keep it that way, not to add a guard here.
     """
 
     brightness: int
@@ -175,16 +213,48 @@ def _clamped(value) -> int:
     bad value there should be loud. A decision-time value can arrive from
     `gardyn/light/brightness/set`, which any broker client can publish, or
     from a persisted last-applied file that was truncated by a power cut — and
-    `Light.set_duty_cycle` raises ValueError outside 0..100.
+    `Light.set_duty_cycle` raises ValueError outside 0..100 (confirmed at
+    app/sensors/light/light.py).
 
-    That raise is the whole reason this exists. The scheduler runs on its own
-    thread; an exception there kills the THREAD, not the process, so systemd's
-    Restart=always never fires and nothing looks wrong. The lamp simply stops
-    following its schedule, silently, until somebody notices the garden is
-    dark. Clamping is the boring outcome and the boring outcome is correct.
+    OverflowError IS IN THE except CLAUSE AND HAS TO BE. It is a subclass of
+    neither TypeError nor ValueError, and `int()` raises it — not ValueError —
+    for float('inf'), float('-inf') and anything that overflows to them, which
+    includes `float("1e999")`. A caller parsing a brightness payload with
+    float() (the natural choice, since "55.0" is a legitimate brightness) hands
+    inf straight through. An earlier version of this function caught only the
+    first two and this docstring still said "Never raises"; review found it.
+    NaN is safe by a different route: int(nan) raises ValueError.
+
+    WHY A RAISE HERE WOULD BE EXPENSIVE, stated as measured rather than as
+    intuition. The scheduler runs on its own thread, and an unhandled exception
+    there kills the THREAD and leaves the process alive with exit status 0, so
+    systemd's Restart=always never fires and the lamp simply stops following
+    its schedule. It is not literally invisible — Python's default
+    threading.excepthook writes a traceback to stderr, mqtt.service sets no
+    StandardError= so systemd's journal default applies, and mqtt.py's
+    basicConfig installs a StreamHandler alongside the gardyn.log FileHandler.
+    So `journalctl -u mqtt` is exactly where the evidence would be. What is
+    missing is any signal that would make somebody go and look. Clamping is
+    the boring outcome and the boring outcome is correct.
     """
     try:
         number = int(value)
+    except OverflowError:
+        # inf and -inf get CLAMPED, not treated as garbage, because their
+        # magnitude is meaningful and clamping is precisely the operation for
+        # an out-of-range magnitude. Lumping them in with the branch below
+        # produced a discontinuity a test caught immediately: 1e308 returned
+        # 100 and 1e309 returned 0, so "too bright" and "unreadable" gave
+        # opposite answers either side of a floating-point limit nobody chose.
+        try:
+            positive = value > 0
+        except TypeError:
+            # Reachable only from an object whose __int__ overflows and which
+            # refuses comparison - never from a payload or a state file. It is
+            # here because the alternative is raising, and the entire contract
+            # of this function is that it does not.
+            return MIN_BRIGHTNESS
+        return MAX_BRIGHTNESS if positive else MIN_BRIGHTNESS
     except (TypeError, ValueError):
         return MIN_BRIGHTNESS
     return max(MIN_BRIGHTNESS, min(MAX_BRIGHTNESS, number))
@@ -286,11 +356,29 @@ def next_boundary_after(schedule: Schedule, when: datetime) -> datetime:
 
     Naive local time throughout, and that is a deliberate limit rather than an
     oversight: APScheduler was rejected in the design specifically because DST
-    handling is not needed here. What makes it not needed is that US DST
-    transitions happen at 02:00 local, and none of the shipped boundaries
-    (03:00, 04:00, 18:00, 19:00) lands in the hour that is skipped or repeated.
-    A boundary added between 02:00 and 03:00 would break that, so it is a
-    constraint on future edits, not a property of the code.
+    handling is not needed here.
+
+    WHAT MAKES IT NOT NEEDED IS PHASE COMPUTATION, not the choice of boundary
+    times. An earlier version of this docstring argued the second thing and got
+    the hours wrong on top of it, so state both halves exactly. Measured
+    against the tzdb via zoneinfo for America/Denver 2026, the two transitions
+    are NOT the same hour:
+
+      spring forward  2026-03-08  01:00 MST -> 03:00 MDT   02:00-02:59 SKIPPED
+      fall back       2026-11-01  01:00 MDT -> 01:00 MST   01:00-01:59 REPEATED
+
+    So a rule of the form "keep boundaries out of the transition hour" would
+    have to name both, and `hour != 2` guards only half of it.
+
+    It does not need to be a rule, because decide() asks what phase it is now
+    rather than reacting to boundary edges. A phase opening in the skipped hour
+    is simply never entered on that one morning, and the next tick after the
+    jump already returns the correct later phase; a phase opening in the
+    repeated hour is entered twice, which applies the same brightness twice.
+    Both are self-correcting within one tick. The only thing naive arithmetic
+    genuinely costs is that an override's expiry can land an hour early or late
+    across a transition — bounded, twice a year, and cheaper than the
+    dependency the design rejected.
     """
     today = datetime.combine(when.date(), time(0, 0))
     later = [

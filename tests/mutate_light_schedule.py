@@ -14,14 +14,21 @@ has no dependency on its surroundings and the suite resolves the repo root
 from __file__, so a copy would only add a second place for the mutant to be
 left behind.
 
-ONE MUTANT IS DELIBERATELY ABSENT and its absence is the honest report, not an
-oversight: removing the `else: break` in phase_at() is behaviour-preserving by
-construction. The boundaries are sorted, so once one compares greater than the
-target every later one does too and the `if` cannot fire again. Scoring it
-would produce a survivor that says nothing about the suite, and quietly
-dropping it without saying so would let a reader assume the battery covers
-every line. The break is a readability marker for the sortedness invariant,
-not logic.
+TWO MUTANTS ARE DELIBERATELY ABSENT, and saying so is the honest report — a
+kill count bounds only the mutants somebody thought to write, so an unexplained
+gap reads as coverage. Both were run once, both survived, and both survivors
+are questions about the CODE rather than about the suite:
+
+  * Removing the `else: break` in phase_at() is behaviour-preserving by
+    construction. The boundaries are sorted, so once one compares greater than
+    the target every later one does too and the `if` cannot fire again. The
+    break is a readability marker for the sortedness invariant, not logic.
+
+  * Removing the `^` from _ENTRY_RE changes nothing today, because the call
+    site uses .match(), which anchors at position 0 by itself. The `^` is
+    dormant insurance against a later switch to .search(); nothing can observe
+    it until that switch happens, so there is no honest assertion to write.
+    See the comment on _ENTRY_RE in light_schedule.py.
 """
 import atexit
 import hashlib
@@ -136,8 +143,8 @@ MUTANTS = [
     ),
     (
         "parse_schedule: unpadded hours and minutes accepted",
-        r'_ENTRY_RE = re.compile(r"^(\d{2}):(\d{2})=(\d{1,3})$")',
-        r'_ENTRY_RE = re.compile(r"^(\d+):(\d+)=(\d{1,3})$")',
+        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})$")',
+        r'_ENTRY_RE = re.compile(r"^([0-9]+):([0-9]+)=([0-9]{1,3})$")',
     ),
     (
         "parse_schedule: the minute bound is not checked",
@@ -163,6 +170,64 @@ MUTANTS = [
         "MAX_BRIGHTNESS widened past what Light.set_duty_cycle accepts",
         "MAX_BRIGHTNESS = 100",
         "MAX_BRIGHTNESS = 255",
+    ),
+    # --- Added after review. Every one of these SURVIVED an independent
+    # adversarial pass over the same code, which is the point of building a
+    # remediation battery from somebody else's survivors rather than from your
+    # own list: a kill count bounds only the mutants you thought of.
+    (
+        "_clamped: OverflowError escapes, so int(inf) kills the tick thread",
+        "    except OverflowError:",
+        "    except ZeroDivisionError:",
+    ),
+    (
+        "_clamped: an infinite brightness collapses to darkness instead of "
+        "clamping, reintroducing the discontinuity at the float limit",
+        "        return MAX_BRIGHTNESS if positive else MIN_BRIGHTNESS",
+        "        return MIN_BRIGHTNESS",
+    ),
+    (
+        "_clamped: the inner comparison guard re-raises",
+        "            return MIN_BRIGHTNESS\n        return MAX_BRIGHTNESS if positive",
+        "            raise\n        return MAX_BRIGHTNESS if positive",
+    ),
+    (
+        "_clamped: ValueError escapes, so int(nan) kills the tick thread",
+        "    except (TypeError, ValueError):\n        return MIN_BRIGHTNESS",
+        "    except (TypeError,):\n        return MIN_BRIGHTNESS",
+    ),
+    (
+        "parse_schedule: the entry pattern loses its end anchor",
+        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})$")',
+        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})")',
+    ),
+    (
+        "parse_schedule: digits widen to Unicode decimals again",
+        r'_ENTRY_RE = re.compile(r"^([0-9]{2}):([0-9]{2})=([0-9]{1,3})$")',
+        r'_ENTRY_RE = re.compile(r"^(\d{2}):(\d{2})=(\d{1,3})$")',
+    ),
+    (
+        "parse_schedule: the missing-key guard is dropped (the empty-entry "
+        "check still raises, so only the MESSAGE distinguishes them)",
+        '        raise ScheduleConfigError(f"{KEY_SCHEDULE} is missing or empty")',
+        "        pass",
+    ),
+    (
+        "next_boundary_after: candidate loses the minute, so every off-the-hour "
+        "boundary collapses to the top of its hour",
+        "today.replace(hour=b.at.hour, minute=b.at.minute)",
+        "today.replace(hour=b.at.hour)",
+    ),
+    (
+        "Schedule.of: pairs is not materialised, so an exhausted iterator "
+        "builds an empty schedule",
+        "        pairs = tuple(pairs)\n        if not pairs:",
+        "        if not pairs:",
+    ),
+    (
+        "PurityTests: the probe is redirected at an innocuous module",
+        '        hits, pulled = self._forbidden_names_pulled_by("import light_schedule")',
+        '        hits, pulled = self._forbidden_names_pulled_by("import json")',
     ),
     (
         "PurityTests: the forbidden-import set is emptied",
@@ -221,10 +286,14 @@ def _path_for(anchor):
     """Which file an anchor belongs to.
 
     Only the PurityTests mutants live in the test file; everything else is in
-    the module. Keyed on the constant's name rather than on a hand-kept index,
-    so adding a mutant cannot silently point at the wrong file.
+    the module. Keyed on names that appear nowhere in light_schedule.py rather
+    than on a hand-kept index, so adding a mutant cannot silently point at the
+    wrong file. A wrong route is not silent anyway - the anchor then matches
+    zero times and apply_mutation refuses with no verdict - but a refusal
+    reads as a harness bug at the moment you least want to debug one.
     """
-    return TEST_FILE if "FORBIDDEN = frozenset" in anchor else TARGET
+    test_only = ("FORBIDDEN = frozenset", "_forbidden_names_pulled_by")
+    return TEST_FILE if any(name in anchor for name in test_only) else TARGET
 
 
 def restore():
@@ -350,7 +419,7 @@ def _run():
     print("=" * 72)
     print(f"{len(MUTANTS)} MUTANTS")
     print("=" * 72)
-    killed, survived, unapplied = [], [], []
+    killed, survived, unapplied, broad = [], [], [], []
     for i, (label, anchor, replacement) in enumerate(MUTANTS, 1):
         print(f"[{i}/{len(MUTANTS)}] {label}")
         if not apply_mutation(anchor, replacement):
@@ -362,23 +431,39 @@ def _run():
         if ok:
             print("  SURVIVED - no test noticed")
             survived.append(label)
-        else:
-            # Read WHY it died, not just the colour. A mutant that reddens the
-            # whole suite tested the harness, not the behaviour, and
-            # "killed (0 failing case(s))" is the tell for exactly that.
-            fails = [
-                line for line in out.splitlines() if line.startswith(("FAIL:", "ERROR:"))
-            ]
-            print(f"  killed ({len(fails)} failing case(s))")
-            for line in fails[:3]:
-                print(f"      {line}")
-            killed.append(label)
+            continue
+
+        # Read WHY it died, not just the colour, and ACT on the reading. A
+        # review of this harness's sibling found the tell being printed and
+        # then ignored: a mutant that compiles but dies at IMPORT reddens every
+        # suite with zero named failing cases, and was still appended to
+        # `killed`, so the headline count never moved. The compile() gate above
+        # cannot catch that class - the mutant is valid Python - so the check
+        # has to live here.
+        fails = [
+            line for line in out.splitlines() if line.startswith(("FAIL:", "ERROR:"))
+        ]
+        if not fails:
+            print("  NO VERDICT - the suite went red with no named failing case,")
+            print("  which means the module died at collection or import rather")
+            print("  than the behaviour being noticed. This is NOT a kill.")
+            broad.append(label)
+            continue
+        print(f"  killed ({len(fails)} failing case(s))")
+        for line in fails[:3]:
+            print(f"      {line}")
+        killed.append(label)
 
     print("\n" + "=" * 72)
     print(
         f"RESULT: {len(killed)} killed, {len(survived)} survived, "
-        f"{len(unapplied)} not applied, of {len(MUTANTS)}"
+        f"{len(unapplied)} not applied, {len(broad)} no-verdict, of {len(MUTANTS)}"
     )
+    if broad:
+        print("\nNO VERDICT - red for a broad reason, so the behaviour these were")
+        print("written for was never exercised. Treat as untested, not as killed:")
+        for label in broad:
+            print(f"  - {label}")
     if survived:
         print("\nSURVIVORS - each is a question about the CORPUS and the CODE, not")
         print("only about the assertion. Ask in order: does any real input reach")
@@ -410,7 +495,7 @@ def _run():
     if not clean:
         print("TREE NOT RESTORED - fix before trusting any score above.")
         return 1
-    return 0 if not survived and not unapplied else 1
+    return 0 if not survived and not unapplied and not broad else 1
 
 
 if __name__ == "__main__":

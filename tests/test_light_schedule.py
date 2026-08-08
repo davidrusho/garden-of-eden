@@ -153,6 +153,33 @@ class NextBoundaryTests(unittest.TestCase):
         always = _sched((("12:00", 60),))
         self.assertEqual(ls.next_boundary_after(always, _at("12:00")), _at("12:00", day=9))
 
+    def test_boundaries_off_the_hour_keep_their_minutes(self):
+        # A CORPUS GAP, not a weak assertion. Every other schedule in this file
+        # sits on the hour, so `today.replace(hour=..., minute=...)` and
+        # `today.replace(hour=...)` are identical across all of them — a mutant
+        # deleting the minute survived until this schedule existed. parse_schedule
+        # accepts any minute, so this is a production-reachable path.
+        offbeat = _sched((("06:45", 40), ("21:05", 0)))
+        self.assertEqual(
+            ls.next_boundary_after(offbeat, _at("06:00")), datetime(2026, 8, 8, 6, 45)
+        )
+        self.assertEqual(
+            ls.next_boundary_after(offbeat, _at("06:45")), datetime(2026, 8, 8, 21, 5)
+        )
+        self.assertEqual(
+            ls.next_boundary_after(offbeat, _at("22:00")), datetime(2026, 8, 9, 6, 45)
+        )
+
+    def test_an_override_on_an_off_the_hour_schedule_expires_on_the_minute(self):
+        offbeat = _sched((("06:45", 40), ("21:05", 0)))
+        override = ls.Override(15, datetime(2026, 8, 8, 6, 30))
+        self.assertTrue(
+            ls.override_is_live(offbeat, override, datetime(2026, 8, 8, 6, 44, 59))
+        )
+        self.assertFalse(
+            ls.override_is_live(offbeat, override, datetime(2026, 8, 8, 6, 45))
+        )
+
     def test_it_crosses_a_month_end(self):
         # 2026-08-31 -> 2026-09-01. Naive date arithmetic that added a day by
         # replacing the day number would raise or wrap wrongly here.
@@ -191,11 +218,31 @@ class OverrideLivenessTests(unittest.TestCase):
         self.assertFalse(ls.override_is_live(self.schedule, override, _at("03:00", day=9)))
 
     def test_a_clock_that_stepped_backwards_leaves_the_override_live(self):
-        # NTP correcting a fast clock backwards puts `now` before applied_at.
-        # Bounded by one day, and the safe direction: a person's command keeps
-        # the lamp rather than a suspect clock taking it.
+        # NTP correcting a fast clock backwards puts `now` before applied_at,
+        # and the override keeps the lamp — the safe direction, since a
+        # person's command beats a clock we have just caught being wrong.
         override = ls.Override(30, _at("12:00"))
         self.assertTrue(ls.override_is_live(self.schedule, override, _at("09:00")))
+
+    def test_a_backwards_clock_step_is_NOT_bounded_by_one_day(self):
+        # An earlier comment on the test above claimed the exposure was
+        # "bounded by one day". It is not, and the arithmetic says why: the
+        # expiry is one boundary after `applied_at`, not after `now`, so a
+        # correction backwards by N days leaves the override live for N+1.
+        # Asserted rather than left in prose, because this is the fact that
+        # decides whether the TTL the design calls "additive on top of this"
+        # is ever needed.
+        override = ls.Override(30, datetime(2027, 1, 1, 12, 0))
+        self.assertTrue(
+            ls.override_is_live(self.schedule, override, datetime(2026, 8, 8, 19, 30))
+        )
+        self.assertEqual(
+            ls.decide(self.schedule, datetime(2026, 8, 8, 23, 0), True, 100, override),
+            (30, "override"),
+        )
+        # Reachability is low - fake-hwclock and systemd-timesyncd both step a
+        # boot clock FORWARD - which is why this is documented rather than
+        # guarded. It is not zero.
 
 
 class DecisionOrderingTests(unittest.TestCase):
@@ -322,6 +369,66 @@ class ClampingTests(unittest.TestCase):
             ls.decide(self.schedule, _at("12:00"), True, None, override), (55, "override")
         )
 
+    def test_an_infinite_brightness_is_clamped_rather_than_raising(self):
+        # int(inf) raises OverflowError, which is a subclass of NEITHER
+        # TypeError nor ValueError - so an except clause naming only those two
+        # lets it straight through, and the docstring promising "never raises"
+        # is false. Reachable: a caller parsing the brightness payload with
+        # float() turns "inf", "Infinity" and "1e999" all into float('inf').
+        for value in (float("inf"), float("1e999")):
+            self.assertEqual(
+                ls.decide(self.schedule, _at("12:00"), False, value),
+                (100, "hold_unsynced"),
+                repr(value),
+            )
+            self.assertEqual(
+                ls.decide(
+                    self.schedule, _at("12:00"), True, None, ls.Override(value, _at("11:00"))
+                ),
+                (100, "override"),
+                repr(value),
+            )
+        self.assertEqual(
+            ls.decide(self.schedule, _at("12:00"), False, float("-inf")),
+            (0, "hold_unsynced"),
+        )
+
+    def test_a_nan_brightness_is_clamped_by_a_different_route(self):
+        # int(nan) raises ValueError, not OverflowError. Separate case so that
+        # narrowing the except clause back down is visible.
+        self.assertEqual(
+            ls.decide(self.schedule, _at("12:00"), False, float("nan")),
+            (0, "hold_unsynced"),
+        )
+
+    def test_the_clamp_has_no_discontinuity_at_the_float_limit(self):
+        # 1e308 is finite and 1e309 is inf, and they take different branches.
+        # They must still give the same answer, or "too bright" and
+        # "unreadable" flip places either side of a limit nobody chose.
+        self.assertEqual(
+            ls.decide(self.schedule, _at("12:00"), False, 1e308)[0],
+            ls.decide(self.schedule, _at("12:00"), False, 1e309)[0],
+        )
+        self.assertEqual(ls.decide(self.schedule, _at("12:00"), False, 1e308)[0], 100)
+
+    def test_an_object_that_overflows_AND_refuses_comparison_does_not_raise(self):
+        # The inner guard in _clamped's OverflowError branch. Unreachable from
+        # a payload or a state file - only a custom object gets here - but the
+        # function's contract is that it never raises, and a raise on the tick
+        # thread is the failure mode the whole module is built around. Given a
+        # test, it is also mutable; without one it is unfalsifiable prose.
+        class Awkward:
+            def __int__(self):
+                raise OverflowError("too big to say")
+
+            def __gt__(self, other):
+                raise TypeError("no ordering here")
+
+        self.assertEqual(
+            ls.decide(self.schedule, _at("12:00"), False, Awkward()),
+            (0, "hold_unsynced"),
+        )
+
 
 class ScheduleValidationTests(unittest.TestCase):
     """Schedule.of() — the single construction path, and what it refuses."""
@@ -329,6 +436,23 @@ class ScheduleValidationTests(unittest.TestCase):
     def test_an_empty_schedule_is_refused(self):
         with self.assertRaises(ls.ScheduleConfigError):
             ls.Schedule.of([], 100)
+
+    def test_an_empty_ITERATOR_is_refused_too(self):
+        # `not pairs` asks the container, and an exhausted iterator is truthy -
+        # so this used to build a Schedule with no boundaries and defer the
+        # failure to an IndexError inside phase_at, a long way from the cause.
+        with self.assertRaises(ls.ScheduleConfigError):
+            ls.Schedule.of(iter([]), 100)
+
+    def test_the_bare_namedtuple_constructor_is_NOT_a_validated_path(self):
+        # Documenting the limit rather than pretending it is closed. Schedule
+        # is a plain NamedTuple, so this builds and then breaks downstream.
+        # Every caller must go through Schedule.of or parse_schedule; this test
+        # exists so that requirement is discoverable from the suite and so a
+        # future guard has something to flip.
+        unvalidated = ls.Schedule((), 100)
+        with self.assertRaises(IndexError):
+            ls.phase_at(unvalidated, time(12, 0))
 
     def test_a_duplicate_boundary_time_is_refused(self):
         with self.assertRaises(ls.ScheduleConfigError):
@@ -386,12 +510,39 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(len(parsed.boundaries), 2)
 
     def test_a_missing_schedule_key_is_refused(self):
-        with self.assertRaises(ls.ScheduleConfigError):
+        # assertRaisesRegex, not assertRaises. Both this and the empty-value
+        # case below still raise if the missing-key guard is deleted - they
+        # just fall through to the empty-entry check instead - so asserting
+        # only the exception TYPE makes that guard unkillable, and a mutant
+        # removing it survived until these pinned the message.
+        with self.assertRaisesRegex(ls.ScheduleConfigError, "missing or empty"):
             ls.parse_schedule({})
 
     def test_an_empty_schedule_value_is_refused(self):
-        with self.assertRaises(ls.ScheduleConfigError):
+        with self.assertRaisesRegex(ls.ScheduleConfigError, "missing or empty"):
             ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": "   "})
+
+    def test_trailing_junk_after_a_valid_entry_is_refused(self):
+        # The `$` anchor, which had no test and no mutant. Un-anchored,
+        # "03:00=50x" parses as three o'clock at 50 and the junk vanishes -
+        # exactly what a truncated or fat-fingered edit looks like.
+        for bad in ("03:00=50x", "03:00=50 50", "03:00=50;18:00=0"):
+            with self.assertRaises(ls.ScheduleConfigError, msg=bad):
+                ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": bad})
+
+    def test_junk_before_a_valid_entry_is_refused(self):
+        # The `^` anchor, the other half.
+        for bad in ("x03:00=50", " -03:00=50"):
+            with self.assertRaises(ls.ScheduleConfigError, msg=bad):
+                ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": bad})
+
+    def test_non_ascii_digits_are_refused(self):
+        # \d matches Unicode decimal digits in Python 3, so the pattern used to
+        # accept Eastern Arabic numerals and int() used to convert them. The
+        # parsed value would have been correct, which is what makes it a
+        # defect in the "a typo must be loud" claim rather than in the output.
+        with self.assertRaises(ls.ScheduleConfigError):
+            ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": "٠٣:٠٠=٥٠"})
 
     def test_a_trailing_comma_is_refused_rather_than_skipped(self):
         # Leniency here would make a truncated edit indistinguishable from a
@@ -459,13 +610,27 @@ class ShippedDefaultTests(unittest.TestCase):
         # The design's stated preference under a first boot with no network.
         self.assertGreater(ls.DEFAULT_SCHEDULE.unsynced_fallback, 0)
 
-    def test_no_shipped_boundary_lands_in_the_dst_transition_hour(self):
-        # next_boundary_after() works in naive local time, which is only safe
-        # while no boundary sits in the hour US DST skips or repeats (02:00 to
-        # 03:00 local). This is the assertion behind that claim, so adding a
-        # 02:30 boundary fails here instead of misbehaving twice a year.
-        for boundary in ls.DEFAULT_SCHEDULE.boundaries:
-            self.assertNotEqual(boundary.at.hour, 2, boundary)
+    def test_a_boundary_in_the_dst_skipped_hour_is_accepted_and_self_corrects(self):
+        # THIS TEST REPLACED ONE THAT ASSERTED THE WRONG THING. The original
+        # required no DEFAULT_SCHEDULE boundary to have hour == 2, on the
+        # stated grounds that 02:00-03:00 is "the hour DST skips or repeats".
+        # Two errors: those are different hours (02:00-02:59 is skipped,
+        # 01:00-01:59 is repeated — measured against the tzdb), and a boundary
+        # is added in /etc/gardyn/, which that assertion could never see. It
+        # was a guard over the wrong corpus, checking the wrong hour.
+        #
+        # The honest statement is that such a boundary is ACCEPTED, and that
+        # phase computation is what makes it harmless. On spring-forward
+        # morning the 02:30 phase is simply never entered, and the first tick
+        # after the jump already reports the correct later phase.
+        dst_risky = ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": "02:30=50,12:00=100"})
+        self.assertEqual(len(dst_risky.boundaries), 2)
+        self.assertEqual(ls.phase_at(dst_risky, time(3, 0)), 50)
+        self.assertEqual(ls.phase_at(dst_risky, time(12, 0)), 100)
+        # ...and the repeated hour, which the old assertion did not cover at all.
+        repeated_hour = ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": "01:30=50,12:00=100"})
+        self.assertEqual(ls.phase_at(repeated_hour, time(1, 30)), 50)
+        self.assertEqual(ls.phase_at(repeated_hour, time(1, 29)), 100)
 
 
 class PurityTests(unittest.TestCase):
@@ -515,6 +680,18 @@ class PurityTests(unittest.TestCase):
 
     def test_the_module_stays_importable_with_no_hardware(self):
         hits, pulled = self._forbidden_names_pulled_by("import light_schedule")
+        # The subject assertion comes FIRST and is not decoration. Without it,
+        # redirecting the probe at any innocuous module leaves this test green
+        # while measuring nothing - a mutant swapping the statement for
+        # `import json` survived, and neither the returncode check nor the
+        # control below could see it, because the control imports something
+        # else on purpose.
+        self.assertIn(
+            "light_schedule",
+            pulled,
+            "the probe did not import light_schedule at all, so its verdict "
+            f"is about some other module. Pulled: {sorted(pulled)}",
+        )
         self.assertEqual(
             hits,
             set(),
