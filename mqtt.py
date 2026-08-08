@@ -888,6 +888,19 @@ def _connack_refused(rc):
     return bool(is_failure)
 
 
+# FIVE POSITIONAL ARGUMENTS, NOT FOUR. The client below registers
+# CallbackAPIVersion.VERSION2, and paho 2.0.0's _handle_connack calls a VERSION2
+# on_connect as on_connect(self, userdata, connect_flags, reason, properties) —
+# always five, with `properties` synthesised as Properties(PacketTypes.CONNACK)
+# when the CONNACK carried none, so it is never omitted and never None.
+# `properties=None` is therefore a default nothing in production supplies, and
+# deleting it makes every connect raise TypeError INSIDE the callback:
+# suppress_exceptions defaults to False, so _handle_connack re-raises, the
+# exception leaves loop_forever(), the process exits, and Restart=always with
+# RestartSec=10 and StartLimitIntervalSec=0 turns that into a permanent
+# ten-second restart loop with the grow light off.
+# Measured against paho 2.0.0, not recalled — see tests/test_connack_refusal.py,
+# which drives all three callbacks the way paho drives them.
 def on_connect(client, userdata, flags, rc, properties=None):
     # A REFUSED CONNACK REACHES THIS CALLBACK. paho calls on_connect from
     # _handle_connack whatever the reason code says — the `if result == 0`
@@ -924,9 +937,21 @@ def on_connect(client, userdata, flags, rc, properties=None):
     #
     # The connect that succeeds seconds later finds the flag already set and
     # correctly returns early, so nothing re-sends. Nothing is leaked and
-    # nothing looks broken — the device is simply up with
-    # sensor.gardyn_pcb_temperature `unknown` for up to half an hour and both
-    # camera images `unknown` for up to an hour.
+    # nothing looks broken — the device is simply up with no fresh PCB
+    # temperature for up to half an hour and no fresh camera frame for up to an
+    # hour.
+    #
+    # WHAT HOME ASSISTANT SHOWS in that window depends on what it already had,
+    # and an earlier version of this comment named one case as if it were the
+    # only one ("`unknown` for up to half an hour"). NEITHER PUBLISHER RETAINS:
+    # publish_pcb_temperature() omits retain= and paho defaults it to False,
+    # and _capture_and_publish() passes retain=False explicitly — so there is no
+    # retained message for a subscriber to read on connect and nothing replays
+    # the gap. After a device-only reconnect HA is therefore still holding the
+    # value it last received, which is STALE rather than `unknown`; `unknown` is
+    # what an HA that restarted in the window gets, having no earlier value.
+    # Either way the entity is not reporting the garden for that window, which
+    # is the whole reason for the gate below.
     #
     # This is the race start_publisher_threads()'s docstring describes, but do
     # NOT say its once-only guard exists to prevent it — an earlier draft of
@@ -1233,9 +1258,24 @@ def on_message(client, userdata, msg):
                 # !r for the same reason as the decode line at the top of this
                 # function: water/low/cm/set is in COMMAND_SUBSCRIPTIONS, so
                 # this payload is whatever a broker client sent, and everything
-                # that fails float() reaches this line. It is the more dangerous
-                # of the two - ERROR is above the root logger's WARNING, so it
-                # survives the INFO line being filtered out.
+                # that fails float() reaches this line.
+                #
+                # NO RANKING BETWEEN THE SINKS. An earlier version of this
+                # comment called this one "the more dangerous of the two"
+                # because "ERROR is above the root logger's WARNING, so it
+                # survives the INFO line being filtered out", and that is wrong
+                # twice over. The INFO line is not filtered: logger.setLevel(
+                # logging.INFO) near the top of this module raises THIS logger
+                # to INFO as a deliberate trade, and test_water_interlock.py's
+                # test_service_logger_is_info_so_commands_are_attributable
+                # asserts it. And a record's fate never depends on an ANCESTOR
+                # logger's level at all — the emitting logger's effective level
+                # decides whether a record is created, and from there
+                # callHandlers consults each HANDLER's level, which is what
+                # test_handlers_do_not_filter_above_the_logger_levels in the
+                # same file documents. basicConfig() above leaves both handlers
+                # at NOTSET, so INFO and ERROR land in gardyn.log alike and a
+                # forged line is worth exactly as much on either.
                 logger.error(f"Invalid water low cm value: {payload!r}")
             else:
                 # The validation is UNCHANGED and stays load-bearing: this is
@@ -1373,7 +1413,18 @@ def start_publisher_threads(client):
 
 
 def on_disconnect(client, userdata, flags, rc, properties=None):
-    """Make a drop visible. Nothing logged one before, on either side."""
+    """Make a drop visible. Nothing logged one before, on either side.
+
+    FIVE POSITIONAL ARGUMENTS, for the same reason as on_connect: paho 2.0.0's
+    _do_on_disconnect calls a VERSION2 on_disconnect as
+    (self, userdata, disconnect_flags, reason, properties), synthesising both
+    the flags and the Properties when the drop was local rather than a DISCONNECT
+    packet. `rc` is therefore a ReasonCode, not an int — `rc == 0` is a legal
+    question to ask of it because ReasonCode.__eq__ compares against a bare int
+    by value, and a clean local disconnect arrives as
+    ReasonCode(DISCONNECT, 'Normal disconnection') whose value is 0. Measured
+    against paho 2.0.0; a connection loss arrives as 'Unspecified error' (128).
+    """
     if rc == 0:
         logger.warning("Disconnected from broker cleanly")
     else:

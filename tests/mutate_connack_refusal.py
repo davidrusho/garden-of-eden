@@ -2,11 +2,13 @@
 """Mutation battery for the refused-CONNACK gate and the escaped decode line
 (T-527.11).
 
-Scores tests/test_connack_refusal.py, tests/test_ha_birth_message.py and
-tests/test_retired_entities.py. The last two are in the list because the change
-inserts a return in front of everything they exercise: an over-correction that
-gated a HEALTHY connect would leave this ticket's own suite perfectly green
-while silencing the device, which is the 2026-08-05 outage again.
+Scores tests/test_connack_refusal.py, tests/test_ha_birth_message.py,
+tests/test_retired_entities.py and tests/test_water_interlock.py. The middle two
+are in the list because the change inserts a return in front of everything they
+exercise: an over-correction that gated a HEALTHY connect would leave this
+ticket's own suite perfectly green while silencing the device, which is the
+2026-08-05 outage again. The last was added in T-527.11 remediation - see the
+note on SUITES, including a measurement of what it does and does not catch.
 
 WHY THESE MUTANTS
 
@@ -42,6 +44,17 @@ prescribes, rather than by walking the diff:
      whose failure mode is defined as silence, the log is the only evidence
      either fix ever fired. Mutants 6-8 and 21 delete or downgrade log lines.
 
+     The largest instance of this was found by review after the second version
+     of this battery scored 27/27, and it was not in the diff at all: the
+     CALLBACK SIGNATURES. paho 2.0.0 calls a VERSION2 on_connect and
+     on_disconnect with five positional arguments and never omits the fifth,
+     while every call site in this repo's suite passed four - so `properties`
+     could be deleted from either signature with everything green and the device
+     in a permanent crash loop. Mutants 28-30. on_message was checked in the
+     same pass and is not exposed: paho passes it three arguments under every
+     callback API version, so there is no divergence to be caught out by. It is
+     pinned anyway, because "we checked" ages worse than an assertion.
+
 A SECOND PAYLOAD SINK was found by review AFTER the first version of this
 battery scored 25/25: `logger.error(f"Invalid water low cm value: {payload}")`
 in the water/low/cm/set handler, still raw. No mutant could have caught it -
@@ -50,16 +63,27 @@ line, and a kill count cannot go down for code nobody wrote a mutant against.
 Mutant 22 covers it now, and mutant 23 covers the source-level rule, which is
 the only thing able to notice a THIRD sink being added raw.
 
-WHAT IS DELIBERATELY NOT HERE, and this is a finding rather than an omission:
-`{payload!r}` -> `{payload!a}` is not scored. ascii() escapes control characters
-exactly as repr() does, so for the property under test - a remote payload
-cannot put a raw newline, CR or ESC into gardyn.log - the two are equivalent
-code, and an equivalent mutant surviving says nothing about the suite. The
-difference between them is non-ASCII handling, which this change is not about.
+A THIRD BLIND SPOT was found by review after the second version scored 27/27:
+mqtt.py's threshold-rejection sink is written across two lines (the call on one,
+the f-string on the next), and the source-level rule test filtered for
+'logger.' and '{payload}' on the SAME PHYSICAL LINE. A raw payload could be
+planted there with the whole suite staying green at 23 tests, OK - measured. The
+rule test is now an ast scan of the call rather than a line filter, and mutants
+31-34 are the four shapes that defeated the old one: the multi-line f-string,
+%-style lazy logging, str.format(), and `!s`.
+
+`{payload!a}` IS scored now (mutant 33) and the reasoning for previously
+excluding it still stands and is worth keeping straight: ascii() escapes \\n,
+\\r and \\x1b exactly as repr() does, so `!a` is NOT a forgery path, and while
+the only tests were safety tests it was a genuinely equivalent mutant whose
+survival said nothing. It is killed by a CANONICAL-SPELLING test, not a safety
+one, and the two are deliberately separate assertions with separate messages.
+Scoring it as though it were a security hole would be the same kind of error the
+"more dangerous of the two" comment was.
 
 Run:  python3 tests/mutate_connack_refusal.py
 
-TWO CONTROLS GATE EVERY RESULT AND BOTH MUST HOLD BEFORE ANY VERDICT IS READ.
+THREE CONTROLS GATE EVERY RESULT AND ALL MUST HOLD BEFORE ANY VERDICT IS READ.
 A battery scores a mutant by whether the test run FAILED, so a broken scorer
 reports every mutant caught - the most reassuring output available, and the one
 that goes straight into a summary as proof of rigour:
@@ -69,15 +93,23 @@ that goes straight into a summary as proof of rigour:
   CONTROL B  deliberately broken code  -> must be RED (negative control)
              A alone is worthless: it is scored by the same path that may be
              broken, so only B proves the scorer can tell pass from fail.
+  CONTROL C  compiles, dies at import  -> must score NO VERDICT (positive
+             control for the third verdict; see score_run()). Without it, "0
+             no-verdict mutants" is equally consistent with the rule working
+             and with the rule being unreachable.
 
 Mechanics, each of which has bitten this repo:
   * every mutant gated on compile() BEFORE the write. A previous battery in
     this repo scored an IndentationError as a kill: the mutant broke collection,
     every suite reddened, and the behaviour under test never ran. Compiling the
     candidate string also keeps invalid Python off disk entirely.
-  * the count of NAMED failing cases printed per mutant. That count is the only
-    tell for the above - a real kill names the cases it broke, and the giveaway
-    on the earlier run was `killed (0 failing case(s))`.
+  * the count of NAMED failing cases DECIDES the verdict, rather than being
+    printed beside one. compile() stops syntax errors; it does nothing about a
+    mutant that compiles and dies at IMPORT, which reddens every suite with zero
+    named cases. This file used to print `killed (0 failing case(s))` - the
+    documented tell - and then count it as a kill anyway, so the tell corrected
+    nothing. A zero-named-case red is now 'no verdict', reported in its own list
+    and non-zero on exit.
   * every anchor required to match EXACTLY once, and the mutated text compared
     against the original, because a replacement matching nothing exits happily
     and is indistinguishable from one that changed nothing.
@@ -104,8 +136,22 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MQTT = os.path.join(REPO, "mqtt.py")
 
+# tests.test_water_interlock was added in T-527.11 remediation. It asserts the
+# decode line's literal source (test_inbound_decode_is_recorded) and mqtt.py's
+# logger level, so it guards lines this battery mutates and belongs in the
+# blast radius.
+#
+# MEASURED, because the reason it was added overstated what it does: of mutants
+# 18-21 it catches only 21, the one that DELETES the decode line. Its assertion
+# matches the source up to `{msg.topic}` and stops, so every mutant that changes
+# only the CONVERSION (18, 19, 20) leaves it green, as does 22 and the new
+# multi-line sink mutants. It therefore adds no kill this battery did not
+# already have. What it adds is an independent pin on the decode line's
+# existence, held by a suite with different stubs and a different reason to
+# exist - which is worth one extra subprocess per mutant and is not worth
+# describing as coverage it does not provide.
 SUITES = ["tests.test_connack_refusal", "tests.test_ha_birth_message",
-          "tests.test_retired_entities"]
+          "tests.test_retired_entities", "tests.test_water_interlock"]
 
 # The gate, quoted once so a mutant that moves it cannot drift from the one that
 # deletes it.
@@ -263,6 +309,65 @@ MUTANTS = [
     ("drop start_publisher_threads from the connect path",
      "    start_publisher_threads(client)\n",
      ""),
+
+    # --- 28-30: the callback ARITY contract ---------------------------------
+    # paho 2.0.0 calls a VERSION2 on_connect / on_disconnect with FIVE
+    # positional arguments and never omits the fifth. Every call site this
+    # repo's suite had before T-527.11 passed FOUR, so each of these used to
+    # SURVIVE while producing a TypeError inside the callback on every connect
+    # in production - re-raised by paho (suppress_exceptions is False), out of
+    # loop_forever(), process exit, and Restart=always turns that into a
+    # permanent crash loop with the grow light off.
+    ("drop `properties` from on_connect - TypeError on every real CONNACK",
+     "def on_connect(client, userdata, flags, rc, properties=None):",
+     "def on_connect(client, userdata, flags, rc):"),
+
+    ("drop `flags` from on_connect - the 5-arg call binds rc to the wrong slot",
+     "def on_connect(client, userdata, flags, rc, properties=None):",
+     "def on_connect(client, userdata, rc, properties=None):"),
+
+    ("drop `properties` from on_disconnect - nothing called it at all before",
+     "def on_disconnect(client, userdata, flags, rc, properties=None):",
+     "def on_disconnect(client, userdata, flags, rc):"),
+
+    # --- 31-34: the payload sink the LINE-BASED guard could not see ---------
+    # mqtt.py's threshold-rejection sink puts the call on one line and the
+    # f-string on the next. The pre-remediation guard filtered for 'logger.'
+    # and '{payload}' on the same physical line, so all four of these SURVIVED
+    # and the suite stayed green at 23 tests, OK. Measured, not assumed.
+    ("raw payload in the MULTI-LINE sink - invisible to a line filter",
+     '                        f"Rejecting water low threshold {payload!r} - "',
+     '                        f"Rejecting water low threshold {payload} - "'),
+
+    ("!s in the multi-line sink - reads right, escapes nothing",
+     '                        f"Rejecting water low threshold {payload!r} - "',
+     '                        f"Rejecting water low threshold {payload!s} - "'),
+
+    # !a is NOT a forgery path - ascii() escapes \n, \r and \x1b exactly as
+    # repr() does - so this is scored by the CANONICAL-SPELLING test, not by a
+    # safety one. Kept separate from the mutants above on purpose: conflating
+    # "safe but spelled differently" with "a remote client can forge log lines"
+    # is how a rule stops meaning anything.
+    ("!a in the multi-line sink - safe, but not the spelling the rule states",
+     '                        f"Rejecting water low threshold {payload!r} - "',
+     '                        f"Rejecting water low threshold {payload!a} - "'),
+
+    ("%-style lazy logging in the multi-line sink - logging interpolates it raw",
+     "                    logger.error(\n"
+     '                        f"Rejecting water low threshold {payload!r} - "\n'
+     '                        f"must be 0 (disabled) or within "\n'
+     '                        f"{WATER_VALID_MIN_CM:.2f}-{WATER_VALID_MAX_CM:.2f}cm"\n'
+     "                    )",
+     "                    logger.error(\n"
+     '                        "Rejecting water low threshold %s - "\n'
+     '                        "must be 0 (disabled) or within "\n'
+     '                        f"{WATER_VALID_MIN_CM:.2f}-{WATER_VALID_MAX_CM:.2f}cm",\n'
+     "                        payload\n"
+     "                    )"),
+
+    ("str.format() in the single-line sink - the third shape a line filter misses",
+     '                logger.error(f"Invalid water low cm value: {payload!r}")',
+     '                logger.error("Invalid water low cm value: {}".format(payload))'),
 ]
 
 # Control B. A deliberately broken tree that MUST score RED. Kept distinct from
@@ -271,6 +376,24 @@ MUTANTS = [
 CONTROL_B = ("CONTROL B: deliberately broken - the refusal gate never fires",
              "    if _connack_refused(rc):",
              "    if False and _connack_refused(rc):")
+
+# Control C. The gap the compile() gate does NOT close, and the reason
+# score_run() below refuses to call a zero-named-case red a kill.
+#
+# `threadingg.Lock()` is valid Python - compile() passes it, so it reaches disk
+# - and then dies at IMPORT time with a NameError. Every suite exits 1 with no
+# FAIL: or ERROR: line anywhere in its output, because unittest never got as far
+# as collecting a case. Before T-527.11 this scored as `killed (0 failing
+# case(s))` and was appended to `killed` regardless, so the headline count went
+# UP for a mutant whose behaviour was never exercised.
+#
+# This control fires that shape deliberately and asserts the harness classifies
+# it as NO VERDICT. It is a POSITIVE control for the scoring rule: without it,
+# "0 no-verdict mutants" is equally consistent with the rule working and with
+# the rule never being reachable.
+CONTROL_C = ("CONTROL C: compiles, dies at import - must score NO VERDICT",
+             "_publisher_threads_lock = threading.Lock()",
+             "_publisher_threads_lock = threadingg.Lock()")
 
 _ORIGINAL_SRC = None
 
@@ -329,6 +452,30 @@ def apply_mutation(anchor, replacement):
     with open(MQTT, "w") as fh:
         fh.write(mutated)
     return True
+
+
+def score_run(ok, out):
+    """Turn one suite run into a verdict: 'survived', 'killed' or 'no-verdict'.
+
+    THE THIRD VERDICT IS THE POINT. A battery scores by colour, so anything that
+    reddens the run reads as a kill - including a mutant that never let the
+    behaviour under test execute at all. The compile() gate keeps SYNTAX errors
+    off disk; it does nothing about a mutant that compiles and then dies at
+    import (a misspelled name, a bad attribute at module scope, an exception in
+    a top-level call). Those redden every suite with ZERO named failing cases,
+    which is the documented tell - and until T-527.11 this file printed that tell
+    and then appended the mutant to `killed` anyway, so the count it was meant to
+    correct never moved.
+
+    A red run with no named case is therefore NOT a verdict. It is the same
+    class of result as a mutant that would not apply: no information about the
+    suite, and it must not be counted for or against it.
+    """
+    if ok:
+        return "survived", []
+    fails = [line for line in out.splitlines()
+             if line.startswith(("FAIL:", "ERROR:"))]
+    return ("killed" if fails else "no-verdict"), fails
 
 
 def run_suites():
@@ -400,9 +547,30 @@ def _run():
     print("  RED - the scorer can distinguish pass from fail\n")
 
     print("=" * 70)
+    print("CONTROL C (positive, for the no-verdict rule) - an import-time break")
+    print("that COMPILES must be classified NO VERDICT, never a kill")
+    print("=" * 70)
+    label, anchor, replacement = CONTROL_C
+    if not apply_mutation(anchor, replacement):
+        print("\nCONTROL C could not be applied. NO DATA.")
+        restore()
+        return 1
+    ok, out = run_suites()
+    restore()
+    verdict, fails = score_run(ok, out)
+    if verdict != "no-verdict":
+        print(f"  scored '{verdict}' with {len(fails)} named failing case(s), "
+              f"but it MUST score 'no-verdict'.")
+        print("\nCONTROL C FAILED - either the scoring rule is not doing its job,")
+        print("or this mutant no longer reproduces the shape it was written for.")
+        print("Either way the no-verdict path is unproven. NO DATA.")
+        return 1
+    print("  NO VERDICT - an import-time break is not counted as a kill\n")
+
+    print("=" * 70)
     print(f"{len(MUTANTS)} MUTANTS")
     print("=" * 70)
-    killed, survived, unapplied = [], [], []
+    killed, survived, unapplied, no_verdict = [], [], [], []
     for i, (label, anchor, replacement) in enumerate(MUTANTS, 1):
         print(f"[{i}/{len(MUTANTS)}] {label}")
         if not apply_mutation(anchor, replacement):
@@ -411,15 +579,16 @@ def _run():
             continue
         ok, out = run_suites()
         restore()
-        if ok:
+        # Read WHY it died, not just the colour - see score_run().
+        verdict, fails = score_run(ok, out)
+        if verdict == "survived":
             print("  SURVIVED - no test noticed")
             survived.append(label)
+        elif verdict == "no-verdict":
+            print("  NO VERDICT - the suites went red with ZERO named failing "
+                  "cases, so the behaviour under test never ran")
+            no_verdict.append(label)
         else:
-            # Read WHY it died, not just the colour. A mutant that reddens the
-            # whole suite tested the harness, not the behaviour - and `killed
-            # (0 failing case(s))` is the tell for exactly that.
-            fails = [l for l in out.splitlines()
-                     if l.startswith(("FAIL:", "ERROR:"))]
             print(f"  killed ({len(fails)} failing case(s))")
             for line in fails[:3]:
                 print(f"      {line}")
@@ -427,10 +596,13 @@ def _run():
 
     print("\n" + "=" * 70)
     print(f"RESULT: {len(killed)} killed, {len(survived)} survived, "
-          f"{len(unapplied)} not applied, of {len(MUTANTS)}")
+          f"{len(no_verdict)} no verdict, {len(unapplied)} not applied, "
+          f"of {len(MUTANTS)}")
     print("=" * 70)
     for label in survived:
         print(f"  SURVIVED  {label}")
+    for label in no_verdict:
+        print(f"  NO VERDICT  {label}")
     for label in unapplied:
         print(f"  NOT APPLIED  {label}")
 
@@ -441,7 +613,7 @@ def _run():
     else:
         print("\n*** TREE NOT RESTORED - mqtt.py DIFFERS. Fix before committing. ***")
         return 1
-    return 0 if not survived and not unapplied else 1
+    return 0 if not survived and not unapplied and not no_verdict else 1
 
 
 if __name__ == "__main__":

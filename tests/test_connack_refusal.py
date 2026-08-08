@@ -21,9 +21,19 @@ REACHES THIS DEVICE.
    queue), and each then sleeps to its own period. The connect
    that succeeds seconds later finds the flag set and returns early, so nothing
    re-sends. Nothing leaks and nothing looks broken; the device is simply up
-   with sensor.gardyn_pcb_temperature `unknown` for up to half an hour and both
-   camera images `unknown` for up to an hour - the two loops have different
-   periods (30 minutes, and IMAGE_INTERVAL_SECONDS which ships as 3600).
+   with no fresh PCB temperature for up to half an hour and no fresh camera
+   frame for up to an hour - the two loops have different periods (30 minutes,
+   and IMAGE_INTERVAL_SECONDS which ships as 3600).
+
+   WHAT HOME ASSISTANT SHOWS in that window is a separate question from how
+   long the window is, and an earlier version of this docstring stated one case
+   as if it were the only one. Neither publisher retains - publish_pcb_
+   temperature() omits retain= (paho defaults it False) and _capture_and_
+   publish() passes retain=False - so nothing replays the gap on connect. A
+   device-only reconnect leaves HA holding the value it last received, STALE
+   rather than `unknown`; `unknown` is what an HA that restarted inside the
+   window gets, having no earlier value of its own. The window, and the
+   severity, are the same either way.
 
    Not to be shortened to "the guard exists to prevent this". It does not:
    start_publisher_threads()'s docstring credits the PLACEMENT with avoiding
@@ -43,10 +53,21 @@ REACHES THIS DEVICE.
    repo rotates that file, so a forged line stays there.
 
    The generic decode line was the one the ticket named. Review found a second,
-   in the water/low/cm/set handler, still raw after the first was fixed - and
-   at ERROR, above the root logger's WARNING, so it is the more exposed of the
-   two. Both are covered here, plus a source-level test for the RULE, because
-   two case-by-case tests cannot notice a third sink being added.
+   in the water/low/cm/set handler, still raw after the first was fixed. Both
+   are covered here, plus a source-level test for the RULE, because
+   case-by-case tests cannot notice a further sink being added.
+
+   NEITHER SINK IS "THE MORE EXPOSED ONE" and two earlier versions of this file
+   said the ERROR one was, on the grounds that "ERROR is above the root
+   logger's WARNING, so it survives the INFO line being filtered out". That is
+   wrong twice. The INFO line is not filtered - mqtt.py raises its own logger to
+   INFO deliberately and tests/test_water_interlock.py asserts it - and an
+   ancestor logger's LEVEL never filters a propagated record in the first
+   place. The emitting logger's effective level decides whether a record exists;
+   from there callHandlers consults each HANDLER's level, which is the mechanism
+   test_handlers_do_not_filter_above_the_logger_levels documents in that same
+   file. basicConfig leaves both handlers at NOTSET, so INFO and ERROR reach
+   gardyn.log alike and a forged line is worth the same on either.
 
    The framing that produced the miss is worth keeping: a topic under
    BASE_TOPIC is ADDRESSED to this device, which is not the same as the broker
@@ -69,15 +90,50 @@ non-empty client_id, which is how mqtt.py constructs its client:
     v3 rc=4  -> on_connect CALLED, ReasonCode(Connack, 'Bad user name or password')   value=134 is_failure=True
     v3 rc=5  -> on_connect CALLED, ReasonCode(Connack, 'Not authorized')              value=135 is_failure=True
 
+    v3 rc=6+ -> on_connect CALLED, ReasonCode(Connack, 'Unspecified error')          value=128 is_failure=True
+
 Note rc=2: paho's early return for a rejected identifier is guarded by
 `self._client_id == b''`, and mqtt.py passes client_id=IDENTIFIER, so that
-rejection DOES reach on_connect on this client. Note also that the value is the
-v5 reason code, not the v3 one - "server unavailable" is 3 on the wire and 136
-here - which is why nothing in this suite compares rc against the v3 numbers.
+rejection DOES reach on_connect on this client. It is unreachable for a SECOND,
+independent reason as well: paho refuses to construct a clean_session=False
+client with an empty or None client_id at all, raising
+`ValueError('A client id must be provided if clean session is False.')` from
+Client.__init__ - so the branch that early return guards cannot exist on this
+client's configuration.
 
-paho is stubbed out in these tests, so the numbers above are reproduced in
-ReasonCodeDouble below rather than imported. They are written as literals for
-that reason: a test that derived them would agree with itself.
+Note rc=6 and above: convert_connack_rc_to_reason_code() maps every out-of-range
+v3 code to 128 'Unspecified error', is_failure=True. The fallback closes the
+space - there is no v3 CONNACK return code that reaches this callback as a
+non-failure other than 0.
+
+Note also that the value is the v5 reason code, not the v3 one - "server
+unavailable" is 3 on the wire and 136 here - which is why nothing in this suite
+compares rc against the v3 numbers.
+
+HOW PAHO CALLS THE CALLBACKS, measured in the same run. This is the INBOUND
+counterpart of RecordingClient's declared publish() signature in
+tests/test_retired_entities.py, and it exists for the same reason: so a double
+cannot disagree with the library about what was meant.
+
+    on_connect     5 positional args  (client, userdata, ConnectFlags,
+                                       ReasonCode, Properties)
+    on_disconnect  5 positional args  (client, userdata, DisconnectFlags,
+                                       ReasonCode, Properties)
+    on_message     3 positional args  (client, userdata, MQTTMessage)
+
+on_connect and on_disconnect are called with FIVE in every case: paho
+synthesises Properties(PacketTypes.CONNACK) / (DISCONNECT) when the packet
+carried none, so the fifth argument is never omitted and never None. Every
+pre-existing call site in this repo's suite passes FOUR, which is why deleting
+`properties=None` from either signature used to leave the whole suite green
+while production raised TypeError inside the callback on every connect -
+suppress_exceptions is False, so paho re-raises, the exception leaves
+loop_forever(), the process exits, and Restart=always makes that permanent.
+TestPahoCallsTheCallbacksLikeThis below is what closes that.
+
+paho is stubbed out in these tests, so the numbers and shapes above are
+reproduced in the doubles below rather than imported. They are written as
+literals for that reason: a test that derived them would agree with itself.
 
 Stubs and RecordingClient come from the existing test modules rather than being
 re-installed - tests.test_water_interlock owns the sys.modules hardware stubs
@@ -87,6 +143,9 @@ non-TestCase names are imported, so nothing here re-runs another module's cases.
 Run:  python3 -m unittest tests.test_connack_refusal
 """
 
+import ast
+import inspect
+import textwrap
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -103,6 +162,12 @@ LIGHT_COMMAND = "gardyn/light/command"
 
 # paho's ReasonCode.is_failure is `self.value >= 0x80` (paho 2.0.0,
 # src/paho/mqtt/reasoncodes.py). 0x80 is 128.
+#
+# A COPY, and nothing here can notice it going stale - paho is stubbed out of
+# this suite, so there is no library to compare against and any test that used
+# this constant on both sides of a comparison would be measuring itself. See
+# test_the_gate_does_not_reimplement_the_boundary, which used to be named as
+# though it pinned this against paho and did not.
 FAILURE_THRESHOLD = 128
 
 
@@ -153,9 +218,169 @@ NOT_AUTHORIZED = ReasonCodeDouble(135, "Not authorized")
 BAD_CREDENTIALS = ReasonCodeDouble(134, "Bad user name or password")
 SERVER_UNAVAILABLE = ReasonCodeDouble(136, "Server unavailable")
 IDENTIFIER_REJECTED = ReasonCodeDouble(133, "Client identifier not valid")
+# Where every out-of-range v3 code lands (rc=6 and up), so the refusal set is
+# not just the four named wire codes - see the table in the module docstring.
+UNSPECIFIED_ERROR = ReasonCodeDouble(128, "Unspecified error")
 
 EVERY_REFUSAL = [NOT_AUTHORIZED, BAD_CREDENTIALS, SERVER_UNAVAILABLE,
-                 IDENTIFIER_REJECTED]
+                 IDENTIFIER_REJECTED, UNSPECIFIED_ERROR]
+
+NORMAL_DISCONNECTION = ReasonCodeDouble(0, "Normal disconnection")
+CONNECTION_LOST = ReasonCodeDouble(128, "Unspecified error")
+
+
+class ConnectFlagsDouble:
+    """paho's ConnectFlags - the THIRD positional argument to a VERSION2
+    on_connect. A namespace object, not the v1 dict; nothing in mqtt.py reads
+    it, which is exactly why only its POSITION matters here."""
+
+    def __init__(self, session_present=False):
+        self.session_present = session_present
+
+
+class DisconnectFlagsDouble:
+    """paho's DisconnectFlags - the third positional argument to a VERSION2
+    on_disconnect."""
+
+    def __init__(self, is_disconnect_packet_from_server=False):
+        self.is_disconnect_packet_from_server = is_disconnect_packet_from_server
+
+
+class PropertiesDouble:
+    """paho's Properties - the FIFTH positional argument, and the one that
+    matters. It is never omitted and never None: when the packet carried no
+    properties paho builds an empty Properties(PacketTypes.CONNACK) rather than
+    dropping the argument."""
+
+    def __init__(self, packet_type="CONNACK"):
+        self.packet_type = packet_type
+
+
+def call_on_connect_as_paho_does(client, rc, userdata=None,
+                                 session_present=False):
+    """Deliver a CONNACK the way paho 2.0.0 delivers one: FIVE positional args.
+
+    Every other call site in this repo's suite passes four, which is the gap
+    this exists to close. Positional on purpose - paho passes them positionally,
+    so a keyword call here would keep passing against a signature that had been
+    reordered.
+    """
+    return mqtt_mod.on_connect(
+        client,
+        userdata,
+        ConnectFlagsDouble(session_present),
+        rc,
+        PropertiesDouble("CONNACK"),
+    )
+
+
+def call_on_disconnect_as_paho_does(client, rc, userdata=None,
+                                    from_server=False):
+    """The same, for on_disconnect - which had NO call site in this suite at
+    all before T-527.11, so its arity was pinned by nothing whatsoever."""
+    return mqtt_mod.on_disconnect(
+        client,
+        userdata,
+        DisconnectFlagsDouble(from_server),
+        rc,
+        PropertiesDouble("DISCONNECT"),
+    )
+
+
+# --- the source-level payload-sink scanner --------------------------------
+#
+# Escaping forms this scanner recognises as NOT reaching the log verbatim.
+# `!a` is ascii(), which escapes \n, \r and \x1b exactly as repr() does; it
+# differs from repr() only in how it renders non-ASCII, which is not what this
+# rule is about. It is therefore safe but non-canonical, and the two tests below
+# separate those two verdicts instead of conflating them.
+_SAFE_CONVERSIONS = {ord("r"): "!r", ord("a"): "!a"}
+_SAFE_WRAPPERS = {"repr": "repr()", "ascii": "ascii()"}
+_CANONICAL_FORMS = {"!r", "repr()"}
+
+
+def _mentions_payload(node):
+    return any(_is_payload_reference(sub) for sub in ast.walk(node))
+
+
+def _payload_sinks(func):
+    """Every place a logger.*() call in `func` puts the payload into a record.
+
+    Returns [(lineno, form, source_line)], where `form` is how that occurrence
+    is escaped - '!r', '!a', 'repr()', 'ascii()' - or 'RAW' for an occurrence
+    that reaches the record byte for byte.
+
+    AST, NOT A LINE FILTER, and the difference is the whole point. The filter
+    this replaces kept lines containing both 'logger.' and '{payload}', which
+    requires the call and the f-string to be on the SAME PHYSICAL LINE.
+    mqtt.py's 'Rejecting water low threshold' sink is not written that way - the
+    call is on one line and the f-string on the next - so a raw payload could be
+    planted there with the whole suite staying green. Measured before this was
+    rewritten, not assumed: 23 tests, OK.
+
+    'RAW' covers every shape that filter also could not see - %-style lazy
+    logging (`logger.error("...%s", payload)`, which logging interpolates in
+    getMessage()), str.format(), plain concatenation, and `{payload!s}`. The
+    test below this one is the positive control that it really reports them.
+    """
+    source = textwrap.dedent(inspect.getsource(func))
+    lines = source.splitlines()
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"):
+            continue
+        for arg in node.args:
+            found.extend(_classify_payload_uses(arg))
+    return [(lineno, form, lines[lineno - 1].strip())
+            for lineno, form in sorted(found)]
+
+
+def _classify_payload_uses(arg):
+    """One logging argument -> [(lineno, form)] for each payload occurrence.
+
+    Three passes, and the ORDER matters. Wrappers are claimed first, because a
+    `repr(payload)` sits inside a FormattedValue carrying no conversion of its
+    own - scanning the f-string first reports that as RAW and then reports the
+    repr() separately, which is one false alarm and one missed accounting from
+    a single expression. Whatever no pass has claimed by the end is reported
+    RAW: reporting the REMAINDER rather than enumerating known-bad shapes means
+    a shape nobody thought of comes out as RAW by default rather than as
+    silence, which is the failure the line filter had.
+    """
+    accounted, found = set(), []
+
+    def claim(node, lineno, form):
+        found.append((lineno, form))
+        accounted.update(id(sub) for sub in ast.walk(node))
+
+    for node in ast.walk(arg):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _SAFE_WRAPPERS):
+            for wrapped in node.args:
+                if _mentions_payload(wrapped):
+                    claim(wrapped, node.lineno, _SAFE_WRAPPERS[node.func.id])
+
+    for node in ast.walk(arg):
+        if (isinstance(node, ast.FormattedValue)
+                and _mentions_payload(node.value)
+                and any(id(sub) not in accounted for sub in ast.walk(node.value)
+                        if _is_payload_reference(sub))):
+            claim(node.value, node.lineno,
+                  _SAFE_CONVERSIONS.get(node.conversion, "RAW"))
+
+    for node in ast.walk(arg):
+        if id(node) not in accounted and _is_payload_reference(node):
+            found.append((node.lineno, "RAW"))
+    return found
+
+
+def _is_payload_reference(node):
+    return ((isinstance(node, ast.Name) and node.id == "payload")
+            or (isinstance(node, ast.Attribute) and node.attr == "payload"))
 
 
 class ConnackTestBase(unittest.TestCase):
@@ -360,6 +585,107 @@ class TestTheGuardTheFixProtects(ConnackTestBase):
         )
 
 
+class TestPahoCallsTheCallbacksLikeThis(ConnackTestBase):
+    """THE ARITY CONTRACT, driven the way paho 2.0.0 actually drives it.
+
+    Everything else in this repo calls on_connect with FOUR positional
+    arguments, because that is what the callbacks were first written against.
+    paho's VERSION2 dispatch passes FIVE - and never omits the fifth, since it
+    synthesises an empty Properties when the packet carried none. The gap that
+    leaves is not theoretical and not gradual: delete `properties=None` from the
+    signature and this whole suite stays green while the device raises TypeError
+    inside the callback on every single connect. paho's suppress_exceptions is
+    False, so it re-raises; the exception leaves loop_forever(); the process
+    exits; mqtt.service is Restart=always with StartLimitIntervalSec=0, so the
+    Pi enters a permanent 10-second crash loop with the grow light off and no
+    console to reach it from.
+
+    THIS IS THE INBOUND HALF of what RecordingClient does outbound. That double
+    declares paho's real publish() signature so it cannot disagree with the
+    library about whether an omitted `retain` is the same as retain=False; these
+    cases declare paho's real CALL so the suite cannot disagree with the library
+    about how many arguments arrive.
+
+    Positional throughout, deliberately. A keyword call would keep passing
+    against a signature whose parameters had been reordered, which is the other
+    half of what "arity" is protecting.
+    """
+
+    def test_on_connect_takes_the_five_positional_arguments_paho_passes(self):
+        """The accepted path, delivered the way the library delivers it."""
+        call_on_connect_as_paho_does(self.client, ACCEPTED)
+        self.assertTrue(
+            mqtt_mod._publisher_threads_started,
+            "on_connect could not be called the way paho calls it, or did not "
+            "reach start_publisher_threads once it was",
+        )
+
+    def test_the_refusal_gate_still_fires_under_the_five_argument_call(self):
+        """The gate and the arity are independent, so both directions are
+        driven through the real calling convention rather than only the
+        accepted one."""
+        for rc in EVERY_REFUSAL:
+            with self.subTest(rc=str(rc)):
+                mqtt_mod._publisher_threads_started = False
+                self.client.calls.clear()
+                call_on_connect_as_paho_does(self.client, rc)
+                self.assertGuardUnburned()
+                self.assertEqual([], self.client.calls)
+
+    def test_on_connect_does_not_require_a_fifth_argument_either(self):
+        """The other side of the same contract, and the reason `properties=None`
+        is a default rather than a required parameter: every pre-existing call
+        site in this repo passes four, and those cases are the regression suite
+        for the accepted path. A signature that DEMANDED five would redden them
+        all - loudly, which is the safe direction, but it would still be a
+        change nobody asked for."""
+        mqtt_mod.on_connect(self.client, None, None, ACCEPTED)
+        self.assertTrue(mqtt_mod._publisher_threads_started)
+
+    def test_on_disconnect_takes_the_five_positional_arguments_paho_passes(self):
+        """on_disconnect had NO call site in this suite before T-527.11, so its
+        arity was pinned by nothing at all - a strictly wider gap than
+        on_connect's, and one that fails on the DISCONNECT path rather than the
+        connect path, i.e. exactly when the broker has already gone away."""
+        with self.assertLogs(mqtt_mod.logger, level="WARNING") as captured:
+            call_on_disconnect_as_paho_does(self.client, NORMAL_DISCONNECTION)
+        self.assertTrue(
+            any("cleanly" in r.getMessage() for r in captured.records),
+            [r.getMessage() for r in captured.records])
+
+    def test_on_disconnect_reports_an_unclean_drop_as_an_error(self):
+        """The branch that matters operationally, and the one that pins that
+        `rc == 0` is being asked of a ReasonCode rather than of an int. paho
+        hands a ReasonCode here too; a clean local drop arrives as value 0
+        ('Normal disconnection') and a connection loss as 128 ('Unspecified
+        error'), so the comparison only works because ReasonCode.__eq__ accepts
+        a bare int."""
+        with self.assertLogs(mqtt_mod.logger, level="ERROR") as captured:
+            call_on_disconnect_as_paho_does(self.client, CONNECTION_LOST,
+                                            from_server=True)
+        messages = [r.getMessage() for r in captured.records]
+        self.assertTrue(any("Unexpectedly disconnected" in m for m in messages),
+                        messages)
+
+    def test_on_message_takes_the_three_positional_arguments_paho_passes(self):
+        """Checked rather than assumed, and it is the one that is NOT at risk:
+        paho passes (client, userdata, message) to on_message in every callback
+        API version, so there is no VERSION1/VERSION2 divergence to be caught
+        out by. It is pinned anyway because "we checked and it was three" is
+        worth exactly as much as the assertion that keeps it three."""
+        mqtt_mod.light = MagicMock()
+        mqtt_mod.light.get_brightness.return_value = 42
+        msg = MagicMock()
+        msg.topic = LIGHT_COMMAND
+        msg.payload = b"ON"
+        with self.assertLogs(mqtt_mod.logger, level="INFO") as captured:
+            mqtt_mod.on_message(self.client, None, msg)
+        self.assertTrue(
+            any(r.getMessage().startswith("Decoded payload on ")
+                for r in captured.records),
+            [r.getMessage() for r in captured.records])
+
+
 class TestWhichQuestionTheGateAsks(unittest.TestCase):
     """_connack_refused() in isolation, including the case that separates the
     two plausible spellings of it."""
@@ -372,7 +698,12 @@ class TestWhichQuestionTheGateAsks(unittest.TestCase):
         for value, name in [(133, "Client identifier not valid"),
                             (134, "Bad user name or password"),
                             (135, "Not authorized"),
-                            (136, "Server unavailable")]:
+                            (136, "Server unavailable"),
+                            # v3 rc=6 and every code above it, via
+                            # convert_connack_rc_to_reason_code's fallback. It
+                            # is what closes the space: no v3 CONNACK code
+                            # reaches this callback as a non-failure except 0.
+                            (128, "Unspecified error")]:
             with self.subTest(name=name):
                 self.assertTrue(
                     mqtt_mod._connack_refused(ReasonCodeDouble(value, name)))
@@ -401,7 +732,29 @@ class TestWhichQuestionTheGateAsks(unittest.TestCase):
             "reason code is a failure",
         )
 
-    def test_the_failure_boundary_is_where_paho_puts_it(self):
+    def test_the_gate_does_not_reimplement_the_boundary(self):
+        """WHAT THIS CANNOT DO, said first, because its previous name
+        (`test_the_failure_boundary_is_where_paho_puts_it`) claimed the
+        opposite. ReasonCodeDouble.is_failure is `value >= FAILURE_THRESHOLD`
+        and FAILURE_THRESHOLD is defined at the top of THIS file, so both sides
+        of the comparison below come from the same place. If paho moved 0x80
+        this test would go on passing, cheerfully, against a stale copy of the
+        number. It measures its own constant.
+
+        Nothing in this suite can do better, and that is a property of the
+        suite's design rather than an oversight to fix here: paho is stubbed out
+        of sys.modules by tests.test_water_interlock and
+        tests/test_suite_isolation.py asserts that no real one leaks in, so
+        there is no library present to compare against. The pin against the real
+        library is the measured run recorded in this module's docstring, which
+        is evidence with a date on it rather than an assertion.
+
+        WHAT IT DOES PIN, which is worth keeping: that _connack_refused()
+        delegates the boundary to the reason code instead of carrying a
+        threshold of its own. A gate rewritten as `rc.value >= 200`, or as
+        `rc.value > 128`, disagrees with the double at these two inputs and
+        fails here.
+        """
         self.assertFalse(mqtt_mod._connack_refused(ReasonCodeDouble(127, "below")))
         self.assertTrue(mqtt_mod._connack_refused(ReasonCodeDouble(128, "Unspecified error")))
 
@@ -483,9 +836,12 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
         gardyn/water/low/cm/set is in COMMAND_SUBSCRIPTIONS at QoS 1, so its
         payload is remote input like any other, and everything that fails
         float() reaches a second log line further down on_message. Review found
-        it still raw after the decode line had been fixed - and it is the worse
-        of the two, because it logs at ERROR, above the root logger's WARNING,
-        so it survives the INFO decode line being filtered out.
+        it still raw after the decode line had been fixed.
+
+        NOT because it is "the worse of the two" - two earlier versions of this
+        file said so and both were wrong; see the module docstring. Both sinks
+        land in gardyn.log identically. It matters because it is a SECOND one,
+        which is a statement about coverage rather than about severity.
 
         Asserted on the record that names this handler, not on the whole
         capture: the decode line above logs the same payload (escaped, now) and
@@ -510,22 +866,98 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
         self.assertIn("\\n", rejections[0])
 
     def test_no_log_line_in_on_message_interpolates_a_payload_raw(self):
-        """The rule rather than the instances, so a THIRD sink cannot be added
-        raw without this failing.
+        """The rule rather than the instances, so a further sink cannot be
+        added raw without this failing.
 
-        Source-level on purpose: the two cases above pin the lines that exist,
-        and neither can notice a new one. Matched on the f-string braces a raw
-        interpolation must produce - `{payload}` with the closing brace and no
-        conversion - which `{payload!r}` cannot match.
+        Source-level on purpose: the case-by-case tests above pin the lines that
+        exist, and none of them can notice a new one. What changed in T-527.11
+        is HOW the source is read - see _payload_sinks(). There are three payload
+        sinks in on_message today; the third, in the threshold-rejection branch,
+        is written across two lines and the line-based version of this test could
+        not see it at all.
         """
-        import inspect
-        source = inspect.getsource(mqtt_mod.on_message)
-        offenders = [line.strip() for line in source.splitlines()
-                     if "logger." in line and "{payload}" in line]
+        raw = [(lineno, line) for lineno, form, line
+               in _payload_sinks(mqtt_mod.on_message) if form == "RAW"]
         self.assertEqual(
-            [], offenders,
-            "a log line interpolates the payload without !r, so a remote "
-            "client can write arbitrary lines into gardyn.log",
+            [], raw,
+            "a log line puts the payload into a record without escaping it, so "
+            "a remote client can write arbitrary lines into gardyn.log. "
+            f"Escaping forms this rule recognises: "
+            f"{sorted(set(_SAFE_CONVERSIONS.values()) | set(_SAFE_WRAPPERS.values()))}",
+        )
+
+    def test_the_payload_sink_scanner_reports_the_shapes_that_defeated_the_old_one(self):
+        """POSITIVE CONTROL on the test above, which is a check whose passing
+        result is an ABSENCE - the one shape that cannot tell a clean scan from
+        a dead one.
+
+        Its predecessor failed exactly here. It reported no offenders whether
+        the code was clean or the offender was simply written in a shape it
+        could not parse, and the multi-line shape was one of those. So each
+        shape gets fed to the scanner directly, including the four the line
+        filter missed: the multi-line f-string, %-style lazy logging,
+        str.format(), and concatenation.
+        """
+        def multi_line_fstring(payload, logger):
+            logger.error(
+                f"Rejecting water low threshold {payload} - "
+                f"must be a number"
+            )
+
+        def percent_style_lazy_logging(payload, logger):
+            logger.error("Rejecting water low threshold %s", payload)
+
+        def str_format(payload, logger):
+            logger.error("Rejecting water low threshold {}".format(payload))
+
+        def concatenation(payload, logger):
+            logger.error("Rejecting water low threshold " + payload)
+
+        def str_conversion(payload, logger):
+            logger.error(f"Rejecting water low threshold {payload!s}")
+
+        for shape in (multi_line_fstring, percent_style_lazy_logging,
+                      str_format, concatenation, str_conversion):
+            with self.subTest(shape=shape.__name__):
+                forms = [form for _, form, _ in _payload_sinks(shape)]
+                self.assertIn(
+                    "RAW", forms,
+                    f"the scanner cannot see a raw payload written as "
+                    f"{shape.__name__}, so a clean report from it means nothing",
+                )
+
+    def test_the_payload_sink_scanner_does_not_cry_wolf_over_escaped_ones(self):
+        """The other half of the control. A scanner that reported RAW for
+        everything would pass the case above and be equally useless - it would
+        redden on the shipping code, which is the direction that gets a check
+        deleted rather than fixed."""
+        def every_escaped_form(payload, logger):
+            logger.error(f"a {payload!r} b {payload!a} c {repr(payload)} "
+                         f"d {ascii(payload)}")
+
+        forms = [form for _, form, _ in _payload_sinks(every_escaped_form)]
+        self.assertNotIn("RAW", forms, forms)
+        self.assertEqual(["!a", "!r", "ascii()", "repr()"], sorted(forms))
+
+    def test_every_payload_sink_uses_the_canonical_repr_spelling(self):
+        """Separate from the safety test above, and reported separately,
+        because these two failures mean different things.
+
+        `{payload!a}` is ascii(): it escapes \\n, \\r and \\x1b exactly as
+        repr() does, so a sink written that way is NOT a forgery path and
+        saying so would be false. What it is is a second spelling of a
+        one-spelling rule, and mqtt.py's own comment states the rule as "!r" -
+        so the codebase and the check agree on one form and a reader has one
+        thing to look for.
+        """
+        odd = [(lineno, form, line) for lineno, form, line
+               in _payload_sinks(mqtt_mod.on_message)
+               if form not in _CANONICAL_FORMS and form != "RAW"]
+        self.assertEqual(
+            [], odd,
+            "this sink escapes the payload safely but not in the form the rule "
+            "is written as (!r). Either spell it !r or change the rule in "
+            "mqtt.py's comment and in _CANONICAL_FORMS together.",
         )
 
     def test_an_ordinary_payload_still_reads_naturally(self):
