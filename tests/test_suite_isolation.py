@@ -392,6 +392,12 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         "mutate_pump_api_interlock.py": ["app/sensors/pump/routes.py"],
         "mutate_ha_birth_message.py": ["mqtt.py"],
         "mutate_connack_refusal.py": ["mqtt.py"],
+        # Two targets, and the second one is the point: this battery mutates
+        # its own test file as well, because PurityTests is the only guard on
+        # light_schedule's stdlib-only promise and a guard nobody has shown
+        # can fail is not a guard (T-527.4).
+        "mutate_light_schedule.py": ["light_schedule.py",
+                                     "tests/test_light_schedule.py"],
     }
 
     # Harnesses that copy the repository and mutate the COPY. They cannot leave
