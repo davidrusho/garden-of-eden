@@ -57,6 +57,12 @@ logger = logging.getLogger(__name__)
 # when this client stops answering keepalives (~1.5x KEEP_ALIVE_INTERVAL).
 STATUS_TOPIC = BASE_TOPIC + "/status"
 
+# Which writer currently owns the lamp: "schedule", "override", "hold_unsynced"
+# or "fallback_unsynced" (the SOURCE_* constants in light_schedule.py). Retained
+# and published by the scheduler, never by a handler — see
+# publish_light_decision().
+LIGHT_SOURCE_TOPIC = BASE_TOPIC + "/light/source"
+
 # Home Assistant's OWN lifecycle topic — the opposite direction to STATUS_TOPIC
 # above. That one is this device telling HA it is alive; this one is HA telling
 # the world that HA is alive, and it is the trigger for re-announcing discovery.
@@ -276,6 +282,14 @@ pump = Pump(pin_factory=pin_factory)
 light = Light(pin_factory=pin_factory)
 distance_sensor = Distance(pin_factory=pin_factory)
 
+# Assigned in __main__, and declared here so the command handlers can be read
+# and imported without it. Several test modules import this file under stubs
+# and never run __main__, so a bare reference would be a NameError inside
+# on_message rather than in a place anyone would look. The handlers branch on
+# None explicitly and say so in the log — a silent fallback to driving the pin
+# directly is exactly the second writer T-527.6 exists to remove.
+light_scheduler = None
+
 # default on brightness
 brightness  = 50
 speed       = 100
@@ -311,6 +325,24 @@ def publish_light_state(client):
     duty = light.get_brightness()
     client.publish(BASE_TOPIC + "/light/state", "ON" if duty > 0 else "OFF", retain=True)
     client.publish(BASE_TOPIC + "/light/brightness/state", str(int(round(duty))), retain=True)
+
+
+def publish_light_decision(client, decision):
+    """Publish the lamp's state AND which writer decided it (T-527.6).
+
+    WHY THE SECOND HALF IS NOT DECORATION. Once the Pi owns the photoperiod,
+    "the light is at 50%" stops being a complete observation: it is the right
+    answer at 18:30 and a person's override at 12:00, and nothing else on the
+    network can tell those apart. The obedience automation in Home Assistant
+    has to make exactly that distinction — its old no-false-alarm argument was
+    written on HA's 15-minute re-assert, which T-527.8 retires — so publishing
+    the source is what gives its replacement something to condition on.
+
+    Retained, like the two state topics beside it, so a subscriber that arrives
+    later is told immediately rather than at the next transition.
+    """
+    publish_light_state(client)
+    client.publish(LIGHT_SOURCE_TOPIC, decision.source, retain=True)
 
 
 def clear_retired_entities(client):
@@ -357,14 +389,41 @@ def clear_retired_entities(client):
 # used to be module globals that only the button path updated, so after any HA
 # command the shadow was stale and the next button press just re-sent the state
 # the device was already in — the press appeared to do nothing.
+def apply_light_override(target):
+    """Put the lamp at `target` as a manual override, through the scheduler.
+
+    The ONE path from a human's intent to the pin, shared by the MQTT command
+    handlers and the physical button. Both used to drive the light directly,
+    which was correct while nothing else owned it.
+
+    The None branch is not a fallback to the old behaviour, and that is
+    deliberate: reaching here with no scheduler means __main__ never ran, so
+    this is a test import or a hand-run REPL, not a garden. Driving the pin
+    anyway would hide the one condition under which this file's model of who
+    owns the lamp is wrong.
+    """
+    if light_scheduler is None:
+        logger.error(
+            "Light command for %s%% ignored: no scheduler is running, so "
+            "nothing owns the photoperiod. This means mqtt.py's __main__ did "
+            "not run.", target,
+        )
+        return
+    light_scheduler.override_now(target)
+
+
 def toggle_light():
+    # Reads the hardware, then hands the result to the same override path the
+    # MQTT handlers use. A person standing at the garden pressing the button is
+    # as much an override as a person tapping the entity in Home Assistant, and
+    # before T-527.6 the button's effect would have been reverted by the next
+    # scheduler tick within 30 seconds.
     if light.get_brightness() > 0:
         logger.info("Toggling Light OFF")
-        light.off()
+        apply_light_override(0)
     else:
         logger.info("Toggling Light ON")
-        light.set_duty_cycle(brightness)
-    publish_light_state(client)
+        apply_light_override(brightness)
 
 def toggle_pump():
     if pump.get_speed() > 0:
@@ -416,6 +475,13 @@ button.when_pressed = handle_button_press
 
 # helpers
 def _flash_lights_blocking(times=3, delay=0.3):
+    # THE ONE REMAINING DIRECT WRITER OF THE PIN, and deliberately so: this is a
+    # ~2 s attention signal that restores what it found, not a statement about
+    # what the lamp should be at, so routing it through the scheduler would
+    # make a low-water abort look like a manual override holding until 03:00.
+    # A scheduler tick landing inside the flash would set the scheduled value
+    # and the restore would then put back the pre-flash brightness — corrected
+    # at the following tick, at most one cadence later.
     original_brightness = light.get_brightness()  # Save the brightness (0–100 scale)
     was_on = original_brightness > 0  # If >0%, we consider it "on"
 
@@ -666,6 +732,26 @@ def send_discovery_messages(client):
     }
     publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)
 
+    # Config for the light's current OWNER (T-527.6). A diagnostic sensor, not
+    # a control: it answers "is the photoperiod running, or has somebody taken
+    # the lamp", which stopped being derivable from the brightness the moment
+    # the Pi became the writer.
+    #
+    # entity_category diagnostic keeps it out of the main card and out of
+    # auto-generated dashboards while leaving it fully available to templates
+    # and automations — which is where it is actually needed, since the
+    # obedience automation T-527.9 rebuilds has to condition on it.
+    SOURCE_CONFIG_TOPIC = ("homeassistant/sensor/gardyn/" + IDENTIFIER
+                           + "_light_source/config")
+    publish_config(SOURCE_CONFIG_TOPIC, {
+        "name": "Light Schedule Source",
+        "unique_id": IDENTIFIER + "_light_source",
+        "state_topic": LIGHT_SOURCE_TOPIC,
+        "icon": "mdi:account-clock",
+        "entity_category": "diagnostic",
+        "device": device_info,
+    })
+
     # The Pump discovery block stood here (T-475). Retiring it is what removes
     # light.gardyn_pump from HA; RETIRED_DISCOVERY_TOPICS is what removes the
     # copy the broker retained.
@@ -854,6 +940,17 @@ def announce_to_home_assistant(client):
     # Announce real device state on every (re)connect. Retained, so HA gets it
     # immediately on subscribe instead of sitting at `unknown`.
     publish_light_state(client)
+    # …and who currently owns the lamp (T-527.6). Unconditional, which is the
+    # whole point: the value has not changed, the SUBSCRIBER has, and a
+    # retained message is delivered once per subscribe. Without this the source
+    # entity sits at whatever the broker still holds — or at `unknown` on a
+    # first announce — until the next transition, which can be hours away.
+    #
+    # A no-op before the scheduler's first tick, which is a real window: this
+    # runs on the connect path and the scheduler starts on its own thread at
+    # the same moment. The next tick publishes it, at most one cadence later.
+    if light_scheduler is not None:
+        light_scheduler.publish_now()
     # The single writer of the debounce clock. Stamped here rather than in
     # _birth_is_debounced() so that EVERY announce counts, including the connect
     # path's - see that function for the retained-birth case this covers.
@@ -1227,18 +1324,31 @@ def on_message(client, userdata, msg):
                 # user never saw take effect.
 
         # === Light Logic ===
+        #
+        # Both handlers route through the scheduler rather than driving the pin
+        # (T-527.6). A manual command is an OVERRIDE: it owns the lamp until the
+        # next scheduled boundary, at which point the schedule takes it back.
+        # The accepted cost, recorded in the T-527 design: an override applied
+        # at 19:05 holds until 03:00, because 19:00 is the last boundary of the
+        # day. A TTL was considered and rejected as more state to test than the
+        # case justifies.
+        #
+        # Driving the pin here as well would make two writers of one lamp, and
+        # they would differ in the two things that are invisible until they
+        # matter — what gets persisted for the unsynced-clock hold, and what
+        # gets published as the owner.
         elif topic_suffix == "light/command":
             if payload.upper() == "ON":
-                light.set_duty_cycle(brightness)
-                publish_light_state(client)
+                apply_light_override(brightness)
             elif payload.upper() == "OFF":
-                light.off()
-                publish_light_state(client)
+                apply_light_override(0)
 
         elif topic_suffix == "light/brightness/set" and payload.isdigit():
+            # `brightness` remains the ON level for a later bare `light/command
+            # ON`, which is why it is still assigned here. The scheduler does
+            # not read it.
             brightness = int(payload)
-            light.set_duty_cycle(brightness)
-            publish_light_state(client)
+            apply_light_override(brightness)
 
         # === Water Level ===
         elif topic_suffix == "water/level/get":
@@ -1480,11 +1590,13 @@ if __name__ == "__main__":
     # that path only runs once a broker has accepted a CONNACK, so putting the
     # scheduler there would reintroduce the dependency this change removes.
     #
-    # publish_light_state is best-effort and is called only after the lamp
-    # actually moves. A publish on a client that has not connected yet returns
-    # an error code rather than raising, and the reconnect path republishes the
-    # retained state through announce_to_home_assistant() anyway.
-    light_scheduler = LightScheduler(light, lambda: publish_light_state(client))
+    # The publish is best-effort and is called only when the lamp's brightness
+    # or its OWNER changes. A publish on a client that has not connected yet
+    # returns an error code rather than raising, and the reconnect path
+    # republishes both through announce_to_home_assistant() anyway.
+    light_scheduler = LightScheduler(
+        light, lambda decision: publish_light_decision(client, decision)
+    )
     light_scheduler.start()
 
     client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)

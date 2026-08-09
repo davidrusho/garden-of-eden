@@ -463,6 +463,8 @@ class SchedulerHarness(unittest.TestCase):
         with open(self.config, "w") as fh:
             fh.write(SHIPPED)
         self.light = FakeLight(brightness=0)
+        # (decision.brightness, decision.source) per publish, which is exactly
+        # the pair the scheduler promises not to republish unchanged.
         self.published = []
         self.clock = datetime(2026, 8, 9, 12, 0, 0)
 
@@ -472,7 +474,9 @@ class SchedulerHarness(unittest.TestCase):
         kwargs.setdefault("now", lambda: self.clock)
         kwargs.setdefault("synced_probe", lambda: (True, None))
         return lsr.LightScheduler(
-            self.light, lambda: self.published.append(self.light.brightness), **kwargs
+            self.light,
+            lambda d: self.published.append((d.brightness, d.source)),
+            **kwargs,
         )
 
 
@@ -503,7 +507,14 @@ class TickTests(SchedulerHarness):
         scheduler = self.build()
         scheduler.tick()
         self.assertEqual([], self.light.commands)
-        self.assertEqual([], self.published)
+
+    def test_an_unchanged_owner_and_brightness_is_not_republished(self):
+        """The state topics are retained, so republishing an identical pair
+        every 30 s is pure broker traffic on a single-antenna Zero W."""
+        scheduler = self.build()
+        for _ in range(4):
+            scheduler.tick()
+        self.assertEqual([(100, ls.SOURCE_SCHEDULE)], self.published)
 
     def test_a_lamp_within_rounding_of_the_target_is_not_rewritten(self):
         """PWM quantisation means get_brightness() need not return exactly what
@@ -518,9 +529,9 @@ class TickTests(SchedulerHarness):
         self.build().tick()
         self.assertEqual(100, lsr.read_last_applied(self.state))
 
-    def test_applying_publishes_the_state(self):
+    def test_applying_publishes_the_state_and_the_owner(self):
         self.build().tick()
-        self.assertEqual([100], self.published)
+        self.assertEqual([(100, ls.SOURCE_SCHEDULE)], self.published)
 
     def test_the_config_file_is_re_read_between_ticks(self):
         """No restart needed after an edit — the acceptance note on T-527.5
@@ -629,6 +640,77 @@ class TickTests(SchedulerHarness):
             "could bring it back to life",
         )
 
+    def test_override_now_moves_the_lamp_in_the_same_call(self):
+        """T-527.6's acceptance. A person tapping the light entity in Home
+        Assistant must not wait up to a tick for the lamp to answer, and the
+        move must go through the scheduler rather than beside it."""
+        scheduler = self.build()
+        decision = scheduler.override_now(20)
+        self.assertEqual(20, decision.brightness)
+        self.assertEqual(ls.SOURCE_OVERRIDE, decision.source)
+        self.assertEqual([20], self.light.commands)
+
+    def test_override_now_persists_what_it_applied(self):
+        """The unsynced-clock hold reads this file, and an override IS a
+        brightness that was actually applied. A command that moved the lamp but
+        left the file saying otherwise would make a later unsynced boot hold a
+        value the lamp has not been at since."""
+        self.build().override_now(20)
+        self.assertEqual(20, lsr.read_last_applied(self.state))
+
+    def test_override_now_publishes_the_new_owner(self):
+        scheduler = self.build()
+        scheduler.tick()
+        scheduler.override_now(20)
+        self.assertEqual(
+            [(100, ls.SOURCE_SCHEDULE), (20, ls.SOURCE_OVERRIDE)], self.published
+        )
+
+    def test_an_override_at_the_SCHEDULES_OWN_brightness_still_publishes(self):
+        """The pin does not move, and the answer to "what owns this lamp" has
+        changed completely. Publishing only on a brightness change would leave
+        Home Assistant believing the schedule is running while a person holds
+        it until 19:00 — and the obedience automation T-527.9 rebuilds has to
+        tell those apart."""
+        scheduler = self.build()
+        scheduler.tick()
+        scheduler.override_now(100)
+        self.assertEqual([], self.light.commands[1:], "the pin should not move")
+        self.assertEqual(
+            [(100, ls.SOURCE_SCHEDULE), (100, ls.SOURCE_OVERRIDE)], self.published
+        )
+
+    def test_the_handback_is_published_even_though_the_lamp_does_not_move(self):
+        scheduler = self.build()
+        self.clock = datetime(2026, 8, 9, 17, 30, 0)
+        scheduler.override_now(50)          # 18:00's brightness, applied early
+        self.clock = datetime(2026, 8, 9, 18, 0, 1)
+        scheduler.tick()
+        self.assertEqual(
+            [(50, ls.SOURCE_OVERRIDE), (50, ls.SOURCE_SCHEDULE)], self.published
+        )
+
+    def test_publish_now_resends_the_last_decision_unconditionally(self):
+        """For the MQTT reconnect path: the value has not changed, the
+        SUBSCRIBER has, and a retained message is delivered once per subscribe.
+        Home Assistant's copy is otherwise whatever the broker still holds."""
+        scheduler = self.build()
+        scheduler.tick()
+        scheduler.publish_now()
+        scheduler.publish_now()
+        self.assertEqual(
+            [(100, ls.SOURCE_SCHEDULE)] * 3, self.published
+        )
+
+    def test_publish_now_before_the_first_tick_is_a_no_op(self):
+        """It runs on the connect path while the scheduler thread is still
+        starting, so `no decision yet` is a real state rather than a defensive
+        branch."""
+        scheduler = self.build()
+        self.assertIsNone(scheduler.last_decision)
+        scheduler.publish_now()
+        self.assertEqual([], self.published)
+
     def test_clear_override_hands_the_lamp_back_immediately(self):
         scheduler = self.build()
         scheduler.set_override(20)
@@ -660,7 +742,7 @@ class TickTests(SchedulerHarness):
 
     def test_a_publish_that_raises_does_not_kill_the_tick(self):
         """The broker being down is the PREMISE of T-527, not an exception."""
-        def explode():
+        def explode(_decision):
             raise OSError("broker unreachable")
         scheduler = lsr.LightScheduler(
             self.light, explode, config_path=self.config, state_path=self.state,
@@ -906,9 +988,71 @@ class WiringTests(unittest.TestCase):
             cls.source = fh.read()
         cls.repo = repo
 
+    def _assertInSource(self, needle, why=""):
+        """assertIn against mqtt.py WITHOUT inlining mqtt.py in the message.
+
+        unittest's default reprs both sides of a failed assertIn, and this
+        haystack is 1,500 lines — one failure emitted ~86 KB of output and
+        buried every other result in the run. The message says what was looked
+        for and nothing about what it was looked for in."""
+        self.assertTrue(needle in self.source,
+                        f"mqtt.py does not contain {needle!r}. {why}")
+
     def test_mqtt_constructs_and_starts_the_scheduler(self):
-        self.assertIn("LightScheduler(light,", self.source)
-        self.assertIn("light_scheduler.start()", self.source)
+        self._assertInSource("LightScheduler(")
+        self._assertInSource("light_scheduler.start()")
+
+    def test_the_command_handlers_go_through_the_scheduler(self):
+        """Two writers of one lamp differ in exactly the two things that stay
+        invisible until they matter: what is persisted for the unsynced-clock
+        hold, and what is published as the owner. Matching the CALL form, never
+        a bare name the surrounding comments also contain."""
+        self._assertInSource("def apply_light_override(")
+        self._assertInSource("light_scheduler.override_now(")
+        handlers = self.source.split("# === Light Logic ===")[1].split(
+            "# === Water Level ===")[0]
+        self.assertNotIn(
+            "light.set_duty_cycle(", handlers,
+            "a light command still drives the pin beside the scheduler")
+        self.assertNotIn(
+            "light.off()", handlers,
+            "a light command still drives the pin beside the scheduler")
+
+    def test_the_physical_button_is_an_override_too(self):
+        """A person at the garden is as much an override as a person in the
+        app, and before this the button's effect was reverted within a tick."""
+        body = self.source.split("def toggle_light(")[1].split("\ndef ")[0]
+        self.assertIn("apply_light_override(", body)
+        self.assertNotIn("light.set_duty_cycle(", body)
+
+    def test_the_reconnect_path_resends_the_owner(self):
+        """A retained message is delivered once per subscribe, so an HA that
+        has just come back needs it re-sent or its source entity sits at
+        whatever the broker still holds."""
+        body = self.source.split("def announce_to_home_assistant(")[1].split(
+            "\ndef ")[0]
+        # The GUARD as well as the call. `assertIn("light_scheduler.
+        # publish_now()")` passes just as happily when the line sits under
+        # `if False:` — a mutant doing exactly that survived the first run of
+        # this battery. A source assertion has to match a form only the working
+        # code can produce.
+        self.assertRegex(
+            body,
+            r"if\s+light_scheduler\s+is\s+not\s+None:\s*\n\s*"
+            r"light_scheduler\.publish_now\(\)",
+            "the reconnect republish is missing, or is behind a guard that "
+            "does not test the scheduler",
+        )
+
+    def test_the_owner_gets_a_discovery_entity(self):
+        body = self.source.split("def send_discovery_messages(")[1].split(
+            "\ndef ")[0]
+        # The CALL, not the constant. A payload built into a local and never
+        # published contains every name this used to look for; that mutant
+        # survived the first run too.
+        self.assertRegex(body, r"publish_config\(\s*SOURCE_CONFIG_TOPIC\s*,")
+        self.assertIn("LIGHT_SOURCE_TOPIC", body)
+        self.assertIn("_light_source", body)
 
     def test_the_scheduler_starts_OUTSIDE_on_connect(self):
         """The one property that makes this feature work. Starting it from

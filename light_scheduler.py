@@ -284,13 +284,18 @@ class LightScheduler:
     runs off the Pi. `light` needs `set_duty_cycle(int)` and `get_brightness()`
     — the surface app/sensors/light/light.py already exposes.
 
-    `publish_state` is called with no arguments after a change is applied, and
-    is where mqtt.py hands in `publish_light_state(client)`. It is called AFTER
-    the lamp has moved and only when it moved: the state topics are retained,
-    so republishing an unchanged value every 30 s would be pure broker traffic,
-    and the reconnect path already republishes via announce_to_home_assistant.
-    A raise from it is caught — the broker must never be able to stop the
-    photoperiod.
+    `publish_state` is called with the Decision whenever the pair
+    (brightness, source) CHANGES — not merely when the lamp moves, and that is
+    the T-527.6 half. "The light is at 100%" and "the light is at 100% because
+    the schedule says so" are different statements, and the second is what
+    tells a human whether an override is still holding. So an override that
+    happens to match the schedule's brightness, and its later expiry, are both
+    published even though the pin never moves.
+
+    The other direction still holds: the state topics are retained, so
+    republishing an unchanged pair every 30 s would be pure broker traffic. A
+    raise from the callable is caught — the broker being unreachable must never
+    be able to stop the photoperiod.
     """
 
     def __init__(
@@ -322,6 +327,12 @@ class LightScheduler:
         # with the hardware read in _apply() — this is not a shadow variable
         # standing in for the lamp, and nothing decides anything from it.
         self._last_logged_target = None
+        # The last (brightness, source) handed to publish_state, so an
+        # unchanged pair is not republished on every tick.
+        self._last_published = None
+        # The last Decision reached, so the MQTT reconnect path can refresh
+        # HA's retained copy without waiting for the next tick.
+        self._last_decision = None
         # Notes already reported, keyed by category, so a config file that is
         # missing for a week produces one ERROR rather than 20,160 of them.
         self._reported = {}
@@ -329,19 +340,36 @@ class LightScheduler:
     # ------------------------------------------------------------- override
 
     def set_override(self, brightness):
-        """Take the lamp off schedule until the next scheduled boundary.
+        """Record a manual command. Does NOT drive the lamp — see override_now.
 
         `applied_at` is stamped from the SAME clock decide() is given, which is
         what makes "has the next boundary passed" answerable even while that
         clock is wrong — see Override's docstring in light_schedule.py.
-
-        NOT WIRED TO ANYTHING YET. T-527.6 connects the MQTT command handlers
-        and the physical button to this, and until it does, a manual command is
-        reverted at the next tick. That is why T-527.7 deploys .4, .5 and .6
-        together and this step ships nothing to the Pi on its own.
         """
         with self._lock:
             self._override = Override(brightness, self._now())
+
+    def override_now(self, brightness):
+        """Take the lamp off schedule and move it in the same breath.
+
+        THE POINT IS THAT THERE IS ONE PATH TO THE PIN. mqtt.py's command
+        handlers used to call light.set_duty_cycle() and publish_light_state()
+        themselves, which was correct while nothing else owned the lamp; with a
+        scheduler running it would mean two writers, differing in what they
+        persist and what they publish, and a manual command that never reached
+        the state file would be silently forgotten by the unsynced-clock hold.
+        Routing through tick() means an override is applied, persisted and
+        published by exactly the code that does it for the schedule.
+
+        It costs one `timedatectl` on the command path (0.169 s median on this
+        Pi), spent on paho's network thread. That is a real cost and it is
+        bought deliberately: the alternative is a second, subtly different
+        implementation of "put the lamp here", which is the shape this file
+        exists to remove. The same thread already spends a synchronous pigpio
+        round-trip inside announce_to_home_assistant().
+        """
+        self.set_override(brightness)
+        return self.tick()
 
     def clear_override(self):
         """Hand the lamp back to the schedule immediately."""
@@ -352,6 +380,26 @@ class LightScheduler:
     def override(self):
         with self._lock:
             return self._override
+
+    @property
+    def last_decision(self):
+        """The most recent Decision, or None before the first tick."""
+        return self._last_decision
+
+    def publish_now(self):
+        """Re-publish the last decision unconditionally.
+
+        For the MQTT reconnect path: a retained message is delivered once per
+        subscribe, so when Home Assistant comes back and re-announces, its copy
+        of who-owns-the-lamp has to be re-sent or it sits at whatever the broker
+        still holds. Unconditional, because the whole point is that the
+        SUBSCRIBER changed, not the value.
+        """
+        if self._last_decision is None:
+            return
+        self._last_published = (self._last_decision.brightness,
+                                self._last_decision.source)
+        self._publish(self._last_decision)
 
     # ----------------------------------------------------------------- tick
 
@@ -383,6 +431,15 @@ class LightScheduler:
             override=override,
         )
         self._apply(decision)
+        self._last_decision = decision
+        # Publish on a change of OWNER as well as of brightness. An override
+        # set to the brightness the schedule already wanted moves no pin, and
+        # is still the difference between "the schedule is running" and "a
+        # person has taken it".
+        pair = (decision.brightness, decision.source)
+        if pair != self._last_published:
+            self._last_published = pair
+            self._publish(decision)
         return decision
 
     def _apply(self, decision):
@@ -426,7 +483,6 @@ class LightScheduler:
 
         note = write_last_applied(self._state_path, target)
         self._report("state", note)
-        self._publish()
 
     def _read_actual(self):
         """The lamp's real duty cycle as a whole percent, or None if unreadable.
@@ -440,11 +496,11 @@ class LightScheduler:
             logger.exception("Schedule could not read the light's current brightness")
             return None
 
-    def _publish(self):
+    def _publish(self, decision):
         if self._publish_state is None:
             return
         try:
-            self._publish_state()
+            self._publish_state(decision)
         except Exception:
             # The broker is allowed to be down. That is the premise of T-527.
             logger.exception("Schedule could not publish the light's state")

@@ -241,14 +241,27 @@ def _clamped(value) -> int:
     itself cited "55.0" as legitimate while the code rejected it. Every shape a
     caller can produce now lands in the same place:
 
-        55.9  "55"  "55.0"  ->  55        inf  "inf"  1e308  "1e999"  ->  100
-        -1    "-1"          ->   0        nan  "nan"  "abc"  b"55"    ->   0
+        55.9  "55"  "55.0"  b"55"  ->  55     inf  "inf"  1e308  "1e999" -> 100
+        -1    "-1"                 ->   0     nan  "nan"  "abc"  None    ->   0
+
+    `b"55"` sat in the second row until review measured it: float() accepts
+    bytes, so it has always produced 55, and the table said 0. The commit that
+    added the bytes branch also added a test asserting 55, so the code, the
+    test and the docstring disagreed two-to-one — which is the shape to watch
+    for, since the outnumbered one is the one nothing executes.
 
     The remaining OverflowError branch is for a Python int too large to become
     a float (10**400); its magnitude is meaningful, so it clamps rather than
-    reading as garbage. NaN is caught explicitly because it compares false
-    against every bound, so a plain min/max would let it through to int() and
-    raise there.
+    reading as garbage.
+
+    NaN IS CAUGHT EXPLICITLY BECAUSE IT COMPARES FALSE AGAINST EVERY BOUND, and
+    the consequence is a runaway lamp rather than a raise. This docstring said
+    "a plain min/max would let it through to int() and raise there"; measured,
+    `max(0, min(100, nan))` returns **100**, because min() keeps its first
+    argument when the comparison is False. So the naive form would drive the
+    grow light to FULL on a NaN and never raise at all. int(nan) does raise,
+    which is what made the wrong sentence plausible — it is simply never
+    reached.
 
     WHY A RAISE HERE WOULD BE EXPENSIVE, stated as measured rather than as
     intuition. The scheduler runs on its own thread, and an unhandled exception
@@ -471,10 +484,25 @@ def decide(
     window is small in practice — NTP syncs within seconds of the network
     returning, and the next tick corrects it.
 
-    Every returned brightness goes through _clamped(), so a corrupt persisted
-    value or a hostile MQTT publish cannot reach Light.set_duty_cycle() with
-    something it will raise on. Read _clamped's docstring for why a raise here
-    would be silent rather than loud.
+    Every returned brightness goes through _clamped(), so a hostile MQTT
+    publish cannot reach Light.set_duty_cycle() with something it will raise
+    on. Read _clamped's docstring for why a raise here would be silent rather
+    than loud.
+
+    `last_applied` MUST ALREADY BE AN int IN 0..100, OR None. That is a
+    contract on the caller and not something _clamped can supply, and the
+    difference is the whole safety argument. _clamped maps junk to 0, so
+    handing this a truncated state file's contents returns
+    (0, "hold_unsynced") — the lamp held OFF for the entire unsynced window,
+    which is strictly worse than the (fallback, "fallback_unsynced") a MISSING
+    file produces. A power cut causes both conditions at once, so the corrupt
+    case is not exotic. An earlier version of this paragraph claimed _clamped
+    covered it; it covers the raise, not the meaning.
+
+    light_scheduler.read_last_applied() is what upholds the contract: it
+    returns None for anything it did not write, deliberately never 0, and
+    tests/test_light_scheduler.py pins that in both directions. Any new caller
+    owes the same.
     """
     # `override is not None` is redundant with override_is_live()'s own None
     # check and is kept anyway: it is what makes the attribute access on the

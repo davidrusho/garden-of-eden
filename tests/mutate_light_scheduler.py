@@ -184,15 +184,37 @@ MUTANTS = [
      "        note = write_last_applied(self._state_path, target)",
      "        note = None"),
     ("the state is never published, so HA never learns the lamp moved", SRC,
-     "        self._publish()",
-     "        pass"),
+     "        if pair != self._last_published:\n            self._last_published = pair\n            self._publish(decision)",
+     "        self._last_published = pair"),
+
+    # ---------------------------------------------------- who owns the lamp
+    ("the publish fires on a brightness change only, so an override at the "
+     "schedule's own brightness is invisible", SRC,
+     "        pair = (decision.brightness, decision.source)",
+     "        pair = (decision.brightness,)"),
+    ("an override is recorded but never applied, so the lamp waits a whole "
+     "tick for a command", SRC,
+     "        self.set_override(brightness)\n        return self.tick()",
+     "        self.set_override(brightness)\n        return self._last_decision"),
+    ("publish_now honours the dedupe, so a reconnecting HA is never re-told "
+     "who owns the lamp", SRC,
+     "        self._last_published = (self._last_decision.brightness,\n"
+     "                                self._last_decision.source)\n"
+     "        self._publish(self._last_decision)",
+     "        pair = (self._last_decision.brightness, self._last_decision.source)\n"
+     "        if pair != self._last_published:\n"
+     "            self._last_published = pair\n"
+     "            self._publish(self._last_decision)"),
+    ("publish_now publishes before any decision exists", SRC,
+     "        if self._last_decision is None:\n            return",
+     "        if False:\n            return"),
     ("a light that refuses to be driven takes the tick down with it", SRC,
      "        try:\n            self._light.set_duty_cycle(target)\n        except Exception:",
      "        try:\n            self._light.set_duty_cycle(target)\n        except KeyError:"),
     ("a publish failure takes the tick down with it - the broker being down "
      "is the PREMISE of this ticket", SRC,
-     "        try:\n            self._publish_state()\n        except Exception:",
-     "        try:\n            self._publish_state()\n        except KeyError:"),
+     "        try:\n            self._publish_state(decision)\n        except Exception:",
+     "        try:\n            self._publish_state(decision)\n        except KeyError:"),
 
     # ---------------------------------------------------------- the logging
     ("every tick re-logs the same problem, burying the four transitions a day "
@@ -227,15 +249,36 @@ MUTANTS = [
      "    light_scheduler.start()",
      "    pass"),
     ("the scheduler starts AFTER loop_forever(), which never returns", MQTT,
-     "    light_scheduler = LightScheduler(light, lambda: publish_light_state(client))\n    light_scheduler.start()\n\n    client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)",
-     "    client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)\n    light_scheduler = LightScheduler(light, lambda: publish_light_state(client))"),
+     "    light_scheduler = LightScheduler(\n        light, lambda decision: publish_light_decision(client, decision)\n    )\n    light_scheduler.start()\n\n    client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)",
+     "    client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)\n    light_scheduler = LightScheduler(\n        light, lambda decision: publish_light_decision(client, decision)\n    )"),
     ("the scheduler is started from on_connect, reintroducing the broker "
      "dependency this whole ticket removes", MQTT,
      "    start_publisher_threads(client)",
-     "    start_publisher_threads(client)\n    LightScheduler(light, lambda: publish_light_state(client)).start()"),
+     "    start_publisher_threads(client)\n    LightScheduler(light, None).start()"),
     ("the unit stops creating the state directory", UNIT,
      "StateDirectory=gardyn\n",
      ""),
+
+    # ----------------------------------------- the override wiring (T-527.6)
+    ("an MQTT light command drives the pin directly, beside the scheduler",
+     MQTT,
+     "        elif topic_suffix == \"light/command\":\n            if payload.upper() == \"ON\":\n                apply_light_override(brightness)\n            elif payload.upper() == \"OFF\":\n                apply_light_override(0)",
+     "        elif topic_suffix == \"light/command\":\n            if payload.upper() == \"ON\":\n                light.set_duty_cycle(brightness)\n            elif payload.upper() == \"OFF\":\n                light.off()"),
+    ("a brightness command drives the pin directly, so nothing persists it "
+     "and nothing publishes the new owner", MQTT,
+     "            brightness = int(payload)\n            apply_light_override(brightness)",
+     "            brightness = int(payload)\n            light.set_duty_cycle(brightness)"),
+    ("the physical button is not an override, so a press is reverted within "
+     "a tick", MQTT,
+     "        logger.info(\"Toggling Light ON\")\n        apply_light_override(brightness)",
+     "        logger.info(\"Toggling Light ON\")\n        light.set_duty_cycle(brightness)"),
+    ("a reconnecting Home Assistant is never re-told who owns the lamp", MQTT,
+     "    if light_scheduler is not None:\n        light_scheduler.publish_now()",
+     "    if False:\n        light_scheduler.publish_now()"),
+    ("the owner has no discovery entity, so it exists only as a raw topic",
+     MQTT,
+     "    publish_config(SOURCE_CONFIG_TOPIC, {",
+     "    _unpublished = ({"),
 
     # ------------------------- the TEST FILE's own constants and controls ---
     # A guard on an architectural promise is exactly the thing that gets
