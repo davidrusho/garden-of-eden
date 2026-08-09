@@ -429,6 +429,15 @@ class ClampingTests(unittest.TestCase):
             # future switch back to int()-style parsing would break it
             # silently in the dark-garden direction.
             (b"55", 55), (b"55.0", 55), (b"999", 100),
+            # bytearray, because _clamped's docstring names it as covered
+            # (T-527.16, which narrowed that contract from an unqualified
+            # "Never raises" to an enumerated set). A shape the prose claims
+            # and nothing executes is the defect this ticket keeps finding, so
+            # every name in that sentence gets a case here.
+            (bytearray(b"55"), 55), (memoryview(b"55"), 55),
+            # …and the non-numeric shapes at the other end of the same
+            # sentence, which must degrade rather than raise.
+            ([], 0), ({}, 0), (object(), 0),
         ]
         for value, expected in cases:
             # _clamped directly, because `None` is a SENTINEL at the decide()

@@ -223,7 +223,31 @@ def _validated_brightness(value, what: str) -> int:
 
 
 def _clamped(value) -> int:
-    """Force any value into 0..100, at DECISION time. Never raises.
+    """Force a brightness-shaped value into 0..100, at DECISION time.
+
+    NEVER RAISES FOR ANY SHAPE A CALLER CAN PRODUCE, which is `int`, `float`,
+    `str`, `bytes`, `bytearray`, `None`, and anything else `float()` rejects
+    with TypeError or ValueError. Those are the whole reachable set: a
+    brightness arrives either off the wire as `bytes`/`str`, out of the
+    persisted state file as `str`, or out of the config as an already-validated
+    `int`.
+
+    THE UNQUALIFIED "Never raises" THAT STOOD HERE WAS THE THIRD WRONG CONTRACT
+    SENTENCE FOUND IN THIS ONE FUNCTION, so state the bound rather than the
+    aspiration. Outside that set live exotic numerics with unbounded magnitude
+    — a `Decimal` at an extreme exponent is the case review raised — where the
+    conversion itself can exhaust memory before any `except` clause here is
+    reached. Measured: `_clamped(Decimal('1E+9999'))` returns 100 cleanly,
+    because `float()` gives `inf`. NOT measured, and deliberately left that
+    way: the `1E+999999999` case review reported as `MemoryError`, because
+    bounding that probe safely on this machine was not possible and running it
+    unbounded is not worth the answer. Either way no caller produces a
+    `Decimal`, and widening the guard would only invite a broader claim that is
+    equally unprovable.
+
+    The seam contract on `Override.brightness` agrees with this: it is
+    untrusted and clamped here, and it comes off the wire, so it is `str` or
+    `bytes`.
 
     Separate from _validated_brightness because the two guard different
     threats and must behave differently. Config is read once by a human and a
