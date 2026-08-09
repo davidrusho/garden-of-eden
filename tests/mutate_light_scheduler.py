@@ -495,6 +495,30 @@ def apply_once(path: Path, old: str, new: str):
     return None
 
 
+def ran_count(out: str) -> int:
+    """How many tests actually RAN, summed across the suites in `out`.
+
+    THE ONLY RELIABLE SIGNAL THAT A MUTANT DIED AT COLLECTION (T-527.18). The
+    no-verdict rule below was written to stop "the module died at import" being
+    scored as "the behaviour was noticed", and it looks for a red run with zero
+    named FAIL:/ERROR: lines. That catches nothing in the ImportError family,
+    because unittest wraps an unimportable module in `unittest.loader.
+    _FailedTest` and reports it as a perfectly ordinary named ERROR:
+
+        ERROR: test_light_scheduler (unittest.loader._FailedTest.…)
+        Ran 1 test in 0.000s
+
+    One named line, so the old rule scored it `killed (1 failing case(s))`
+    while the behaviour under test never executed. Confirmed by planting
+    `import a_module_that_does_not_exist` and reading the output.
+
+    The ran-count cannot be fooled that way: no honest mutant changes how many
+    tests are COLLECTED, only how many pass. A count that moved means the suite
+    that ran is not the suite that was scored.
+    """
+    return sum(int(n) for n in re.findall(r"Ran (\d+) tests?", out))
+
+
 def run_suites(root: Path, suites=(SUITE,)):
     """Return (all_passed, combined_output). stderr merged — unittest uses it."""
     for cache in root.rglob("__pycache__"):
@@ -529,6 +553,25 @@ CONTROL_B = (
     "        self.assertEqual(ls.SOURCE_SCHEDULE, decision.source)",
 )
 
+# CONTROL C — the positive control for the NO-VERDICT rule (T-527.15/.18).
+#
+# Without it, "0 no-verdict" is equally consistent with the rule working and
+# with the rule being unreachable, and the second was TRUE for the whole
+# ImportError family until 2026-08-09: unittest wraps an unimportable module in
+# `unittest.loader._FailedTest` and reports one ordinary named ERROR, so the
+# zero-named-lines rule could never fire and the mutant scored as a kill.
+#
+# Deliberately a MISSING IMPORT rather than a typo'd name. A name typo
+# (`threadingg.Lock()`) is the shape a sibling harness used, and it happens to
+# raise at module level too — but only because that particular line executes at
+# import. Move it inside a function and the same control silently stops testing
+# anything. An import statement cannot be moved out of the import.
+CONTROL_C = (
+    SRC,
+    "import subprocess\n",
+    "import subprocess\nimport a_module_that_certainly_does_not_exist\n",
+)
+
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
@@ -546,8 +589,12 @@ def main() -> int:
             print("\nCONTROL A FAILED - the suite does not pass on a clean copy.")
             print("This is NO DATA, not a score. Nothing below means anything.")
             return 2
-        ran = re.search(r"Ran (\d+) tests", out)
-        print(f"  GREEN ({ran.group(1) if ran else '?'} tests)\n")
+        clean_ran = ran_count(out)
+        if clean_ran == 0:
+            print("\nCONTROL A FAILED - a green run that collected NO tests.")
+            print("This is NO DATA, not a score. Nothing below means anything.")
+            return 2
+        print(f"  GREEN ({clean_ran} tests)\n")
 
         print("=" * 72)
         print("CONTROL B (negative) - a broken ASSERTION must score RED")
@@ -567,6 +614,34 @@ def main() -> int:
             print("Every 'killed' below would be meaningless. NO DATA.")
             return 2
         print("  RED - the scorer can distinguish pass from fail\n")
+
+        print("=" * 72)
+        print("CONTROL C (positive, for the NO-VERDICT rule) - an import-time")
+        print("break must score NO VERDICT, not a kill")
+        print("=" * 72)
+        ctl = root / CONTROL_C[0]
+        pristine_ctl = ctl.read_text()
+        problem = apply_once(ctl, CONTROL_C[1], CONTROL_C[2])
+        if problem:
+            print(f"  could not inject the import break: {problem}")
+            print("\nCONTROL C FAILED - the no-verdict rule is unproven. NO DATA.")
+            return 2
+        ok, out = run_suites(root)
+        ctl.write_text(pristine_ctl)
+        c_ran = ran_count(out)
+        c_fails = [ln for ln in out.splitlines()
+                   if ln.startswith(("FAIL:", "ERROR:"))]
+        if ok or c_ran == clean_ran:
+            print(f"  the suite ran {c_ran} tests against the clean {clean_ran}"
+                  f" and was {'GREEN' if ok else 'RED'}")
+            print("\nCONTROL C FAILED - an import-time break was not detected as")
+            print("a collection failure, so every 'killed' below may belong to a")
+            print("mutant whose behaviour never ran. NO DATA.")
+            return 2
+        print(f"  NO VERDICT - {c_ran} tests ran against the clean {clean_ran}, "
+              f"with {len(c_fails)} named failing case(s)")
+        print("  (note the named lines: that is exactly why the zero-named-lines")
+        print("   rule alone could not see this, and the count can)\n")
 
         print("=" * 72)
         print(f"{len(MUTANTS)} MUTANTS")
@@ -589,9 +664,25 @@ def main() -> int:
                 print("  SURVIVED - no test noticed")
                 survived.append(label)
                 continue
-            # Read WHY it died. A mutant that compiles but dies at import
-            # reddens the whole suite with zero named failing cases, and
-            # scoring that as a kill means the behaviour was never exercised.
+            # Read WHY it died, on TWO independent signals, because each misses
+            # what the other catches (T-527.18).
+            #
+            # First: did the same tests run at all? A mutant that compiles and
+            # then dies at import is wrapped by unittest in
+            # `unittest.loader._FailedTest` and reported as ONE ordinary named
+            # ERROR line — so the zero-named-lines rule below cannot see it,
+            # and it used to score as a kill. The ran-count can: no honest
+            # mutant changes how many tests are COLLECTED.
+            mutant_ran = ran_count(out)
+            if mutant_ran != clean_ran:
+                print(f"  NO VERDICT - {mutant_ran} tests ran against the clean")
+                print(f"  tree's {clean_ran}, so the module died at collection")
+                print("  rather than the behaviour being noticed. NOT a kill.")
+                broad.append(label)
+                continue
+            # Second: a red run with no named failing case at all. Kept as its
+            # own rule rather than folded into the count, because it catches
+            # the shapes that redden without changing collection.
             fails = [ln for ln in out.splitlines()
                      if ln.startswith(("FAIL:", "ERROR:"))]
             if not fails:

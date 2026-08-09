@@ -128,6 +128,7 @@ Mechanics, each of which has bitten this repo:
 import atexit
 import hashlib
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -391,9 +392,19 @@ CONTROL_B = ("CONTROL B: deliberately broken - the refusal gate never fires",
 # it as NO VERDICT. It is a POSITIVE control for the scoring rule: without it,
 # "0 no-verdict mutants" is equally consistent with the rule working and with
 # the rule never being reachable.
+# A MISSING IMPORT, NOT A TYPO'D NAME, and the change is deliberate
+# (T-527.18). This control previously read `threadingg.Lock()`, which raises
+# only because that particular assignment happens to execute at module scope —
+# move the line inside a function and the control silently stops testing
+# anything, while still looking correct. An import statement cannot be moved
+# out of the import. It is also the exact shape the scoring rule was WRONG
+# about: unittest reports an unimportable module as a named ERROR via
+# `unittest.loader._FailedTest`, so the zero-named-cases tell never fired and
+# this control was passing for a reason it did not state.
 CONTROL_C = ("CONTROL C: compiles, dies at import - must score NO VERDICT",
              "_publisher_threads_lock = threading.Lock()",
-             "_publisher_threads_lock = threadingg.Lock()")
+             "_publisher_threads_lock = threading.Lock()\n"
+             "import a_module_that_certainly_does_not_exist")
 
 _ORIGINAL_SRC = None
 
@@ -454,7 +465,12 @@ def apply_mutation(anchor, replacement):
     return True
 
 
-def score_run(ok, out):
+def ran_count(out):
+    """How many tests actually RAN, summed across the suites in `out`."""
+    return sum(int(n) for n in re.findall(r"Ran (\d+) tests?", out))
+
+
+def score_run(ok, out, clean_ran=None):
     """Turn one suite run into a verdict: 'survived', 'killed' or 'no-verdict'.
 
     THE THIRD VERDICT IS THE POINT. A battery scores by colour, so anything that
@@ -475,6 +491,16 @@ def score_run(ok, out):
         return "survived", []
     fails = [line for line in out.splitlines()
              if line.startswith(("FAIL:", "ERROR:"))]
+    # THE ZERO-NAMED-CASES TELL DOES NOT COVER THE ImportError FAMILY, which is
+    # the half this rule was believed to cover and did not (T-527.18). unittest
+    # wraps an unimportable module in `unittest.loader._FailedTest` and reports
+    # it as an ordinary NAMED ERROR, so `fails` is non-empty and the mutant
+    # scored as a kill while the behaviour under test never executed. The
+    # ran-count catches it: no honest mutant changes how many tests are
+    # COLLECTED, only how many pass. Passed in rather than recomputed so the
+    # comparison is always against THIS run's own clean baseline.
+    if clean_ran is not None and ran_count(out) != clean_ran:
+        return "no-verdict", fails
     return ("killed" if fails else "no-verdict"), fails
 
 
@@ -527,7 +553,11 @@ def _run():
         print("\nCONTROL A FAILED - the suite does not pass on a clean tree.")
         print("This is NO DATA, not a score. Fix the suite before reading anything.")
         return 1
-    print("  GREEN - suites pass on the clean tree\n")
+    clean_ran = ran_count(out)
+    if clean_ran == 0:
+        print("\nCONTROL A FAILED - a green run that collected NO tests. NO DATA.")
+        return 1
+    print(f"  GREEN - suites pass on the clean tree ({clean_ran} tests)\n")
 
     print("=" * 70)
     print("CONTROL B (negative) - a deliberately broken tree must be RED")
@@ -557,7 +587,7 @@ def _run():
         return 1
     ok, out = run_suites()
     restore()
-    verdict, fails = score_run(ok, out)
+    verdict, fails = score_run(ok, out, clean_ran)
     if verdict != "no-verdict":
         print(f"  scored '{verdict}' with {len(fails)} named failing case(s), "
               f"but it MUST score 'no-verdict'.")
@@ -580,7 +610,7 @@ def _run():
         ok, out = run_suites()
         restore()
         # Read WHY it died, not just the colour - see score_run().
-        verdict, fails = score_run(ok, out)
+        verdict, fails = score_run(ok, out, clean_ran)
         if verdict == "survived":
             print("  SURVIVED - no test noticed")
             survived.append(label)

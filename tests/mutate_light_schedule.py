@@ -63,6 +63,7 @@ biased toward the code you were already thinking about.
 """
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -349,6 +350,25 @@ CONTROL_B = (
     "    return Decision(0, SOURCE_SCHEDULE)",
 )
 
+# CONTROL C - the positive control for the NO-VERDICT rule (T-527.15/.18).
+#
+# Without it, "0 no-verdict" is equally consistent with the rule working and
+# with the rule being UNREACHABLE, and the second was true for the whole
+# ImportError family until 2026-08-09. The rule below looks for a red run with
+# zero named failing cases; unittest wraps an unimportable module in
+# `unittest.loader._FailedTest` and reports it as one ordinary named ERROR, so
+# an import-time death scored as `killed (1 failing case(s))` while the
+# behaviour under test never executed. The ran-count is what catches it.
+#
+# Deliberately a MISSING IMPORT rather than a typo'd name: a name typo only
+# raises at import while that particular line happens to execute at module
+# level, so moving it into a function would silently retire the control.
+CONTROL_C = (
+    "CONTROL C: compiles, dies at import - must score NO VERDICT",
+    "import re\n",
+    "import re\nimport a_module_that_certainly_does_not_exist\n",
+)
+
 # The one mutant that lives in the TEST file rather than the module: see
 # MUTANTS' last entry. Kept in the same battery because PurityTests is the only
 # guard on the module's single architectural promise, so a battery that could
@@ -435,6 +455,19 @@ def apply_mutation(anchor, replacement):
     return True
 
 
+def ran_count(out):
+    """How many tests actually RAN, summed across the suites in `out`.
+
+    THE ONLY RELIABLE SIGNAL THAT A MUTANT DIED AT COLLECTION (T-527.18). The
+    zero-named-failures rule below cannot see the ImportError family, because
+    unittest reports an unimportable module as a named ERROR through
+    `unittest.loader._FailedTest`. No honest mutant changes how many tests are
+    COLLECTED, so a count that moved means the suite that ran is not the suite
+    being scored.
+    """
+    return sum(int(n) for n in re.findall(r"Ran (\d+) tests?", out))
+
+
 def run_suites():
     """Return (all_passed, combined_output). stderr merged - unittest uses it."""
     purge_pycache()
@@ -500,7 +533,12 @@ def _run():
         print("\nCONTROL A FAILED - the suite does not pass on a clean tree.")
         print("This is NO DATA, not a score. Fix the suite before reading anything.")
         return 1
-    print("  GREEN - the suite passes on the clean tree\n")
+    clean_ran = ran_count(out)
+    if clean_ran == 0:
+        print("\nCONTROL A FAILED - a green run that collected NO tests.")
+        print("This is NO DATA, not a score.")
+        return 1
+    print(f"  GREEN - the suite passes on the clean tree ({clean_ran} tests)\n")
 
     print("=" * 72)
     print("CONTROL B (negative) - a deliberately broken tree must be RED")
@@ -519,6 +557,33 @@ def _run():
         print("Every 'killed' below would be meaningless. NO DATA.")
         return 1
     print("  RED - the scorer can distinguish pass from fail\n")
+
+    print("=" * 72)
+    print("CONTROL C (positive, for the NO-VERDICT rule) - an import-time break")
+    print("must score NO VERDICT, not a kill")
+    print("=" * 72)
+    label, anchor, replacement = CONTROL_C
+    print(f"  {label}")
+    if not apply_mutation(anchor, replacement):
+        print("\nCONTROL C could not be applied - the no-verdict rule is")
+        print("unproven. NO DATA.")
+        restore()
+        return 1
+    ok, out = run_suites()
+    restore()
+    c_ran = ran_count(out)
+    c_fails = [ln for ln in out.splitlines() if ln.startswith(("FAIL:", "ERROR:"))]
+    if ok or c_ran == clean_ran:
+        print(f"  ran {c_ran} tests against the clean {clean_ran}, "
+              f"{'GREEN' if ok else 'RED'}")
+        print("\nCONTROL C FAILED - an import-time break was not detected as a")
+        print("collection failure, so every 'killed' below may belong to a")
+        print("mutant whose behaviour never ran. NO DATA.")
+        return 1
+    print(f"  NO VERDICT - {c_ran} tests ran against the clean {clean_ran}, "
+          f"with {len(c_fails)} named failing case(s)")
+    print("  (the named lines are exactly why the zero-named-lines rule alone")
+    print("   could not see this, and why the count can)\n")
 
     print("=" * 72)
     print(f"{len(MUTANTS)} MUTANTS")
@@ -544,6 +609,13 @@ def _run():
         # `killed`, so the headline count never moved. The compile() gate above
         # cannot catch that class - the mutant is valid Python - so the check
         # has to live here.
+        mutant_ran = ran_count(out)
+        if mutant_ran != clean_ran:
+            print(f"  NO VERDICT - {mutant_ran} tests ran against the clean")
+            print(f"  tree's {clean_ran}, so the module died at collection")
+            print("  rather than the behaviour being noticed. This is NOT a kill.")
+            broad.append(label)
+            continue
         fails = [
             line for line in out.splitlines() if line.startswith(("FAIL:", "ERROR:"))
         ]

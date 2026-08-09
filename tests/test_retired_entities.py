@@ -44,13 +44,23 @@ RETIRED_DISCOVERY = [
     f"homeassistant/sensor/gardyn/{ID}_humidity/config",
 ]
 
-# The four that WORK and must keep working: the grow light, the PCB thermometer
-# (PCT2075 at 0x48), and both cameras.
+# The entities that WORK and must keep working: the grow light, the PCB
+# thermometer (PCT2075 at 0x48), both cameras — and, since T-527.6, the light's
+# SCHEDULE SOURCE.
+#
+# The fifth was added by b95e263 and this list was not updated, so
+# test_discovery_announces_nothing_beyond_the_four failed from that commit
+# until 2026-08-09 and nobody noticed. The guard was RIGHT: a new entity
+# appeared and it said so. Recorded here rather than quietly widened, because
+# the failure also blocked tests/mutate_connack_refusal.py's CONTROL A, which
+# runs this suite — so a broken test in one file made a whole battery
+# unrunnable, and "the battery cannot run" looked like an environment problem.
 SURVIVING_DISCOVERY = [
     f"homeassistant/light/gardyn/{ID}_light/config",
     f"homeassistant/sensor/gardyn/{ID}_pcb_temp/config",
     f"homeassistant/image/gardyn/{ID}_upper_camera/config",
     f"homeassistant/image/gardyn/{ID}_lower_camera/config",
+    f"homeassistant/sensor/gardyn/{ID}_light_source/config",
 ]
 
 # Every state topic the retired entities were fed from that was published with
@@ -210,9 +220,11 @@ class TestDiscoveryNoLongerAnnouncesDeadHardware(RetiredEntitiesTestBase):
                 self.assertTrue(call.retain)
                 self.assertTrue(call.payload)
 
-    def test_discovery_announces_nothing_beyond_the_four(self):
+    def test_discovery_announces_nothing_beyond_the_survivors(self):
         # Catches a retired block that was moved rather than removed, and any
-        # eighth entity quietly reintroduced.
+        # entity quietly reintroduced. It also catches a legitimately NEW one,
+        # which is what happened in T-527.6 — see SURVIVING_DISCOVERY. Adding
+        # an entity is meant to require touching this list.
         mqtt_mod.send_discovery_messages(self.client)
         announced = sorted(t for t in self.client.topics
                            if t.startswith("homeassistant/"))
@@ -488,12 +500,37 @@ class TestRetiredCommandSurface(RetiredEntitiesTestBase):
         self.assertEqual(self.client.to("gardyn/water/low/cm"), [])
         self.assertEqual(self.client.to("gardyn/water/low/mode"), [])
 
-    def test_the_light_still_publishes_its_state(self):
-        # The control that separates "the retired publishers are gone" from
-        # "state publishing is broken".
+    def test_a_light_command_still_reaches_the_lamp_THROUGH_THE_SCHEDULER(self):
+        """The control that separates "the retired publishers are gone" from
+        "the light command surface is broken".
+
+        REWRITTEN FOR T-527.6's CONTRACT. It used to assert that a command
+        published `gardyn/light/state` directly, and that stopped being true
+        the moment the scheduler became the single writer: mqtt.py's handlers
+        now call apply_light_override(), and publishing is the scheduler's job.
+        With no scheduler installed the command deliberately does NOTHING and
+        logs — apply_light_override's docstring says driving the pin anyway
+        would hide the one condition under which the module's model of who owns
+        the lamp is wrong — so the honest assertion is that the command reaches
+        the scheduler. The publish itself is pinned in test_light_scheduler.py.
+        """
+        mqtt_mod.light_scheduler = MagicMock()
+        self.addCleanup(setattr, mqtt_mod, "light_scheduler", None)
         self._send("light/command", "ON")
-        self.assertEqual(len(self.client.to("gardyn/light/state")), 1)
-        self.assertTrue(self.client.to("gardyn/light/state")[0].retain)
+        mqtt_mod.light_scheduler.override_now.assert_called_once()
+
+    def test_a_light_command_with_NO_scheduler_drives_nothing(self):
+        """The other half, and the reason the test above is not just weaker.
+
+        Reaching the handlers with no scheduler means __main__ never ran, and
+        T-527.6 chose to make that visibly do nothing rather than fall back to
+        the old direct-drive path. Without this, deleting the None guard would
+        look like an improvement."""
+        mqtt_mod.light_scheduler = None
+        with self.assertLogs(mqtt_mod.logger, level="ERROR"):
+            self._send("light/command", "ON")
+        mqtt_mod.light.set_duty_cycle.assert_not_called()
+        mqtt_mod.light.off.assert_not_called()
 
 
 class TestInterlockSurvivesTheWithdrawal(RetiredEntitiesTestBase):

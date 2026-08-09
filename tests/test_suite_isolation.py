@@ -342,13 +342,35 @@ runner = "run_suites" if hasattr(mod, "run_suites") else "run_suite"
 before = {p: fingerprint(p) for p in targets}
 state = {"n": 0, "at_interrupt": None}
 
+# The controls' canned output MUST LOOK LIKE unittest, not like a sentinel.
+# This double used to return the bare string "control", which was fine until
+# the harnesses learned to read the ran-count (T-527.18): a "green" run
+# reporting zero collected tests is itself a NO DATA condition, so the harness
+# correctly aborted at control A and main() returned before the interrupt could
+# be injected. The double was written from the happy path and modelled the
+# COLOUR of a run without its CONTENT.
+_GREEN = "Ran 40 tests in 0.100s\n\nOK\n"
+_RED = ("FAIL: test_x (tests.test_x.X.test_x)\nAssertionError: 1 != 0\n"
+        "Ran 40 tests in 0.100s\n\nFAILED (failures=1)\n")
+# Control C's shape: compiles, dies at IMPORT. unittest reports it as a named
+# ERROR through _FailedTest, and the collapsed ran-count is the only tell.
+_IMPORT_DEATH = ("ERROR: test_x (unittest.loader._FailedTest.test_x)\n"
+                 "ModuleNotFoundError: No module named 'nope'\n"
+                 "Ran 1 test in 0.000s\n\nFAILED (errors=1)\n")
+n_controls = 3 if hasattr(mod, "CONTROL_C") else 2
+
 def fake(*a, **k):
     state["n"] += 1
-    # Call 1 is control A (the clean tree, must look GREEN) and call 2 is
-    # control B (broken, must look RED). Interrupting before those pass would
-    # abort the harness through its own guard rather than mid-mutant.
-    if state["n"] <= 2:
-        return (state["n"] == 1), "control"
+    # Call 1 is control A (clean, must look GREEN), call 2 is control B (broken,
+    # must look RED), and call 3 — where the harness has one — is control C (an
+    # import-time death, must classify as NO VERDICT). Interrupting before those
+    # pass would abort the harness through its own guard rather than mid-mutant.
+    if state["n"] <= n_controls:
+        if state["n"] == 1:
+            return True, _GREEN
+        if state["n"] == 2:
+            return False, _RED
+        return False, _IMPORT_DEATH
     now = {p: fingerprint(p) for p in targets}
     if mode == "delete":
         # Wait for the DELETE mutant, whose restore is a different code path

@@ -760,13 +760,23 @@ class TestTheNewBranchDoesNotShadowTheRest(BirthMessageTestBase):
     while the grow light stopped answering Home Assistant entirely.
     """
 
-    def test_a_light_command_still_reaches_the_light(self):
+    def test_a_light_command_still_reaches_the_lamp_THROUGH_THE_SCHEDULER(self):
+        """REWRITTEN FOR T-527.6's CONTRACT. These used to assert the handler
+        drove the pin directly (light.off / light.set_duty_cycle), which is
+        exactly what T-527.6 removed — there is now ONE path from a human's
+        intent to the pin, through the scheduler, so that a command is applied,
+        persisted and published by the same code that does it for the schedule.
+        Asserting the old calls made both tests fail from b95e263 onward."""
+        mqtt_mod.light_scheduler = MagicMock()
+        self.addCleanup(setattr, mqtt_mod, "light_scheduler", None)
         self._deliver("gardyn/light/command", "OFF")
-        mqtt_mod.light.off.assert_called_once()
+        mqtt_mod.light_scheduler.override_now.assert_called_once_with(0)
 
-    def test_a_brightness_command_still_reaches_the_light(self):
+    def test_a_brightness_command_still_reaches_the_lamp(self):
+        mqtt_mod.light_scheduler = MagicMock()
+        self.addCleanup(setattr, mqtt_mod, "light_scheduler", None)
         self._deliver("gardyn/light/brightness/set", "70")
-        mqtt_mod.light.set_duty_cycle.assert_called_with(70)
+        mqtt_mod.light_scheduler.override_now.assert_called_with(70)
 
     def test_a_light_command_does_not_re_announce_discovery(self):
         # The inverse shadow: an over-broad birth branch that also fired on
