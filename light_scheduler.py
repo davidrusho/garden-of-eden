@@ -222,11 +222,26 @@ def read_clock_state(_run=subprocess.run, timeout=NTP_QUERY_TIMEOUT_SECONDS):
     cost this ticket a blocked deploy (T-527.19). It is NOT "is the clock
     accurate". systemd v252's src/timedate/timedated.c computes it as
     `txc.maxerror < 16000000` — 16 seconds of accumulated ERROR BOUND — while
-    the kernel (kernel/time/ntp.c) adds MAXFREQ, 500 µs, to maxerror once per
-    second whenever NTP is unreachable. So a perfectly accurate clock reports
-    `no` after 16,000,000 / 500 = 32,000 s, and that was CONFIRMED ON THIS PI
-    on 2026-08-09 by a read-only adjtimex(2) probe: exactly 500.0 µs/s, 8.89 h
-    from a standing start. It is a STALENESS reading, not an accuracy one.
+    the kernel's second_overflow() (kernel/time/ntp.c) adds MAXFREQ, 500 µs, to
+    maxerror EVERY SECOND, unconditionally. NTP does not slow that climb; a
+    successful sync RESETS maxerror, via ADJ_MAXERROR. The distinction matters
+    because it says where the clock stands the moment the network drops: at
+    whatever the last sync left, climbing at a fixed rate from there.
+
+    So a perfectly accurate clock reports `no` after 16,000,000 / 500 =
+    32,000 s = 8.89 h FROM A STANDING START — an upper bound, since maxerror is
+    rarely exactly 0 at the last sync, so the real trip comes sooner. Confirmed
+    on this Pi on 2026-08-09 by a read-only adjtimex(2) probe that read both
+    candidate struct timex layouts so the wrong one was its own control:
+    exactly 500.0 µs/s. It is a STALENESS reading, not an accuracy one.
+
+    ONE PROPERTY OF THE KERNEL IS WHAT MAKES THE LATCH SOUND, and it is worth
+    naming here because the latch looks reckless without it: ntp_clear() sets
+    time_maxerror to NTP_PHASE_LIMIT, and clock_settime()/settimeofday() route
+    through timekeeping_update() with TK_CLEAR_NTP. So a clock restored from
+    /var/lib/systemd/timesync/clock, or set by hand with `date -s`, forces
+    NTPSynchronized=no. The latch CANNOT fire on a clock that was restored from
+    disk — which is precisely the scenario the gate exists for.
     """
     try:
         proc = _run(list(NTP_QUERY), capture_output=True, text=True, timeout=timeout)
@@ -405,6 +420,21 @@ class LightScheduler:
         # and it is written as one acquisition covering both halves — which it
         # has to be anyway, or the override could expire between being recorded
         # and being applied.
+        #
+        # PAHO'S NETWORK THREAD CAN NOW BLOCK ON THIS LOCK, WHICH IT COULD NOT
+        # BEFORE, and that was checked against paho 2.0.0's source rather than
+        # assumed. `_packet_queue` acquires paho's own `_in_callback_mutex`
+        # NON-blocking (`acquire(False)`) and the socket is non-blocking, so
+        # there is no lock-order inversion and `client.publish()` under this
+        # lock cannot block on the network. The wait is bounded by
+        # NTP_QUERY_TIMEOUT_SECONDS plus pigpio round-trips, against a
+        # KEEP_ALIVE_INTERVAL of 60 s, so a 10-20 s stall is inside budget.
+        #
+        # The residual, named rather than hidden: a WEDGED pigpiod. Its socket
+        # round-trip has no timeout, so it would pin this lock indefinitely.
+        # That exposure is widened here rather than created —
+        # announce_to_home_assistant() already calls light.get_brightness() on
+        # paho's thread before it reaches publish_now().
         self._lock = threading.Lock()
         self._override = None
         self._stop = threading.Event()
@@ -571,21 +601,37 @@ class LightScheduler:
         # Never synchronised in this process's life, and the kernel says so.
         # This is the scenario the gate is for — but it is bounded, because an
         # unbounded hold of a persisted 0 is the dark garden all over again.
-        elapsed = self._elapsed_since_boot()
-        if elapsed < self._never_synced_hold_seconds:
+        if self._elapsed_since_boot() < self._never_synced_hold_seconds:
             return False, None
+        # NO ELAPSED TIME IN THIS STRING, and that is not a style choice.
+        # _report dedupes on the message TEXT, so interpolating a value that
+        # moves defeats it completely: `{elapsed / 3600:.1f}` changes every six
+        # minutes, which measured 246 distinct ERROR lines a day into an
+        # unrotated gardyn.log on an SD card — against the "one ERROR rather
+        # than 20,160" this design claims. The condition holds for the whole
+        # outage, so the message must be constant for the whole outage. The
+        # journal's own timestamps say when it started; uptime says how long.
         return True, (
-            f"the clock has never synchronised and the host has been up "
-            f"{elapsed / 3600:.1f} h; following the schedule anyway rather than "
-            f"holding the lamp indefinitely"
+            "the clock has never synchronised and the host has been up longer "
+            "than the hold ceiling; following the schedule anyway rather than "
+            "holding the lamp indefinitely"
         )
 
     def _elapsed_since_boot(self):
         """Seconds since boot, falling back to this process's own age.
 
-        The fallback UNDER-reports across a restart, which is the safe
-        direction: it lengthens the hold rather than ending it early. It exists
-        for the laptop the tests run on, where there is no /proc/uptime.
+        THE FALLBACK UNDER-REPORTS ACROSS A RESTART, WHICH IS THE DANGEROUS
+        DIRECTION, and an earlier version of this docstring called it the safe
+        one — flatly contradicting UPTIME_PATH's comment two hundred lines up,
+        which is the one that is right. Under-reporting LENGTHENS the hold, and
+        an unbounded hold is the dark garden NEVER_SYNCED_HOLD_SECONDS exists
+        to close; ending the hold early only costs a photoperiod at the wrong
+        hour, which is this ticket's cheap mistake throughout.
+
+        It is tolerable only because of where it can fire: /proc/uptime is
+        always present on the deploy target, so this branch is reachable on the
+        laptop the tests run on and essentially nowhere else. If that ever
+        stops being true, this is a real hole rather than a convenience.
         """
         value = self._uptime()
         if value is None:
@@ -632,6 +678,11 @@ class LightScheduler:
         # published while sending the hardware's stale value, and every later
         # tick then deduped against it. Home Assistant showed the grow light
         # OFF while it was on, until the next boundary or an MQTT reconnect.
+        #
+        # The accepted cost: a PERMANENTLY failing pigpio now republishes every
+        # tick rather than once. That is broker traffic on retained topics, and
+        # it is dwarfed by _apply's own logger.exception traceback per tick,
+        # which is pre-existing. Suppressing it would reinstate the strand.
         pair = (decision.brightness, decision.source)
         if pair != self._last_published or not applied:
             self._publish(decision)
@@ -755,6 +806,13 @@ class LightScheduler:
 
         The sleep is measured from the START of the tick, so a slow tick eats
         into the gap rather than adding to it and the cadence does not drift.
+
+        IT USES THE MODULE-LEVEL monotonic(), NOT self._monotonic, and the
+        split is deliberate rather than an oversight. `self._monotonic` exists
+        for ONE purpose — the never-synced hold's fallback anchor — and tests
+        inject finite iterators into it; driving this loop from the same
+        callable would exhaust them. Nothing here needs to be steerable,
+        because the cadence is already injectable through `sleeper`.
         """
         while not self._stop.is_set():
             started = monotonic()

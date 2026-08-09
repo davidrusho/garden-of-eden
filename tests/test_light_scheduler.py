@@ -1014,20 +1014,33 @@ class ClockVerdictTests(SchedulerHarness):
         self.assertEqual(100, decision.brightness)
         self.assertEqual([100], self.light.commands)
 
-    def test_ending_the_hold_is_reported_once(self):
+    def test_ending_the_hold_is_reported_once_ACROSS_AN_ADVANCING_UPTIME(self):
         """It is a real degradation — the schedule is now running on a clock
-        nothing has corroborated — so it must reach the log. Once, though: this
-        condition persists for the whole outage, and _report is what keeps it
-        from writing 2,880 lines a day."""
+        nothing has corroborated — so it must reach the log. Once, though: the
+        condition persists for the whole outage.
+
+        THE UPTIME ADVANCES HERE, AND THAT IS THE ENTIRE POINT OF THE TEST.
+        The first version of this passed a CONSTANT uptime, which made the
+        assertion true by its own input: _report dedupes on message TEXT, and
+        the note interpolated `{elapsed / 3600:.1f}`, so in production — where
+        uptime grows — it emitted a new distinct string every six minutes.
+        Measured at 246 ERROR lines a day into an unrotated gardyn.log on an SD
+        card, against a docstring claiming one. Four hours of real ticks are
+        simulated below because two identical ones could never show it."""
+        elapsed = [lsr.NEVER_SYNCED_HOLD_SECONDS + 1]
         scheduler = self.build(
             clock_probe=self._probe(self.UNSYNCED),
-            uptime=lambda: lsr.NEVER_SYNCED_HOLD_SECONDS + 1,
+            uptime=lambda: elapsed[0],
         )
         with self.assertLogs(lsr.logger, level="ERROR") as captured:
-            scheduler.tick()
-            scheduler.tick()
-        self.assertEqual(1, len(captured.records))
-        self.assertIn("never synchronised", captured.output[0])
+            for _ in range(480):          # 4 h at the shipped 30 s cadence
+                scheduler.tick()
+                elapsed[0] += 30
+        holds = [line for line in captured.output if "never synchronised" in line]
+        self.assertEqual(
+            1, len(holds),
+            f"the hold note is not deduped across a growing uptime: {len(holds)} lines",
+        )
 
     def test_the_ceiling_is_measured_from_BOOT_not_from_process_start(self):
         """A crash loop must not reset it. mqtt.service carries Restart=always
@@ -1045,9 +1058,13 @@ class ClockVerdictTests(SchedulerHarness):
         self.assertEqual(ls.SOURCE_SCHEDULE, scheduler.tick().source)
 
     def test_an_unreadable_uptime_falls_back_to_this_process_age(self):
-        """No /proc/uptime — a laptop, or a container without procfs. The
-        fallback UNDER-reports across a restart, which lengthens the hold rather
-        than ending it early, and that is the safe direction."""
+        """No /proc/uptime — a laptop, or a container without procfs.
+
+        The fallback UNDER-reports across a restart, which LENGTHENS the hold,
+        and that is the DANGEROUS direction, not the safe one: an unbounded
+        hold is the dark garden the ceiling exists to close. It is tolerable
+        only because /proc/uptime always exists on the deploy target, so this
+        branch is reachable here and essentially nowhere else."""
         lsr.write_last_applied(self.state, 50)
         self.light.brightness = 50
         # The FIRST reading is consumed at construction, as the anchor. Both
@@ -1087,16 +1104,28 @@ class SerialisationTests(SchedulerHarness):
     ~0.1%-per-command window.
     """
 
-    def _blocking_probe(self, entered, release):
-        """A clock probe that parks inside the tick until told to continue.
+    def _blocking_probe(self, entered, release, park_on=(1,)):
+        """A clock probe that parks inside SPECIFIC ticks until released.
 
         Stands in for the real `timedatectl` fork+exec, which is where a tick
         actually spends its time (0.169 s median on the Pi, up to
         NTP_QUERY_TIMEOUT_SECONDS) and therefore where a second thread lands.
+
+        `park_on` IS THE FIX FOR AN ASSERTION THAT PASSED FOR THE WRONG REASON.
+        An earlier version parked on EVERY call, so a second thread entering
+        its own tick blocked on the probe rather than on the lock — which meant
+        the "did not interleave" assertion below stayed true with the lock
+        removed, and the mutant was killed four lines later by a different
+        mechanism than the comment claimed. Parking only the named call leaves
+        the lock as the only thing that can hold the second thread up.
         """
+        calls = []
+
         def probe():
-            entered.set()
-            self.assertTrue(release.wait(5), "the test never released the tick")
+            calls.append(None)
+            if len(calls) in park_on:
+                entered.set()
+                self.assertTrue(release.wait(5), "the test never released the tick")
             return (lsr.CLOCK_SYNCED, None)
         return probe
 
@@ -1105,6 +1134,28 @@ class SerialisationTests(SchedulerHarness):
         thread.start()
         self.addCleanup(thread.join, 5)
         return thread
+
+    def _run_when_started(self, fn):
+        """Run `fn` off-thread, returning once the thread is REALLY running.
+
+        The two interleave tests below assert that something cannot finish
+        within a short window. That window has to contain only the call under
+        test — if it also contains Python's thread start-up, then a loaded
+        machine makes the assertion pass because nothing had begun yet, which
+        is a mutant surviving for a reason unrelated to the lock. Waiting on a
+        started-flag first removes that from the window; what is left is the
+        lock, which is the thing being measured.
+        """
+        started, done = threading.Event(), threading.Event()
+
+        def body():
+            started.set()
+            fn()
+            done.set()
+
+        self._run_off_thread(body)
+        self.assertTrue(started.wait(5), "the helper thread never started")
+        return done
 
     def test_a_command_landing_inside_a_tick_is_not_reverted(self):
         """DEFECT 3. You press the button to turn the lamp off; before this it
@@ -1119,16 +1170,12 @@ class SerialisationTests(SchedulerHarness):
         self._run_off_thread(scheduler.tick)
         self.assertTrue(entered.wait(5), "the tick never started")
 
-        done = threading.Event()
-
-        def command():
-            scheduler.override_now(0)
-            done.set()
-
-        self._run_off_thread(command)
-        # The command must NOT be able to complete while a tick is in flight.
-        # This is the assertion that goes red with the lock removed: without it
-        # the override lands, and the parked tick then reverts it on resume.
+        done = self._run_when_started(lambda: scheduler.override_now(0))
+        # The command must NOT complete while a tick is in flight, and the LOCK
+        # has to be the only thing stopping it — the probe parks call 1 only,
+        # so the command's own tick would sail through if the lock were gone.
+        # Verified by applying the battery's `with self._lock:` -> `if True:`
+        # mutant and watching this line go red, rather than assumed.
         self.assertFalse(done.wait(0.2), "the command interleaved with the tick")
 
         release.set()
@@ -1147,19 +1194,14 @@ class SerialisationTests(SchedulerHarness):
         while a person held the lamp, held until the override expired, and the
         T-527.9 obedience automation is specified to condition on that topic."""
         entered, release = threading.Event(), threading.Event()
-        scheduler = self.build(clock_probe=self._blocking_probe(entered, release))
-        # Seed a decision for publish_now to republish. The probe blocks, so
-        # this first tick has to be let through before it can park.
-        release.set()
-        scheduler.tick()
-
-        entered.clear()
-        release.clear()
+        scheduler = self.build(
+            clock_probe=self._blocking_probe(entered, release, park_on=(2,))
+        )
+        scheduler.tick()  # seed a decision for publish_now to republish
         self._run_off_thread(scheduler.tick)
         self.assertTrue(entered.wait(5), "the second tick never started")
 
-        published = threading.Event()
-        self._run_off_thread(lambda: (scheduler.publish_now(), published.set()))
+        published = self._run_when_started(scheduler.publish_now)
         self.assertFalse(
             published.wait(0.2), "publish_now interleaved with a tick"
         )
@@ -1172,20 +1214,33 @@ class SerialisationTests(SchedulerHarness):
         self.assertEqual(scheduler._last_published, self.published[-1])
 
     def test_the_remembered_pair_matches_the_last_publish_under_contention(self):
-        """The same invariant as a stress run rather than a staged interleave —
-        a second instrument on one property, because the staged test proves the
-        lock blocks and this proves the bookkeeping is right on both sides of
-        it. Deliberately not the only evidence: a stress loop that happens to
-        miss the window passes for the wrong reason."""
+        """The same invariant as a stress run rather than a staged interleave.
+
+        THE OVERRIDES ARE WHAT MAKE THE INVARIANT MEAN ANYTHING. Without them
+        every thread reaches the identical decision, so the whole run publishes
+        one distinct pair and `_last_published == published[-1]` compares a
+        value to itself — it cannot fail under any interleaving, which makes it
+        decoration rather than a check. Alternating an override in and out
+        keeps at least two pairs in flight, so a torn read is observable.
+
+        The liveness half is asserted separately and is worth having on its
+        own: nothing here may deadlock.
+        """
         scheduler = self.build()
         scheduler.tick()
-        threads = []
-        for index in range(40):
-            target = scheduler.tick if index % 2 else scheduler.publish_now
-            threads.append(self._run_off_thread(target))
+        actions = (scheduler.tick, scheduler.publish_now,
+                   lambda: scheduler.override_now(20), scheduler.clear_override)
+        threads = [self._run_off_thread(actions[index % len(actions)])
+                   for index in range(40)]
         for thread in threads:
             thread.join(5)
             self.assertFalse(thread.is_alive(), "a thread deadlocked")
+
+        self.assertGreater(
+            len(set(self.published)), 1,
+            "the stress run only ever published one pair, so the invariant "
+            "below compares a value to itself",
+        )
         self.assertEqual(scheduler._last_published, self.published[-1])
 
     # --------------------------------------------- the failed-drive republish

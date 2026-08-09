@@ -27,12 +27,24 @@ An earlier version of the list below named three gaps and did not mention
 concurrency, so the largest untested surface in the module was the one this
 preamble implied was covered — which is worse than an undeclared gap, because
 an undeclared gap at least prompts the question. An independent 15-mutant pass
-then left 10 survivors, `with self._lock:` -> `if True:` among them in BOTH
-places. Both lock statements, the publish bookkeeping and the failed-drive
-republish now carry mutants, and tests/test_light_scheduler.py's
-SerialisationTests is what kills them. Read that as the standing lesson: when
-declaring absences, enumerate the module's constructs, not the ones already in
-mind.
+then left 10 survivors, `with self._lock:` -> `if True:` among them.
+
+THERE ARE SEVEN `with self._lock:` STATEMENTS AND THREE OF THEM CARRY MUTANTS.
+Counted, because the first version of this paragraph said "both lock
+statements" — committing the exact error it had just been written to warn
+about, one sentence after warning about it. The three that are mutated are the
+ones with production callers: `tick`, `override_now`, `publish_now` (mqtt.py
+calls only those three plus `start`). The four that are not are
+`set_override`, `clear_override`, and the `override` and `last_decision`
+properties; each was checked individually and all four can be removed with the
+suite still GREEN. That is a real gap in the guard rather than a judgement that
+it does not matter — it is unexercised API surface today, and the moment
+anything calls it, it is untested. Do not read the 100% score as covering it.
+
+The publish bookkeeping and the failed-drive republish do carry mutants, and
+tests/test_light_scheduler.py's SerialisationTests is what kills them. The
+standing lesson: when declaring absences, ENUMERATE the module's constructs —
+`grep -c` them — rather than listing the ones already in mind.
 
 CONSTRUCTS WITH NO MUTANT, DECLARED RATHER THAN LEFT AS AN UNEXPLAINED GAP —
 because a kill count bounds only the mutants somebody thought to write, and an
@@ -361,22 +373,34 @@ MUTANTS = [
      "        self._ever_synced = True\n        if state == CLOCK_UNKNOWN:\n            return True, None"),
     ("the never-synced hold has no ceiling - a legitimate persisted 0 is a "
      "dark garden for the whole outage", SRC,
-     "        if elapsed < self._never_synced_hold_seconds:\n            return False, None",
+     "        if self._elapsed_since_boot() < self._never_synced_hold_seconds:\n"
+     "            return False, None",
      "        if True:\n            return False, None"),
     ("the ceiling is inclusive, which is the off-by-one nobody would notice",
      SRC,
-     "        if elapsed < self._never_synced_hold_seconds:",
-     "        if elapsed <= self._never_synced_hold_seconds:"),
+     "        if self._elapsed_since_boot() < self._never_synced_hold_seconds:",
+     "        if self._elapsed_since_boot() <= self._never_synced_hold_seconds:"),
     # NOTE: the first version of this mutant was `None or f"" or f"the clock…"`,
     # which evaluates to the SAME string — it perturbed nothing and survived
     # honestly. A survivor is a question about the harness before it is a
     # question about the suite.
     ("ending the hold is silent, so nothing in the journal says the schedule "
      "is running on an uncorroborated clock", SRC,
-     "        return True, (\n            f\"the clock has never synchronised and the host has been up \"\n"
-     "            f\"{elapsed / 3600:.1f} h; following the schedule anyway rather than \"\n"
-     "            f\"holding the lamp indefinitely\"\n        )",
+     "        return True, (\n            \"the clock has never synchronised and the host has been up longer \"\n"
+     "            \"than the hold ceiling; following the schedule anyway rather than \"\n"
+     "            \"holding the lamp indefinitely\"\n        )",
      "        return True, None"),
+    # A mutant must be able to REINTRODUCE removed code, not only break what is
+    # present. This puts the elapsed value back into the note, which is what
+    # defeated _report's text dedupe and wrote 246 ERROR lines a day.
+    ("the hold note interpolates a value that moves, so _report's dedupe is "
+     "defeated and every six minutes writes a fresh ERROR line", SRC,
+     "        return True, (\n            \"the clock has never synchronised and the host has been up longer \"\n"
+     "            \"than the hold ceiling; following the schedule anyway rather than \"\n"
+     "            \"holding the lamp indefinitely\"\n        )",
+     "        return True, (\n            f\"the clock has never synchronised and the host has been up \"\n"
+     "            f\"{self._elapsed_since_boot() / 3600:.1f} h; following the schedule anyway \"\n"
+     "            f\"rather than holding the lamp indefinitely\"\n        )"),
     ("the ceiling is measured from process start, so a crash loop grants a "
      "fresh window every ten seconds", SRC,
      "        value = self._uptime()\n        if value is None:",
