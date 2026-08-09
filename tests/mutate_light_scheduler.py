@@ -22,6 +22,18 @@ every branch that can decide "do not drive the lamp" gets at least one mutant:
 the NTP gate's three failure readings, the corrupt-state-file reading, the
 already-at-target shortcut, and run_forever's catch-all.
 
+THREADING IS NOW IN THE BATTERY, AND ITS ABSENCE WAS THIS FILE'S WORST BUG.
+An earlier version of the list below named three gaps and did not mention
+concurrency, so the largest untested surface in the module was the one this
+preamble implied was covered — which is worse than an undeclared gap, because
+an undeclared gap at least prompts the question. An independent 15-mutant pass
+then left 10 survivors, `with self._lock:` -> `if True:` among them in BOTH
+places. Both lock statements, the publish bookkeeping and the failed-drive
+republish now carry mutants, and tests/test_light_scheduler.py's
+SerialisationTests is what kills them. Read that as the standing lesson: when
+declaring absences, enumerate the module's constructs, not the ones already in
+mind.
+
 CONSTRUCTS WITH NO MUTANT, DECLARED RATHER THAN LEFT AS AN UNEXPLAINED GAP —
 because a kill count bounds only the mutants somebody thought to write, and an
 undeclared absence reads as coverage:
@@ -47,6 +59,14 @@ undeclared absence reads as coverage:
     perturb. tests/test_light_scheduler.py carries
     test_the_corruption_corpus_has_not_been_quietly_narrowed for exactly that,
     and the last mutant below empties the tuple to prove that guard fires.
+  * The ORDER of the two lock acquisitions cannot be perturbed into a deadlock
+    by any single-anchor mutant, because there is only ever one lock and no
+    nesting — that is the design rather than an oversight, and
+    SerialisationTests' stress case asserts no thread hangs. A mutant that
+    introduced a second lock would be writing new code, not perturbing this.
+  * `_elapsed_since_boot`'s subtraction. The fallback branch has mutants on
+    both of its inputs (`self._uptime()` forced to None, and the ceiling
+    itself), and a mutant on the arithmetic would only restate them.
 
 Exit 0 all killed, 1 survivors or unapplied or no-verdict, 2 a broken
 instrument (either control failed).
@@ -77,14 +97,26 @@ SUITES_FOR = {SRC: (SUITE,), TESTS: (SUITE,), MQTT: (SUITE,), UNIT: (SUITE,)}
 MUTANTS = [
     # ------------------------------------------------- the NTP gate's readings
     ("a broken timedatectl reads as an UNSYNCED clock (freezes the lamp)", SRC,
-     '        return True, f"cannot read NTP sync state ({exc}); assuming the clock is good"',
-     '        return False, f"cannot read NTP sync state ({exc}); assuming the clock is good"'),
+     '        return CLOCK_UNKNOWN, f"cannot read NTP sync state ({exc})"',
+     '        return CLOCK_UNSYNCED, f"cannot read NTP sync state ({exc})"'),
     ("a non-zero timedatectl exit reads as an UNSYNCED clock", SRC,
-     '        return True, f"cannot read NTP sync state ({detail}); assuming the clock is good"',
-     '        return False, f"cannot read NTP sync state ({detail}); assuming the clock is good"'),
+     '        return CLOCK_UNKNOWN, f"cannot read NTP sync state ({detail})"',
+     '        return CLOCK_UNSYNCED, f"cannot read NTP sync state ({detail})"'),
     ("an empty or unrecognised NTPSynchronized answer reads as `no`", SRC,
-     '    if answer == "no":\n        return False, None',
-     '    if answer != "yes":\n        return False, None'),
+     '    if answer == "no":\n        return CLOCK_UNSYNCED, None',
+     '    if answer != "yes":\n        return CLOCK_UNSYNCED, None'),
+    ("a broken timedatectl is remembered as a SYNC, latching the gate open on "
+     "the strength of its own breakage", SRC,
+     "        if state == CLOCK_SYNCED:",
+     "        if state in (CLOCK_SYNCED, CLOCK_UNKNOWN):"),
+    ("capture_output is dropped, so stdout is None and every answer is unknown",
+     SRC,
+     "        proc = _run(list(NTP_QUERY), capture_output=True, text=True, timeout=timeout)",
+     "        proc = _run(list(NTP_QUERY), text=True, timeout=timeout)"),
+    ("text= is dropped, so the answer arrives as bytes and never equals 'yes'",
+     SRC,
+     "        proc = _run(list(NTP_QUERY), capture_output=True, text=True, timeout=timeout)",
+     "        proc = _run(list(NTP_QUERY), capture_output=True, timeout=timeout)"),
     ("the probe asks whether a time SERVICE is enabled, not whether the "
      "kernel clock is synchronised", SRC,
      'NTP_QUERY = ("timedatectl", "show", "--property=NTPSynchronized", "--value")',
@@ -117,7 +149,9 @@ MUTANTS = [
      "    if not MIN_BRIGHTNESS <= value <= MAX_BRIGHTNESS:\n        return None",
      "    if False:\n        return None"),
     ("an unreadable state file raises instead of reading as absent", SRC,
+     "    try:\n        with open(path) as handle:\n            raw = handle.read()\n"
      "    except (OSError, UnicodeDecodeError):\n        return None",
+     "    try:\n        with open(path) as handle:\n            raw = handle.read()\n"
      "    except KeyError:\n        return None"),
     ("the persist is not atomic - a failed write destroys the previous value",
      SRC,
@@ -162,12 +196,12 @@ MUTANTS = [
      "            override=override,\n        )",
      "            override=None,\n        )"),
     ("an expired override is left in place instead of being cleared", SRC,
-     "                self._override = None\n                override = None\n                expired = True",
-     "                override = None\n                expired = True"),
+     "            self._override = None\n            override = None\n            logger.info(",
+     "            override = None\n            logger.info("),
     ("the override is stamped from the wall clock rather than the scheduler's",
      SRC,
-     "            self._override = Override(brightness, self._now())",
-     "            self._override = Override(brightness, datetime.now())"),
+     "        self._override = Override(brightness, self._now())",
+     "        self._override = Override(brightness, datetime.now())"),
 
     # ------------------------------------------------------------- _apply
     ("the lamp is rewritten on every tick even when it is already there", SRC,
@@ -184,7 +218,9 @@ MUTANTS = [
      "        note = write_last_applied(self._state_path, target)",
      "        note = None"),
     ("the state is never published, so HA never learns the lamp moved", SRC,
-     "        if pair != self._last_published:\n            self._last_published = pair\n            self._publish(decision)",
+     "        if pair != self._last_published or not applied:\n"
+     "            self._publish(decision)\n"
+     "            self._record_published_locked(decision)",
      "        self._last_published = pair"),
 
     # ---------------------------------------------------- who owns the lamp
@@ -194,20 +230,19 @@ MUTANTS = [
      "        pair = (decision.brightness,)"),
     ("an override is recorded but never applied, so the lamp waits a whole "
      "tick for a command", SRC,
-     "        self.set_override(brightness)\n        return self.tick()",
-     "        self.set_override(brightness)\n        return self._last_decision"),
+     "            self._set_override_locked(brightness)\n            return self._tick_locked()",
+     "            self._set_override_locked(brightness)\n            return self._last_decision"),
     ("publish_now honours the dedupe, so a reconnecting HA is never re-told "
      "who owns the lamp", SRC,
-     "        self._last_published = (self._last_decision.brightness,\n"
-     "                                self._last_decision.source)\n"
-     "        self._publish(self._last_decision)",
-     "        pair = (self._last_decision.brightness, self._last_decision.source)\n"
-     "        if pair != self._last_published:\n"
-     "            self._last_published = pair\n"
-     "            self._publish(self._last_decision)"),
+     "                return\n            self._publish(decision)\n"
+     "            self._record_published_locked(decision)",
+     "                return\n            pair = (decision.brightness, decision.source)\n"
+     "            if pair != self._last_published:\n"
+     "                self._publish(decision)\n"
+     "                self._record_published_locked(decision)"),
     ("publish_now publishes before any decision exists", SRC,
-     "        if self._last_decision is None:\n            return",
-     "        if False:\n            return"),
+     "            if decision is None:\n                return",
+     "            if False:\n                return"),
     ("a light that refuses to be driven takes the tick down with it", SRC,
      "        try:\n            self._light.set_duty_cycle(target)\n        except Exception:",
      "        try:\n            self._light.set_duty_cycle(target)\n        except KeyError:"),
@@ -279,6 +314,123 @@ MUTANTS = [
      MQTT,
      "    publish_config(SOURCE_CONFIG_TOPIC, {",
      "    _unpublished = ({"),
+
+    # ------------------------------------- serialisation (T-527.20) --------
+    # THE LARGEST UNTESTED SURFACE IN THE PREVIOUS BATTERY, and it was the one
+    # declared covered by omission: an independent 15-mutant pass left 10
+    # survivors, `with self._lock:` -> `if True:` among them, because the file
+    # had no concurrent test at all.
+    ("the tick is not serialised, so a command landing inside one is reverted",
+     SRC,
+     "        with self._lock:\n            return self._tick_locked()",
+     "        if True:\n            return self._tick_locked()"),
+    ("recording an override and applying it are two acquisitions again, so a "
+     "tick can run between them", SRC,
+     "        with self._lock:\n            self._set_override_locked(brightness)\n"
+     "            return self._tick_locked()",
+     "        self._set_override_locked(brightness)\n        return self.tick()"),
+    ("publish_now runs outside the lock, so its publish can land after a "
+     "tick's while its bookkeeping lands before", SRC,
+     "        with self._lock:\n            decision = self._last_decision",
+     "        if True:\n            decision = self._last_decision"),
+    ("a failed drive is recorded as published, stranding HA on the value the "
+     "lamp never reached", SRC,
+     "        if pair != self._last_published or not applied:",
+     "        if pair != self._last_published:"),
+    ("_apply reports success after the drive raised", SRC,
+     '            logger.exception("Schedule could not drive the light to %s%%", target)\n'
+     "            return False",
+     '            logger.exception("Schedule could not drive the light to %s%%", target)\n'
+     "            return True"),
+    ("the published pair is remembered even when the lamp never got there",
+     SRC,
+     "        if self._last_apply_ok:\n            self._last_published = (decision.brightness, decision.source)",
+     "        if True:\n            self._last_published = (decision.brightness, decision.source)"),
+
+    # ------------------------------------- the clock gate (T-527.19) -------
+    ("the latch never sets, so the 8.9-hour staleness trip freezes the lamp "
+     "again", SRC,
+     "                self._ever_synced = True",
+     "                self._ever_synced = False"),
+    ("the latch is never consulted, which is the shipped defect verbatim", SRC,
+     "        if self._ever_synced:\n            # Latched.",
+     "        if False:\n            # Latched."),
+    ("the latch is set unconditionally, so a boot that never synced drives "
+     "off a clock restored from disk", SRC,
+     "        if state == CLOCK_UNKNOWN:\n            return True, None",
+     "        self._ever_synced = True\n        if state == CLOCK_UNKNOWN:\n            return True, None"),
+    ("the never-synced hold has no ceiling - a legitimate persisted 0 is a "
+     "dark garden for the whole outage", SRC,
+     "        if elapsed < self._never_synced_hold_seconds:\n            return False, None",
+     "        if True:\n            return False, None"),
+    ("the ceiling is inclusive, which is the off-by-one nobody would notice",
+     SRC,
+     "        if elapsed < self._never_synced_hold_seconds:",
+     "        if elapsed <= self._never_synced_hold_seconds:"),
+    # NOTE: the first version of this mutant was `None or f"" or f"the clock…"`,
+    # which evaluates to the SAME string — it perturbed nothing and survived
+    # honestly. A survivor is a question about the harness before it is a
+    # question about the suite.
+    ("ending the hold is silent, so nothing in the journal says the schedule "
+     "is running on an uncorroborated clock", SRC,
+     "        return True, (\n            f\"the clock has never synchronised and the host has been up \"\n"
+     "            f\"{elapsed / 3600:.1f} h; following the schedule anyway rather than \"\n"
+     "            f\"holding the lamp indefinitely\"\n        )",
+     "        return True, None"),
+    ("the ceiling is measured from process start, so a crash loop grants a "
+     "fresh window every ten seconds", SRC,
+     "        value = self._uptime()\n        if value is None:",
+     "        value = None\n        if value is None:"),
+    ("an unreadable /proc/uptime reads as a host that just booted, extending "
+     "the very hold the ceiling bounds", SRC,
+     "    try:\n        with _open(path) as handle:\n            raw = handle.read()\n"
+     "    except (OSError, UnicodeDecodeError):\n        return None",
+     "    try:\n        with _open(path) as handle:\n            raw = handle.read()\n"
+     "    except (OSError, UnicodeDecodeError):\n        return 0.0"),
+    ("an unparseable /proc/uptime reads as zero rather than as unreadable",
+     SRC,
+     "    except (IndexError, ValueError):\n        return None",
+     "    except (IndexError, ValueError):\n        return 0.0"),
+
+    # --------------------------------- the module-level defaults -----------
+    # Every test passes these explicitly, so before T-527.20 a mutant on any of
+    # them was SILENT. A default nothing asserts is a default nothing protects.
+    ("CONFIG_PATH is repointed at a path that does not exist", SRC,
+     'CONFIG_PATH = "/etc/gardyn/light.env"',
+     'CONFIG_PATH = "/etc/gardyn/light.conf"'),
+    ("the state directory disagrees with StateDirectory= in the unit", SRC,
+     'STATE_DIR_FALLBACK = "/var/lib/gardyn"',
+     'STATE_DIR_FALLBACK = "/var/lib/gardyn-light"'),
+    ("the tick cadence is raised to an hour, so a boundary is up to 60 minutes "
+     "late", SRC,
+     "TICK_SECONDS = 30",
+     "TICK_SECONDS = 3600"),
+    ("the NTP query timeout is cut to a value no fork+exec can meet", SRC,
+     "NTP_QUERY_TIMEOUT_SECONDS = 10",
+     "NTP_QUERY_TIMEOUT_SECONDS = 0.001"),
+    ("the never-synced ceiling is widened to a week", SRC,
+     "NEVER_SYNCED_HOLD_SECONDS = 2 * 60 * 60",
+     "NEVER_SYNCED_HOLD_SECONDS = 7 * 24 * 60 * 60"),
+    ("UPTIME_PATH is repointed away from procfs", SRC,
+     'UPTIME_PATH = "/proc/uptime"',
+     'UPTIME_PATH = "/proc/loadavg"'),
+    # A hardcoded default that EQUALS its constant cannot be caught at runtime
+    # — every assertion agrees while the single source of truth is gone, and
+    # `is` agrees too, since identical literals in one module fold to one
+    # object. The killing test is a SOURCE assertion, so the mutant has to be
+    # one the source can see.
+    ("the constructor hardcodes its own config path past the module constant",
+     SRC,
+     "        config_path=CONFIG_PATH,",
+     '        config_path="/etc/gardyn/light.env",  # noqa'),
+    ("the constructor hardcodes the tick cadence past the module constant",
+     SRC,
+     "        tick_seconds=TICK_SECONDS,",
+     "        tick_seconds=30,"),
+    ("the constructor hardcodes the never-synced ceiling past the module "
+     "constant", SRC,
+     "        never_synced_hold_seconds=NEVER_SYNCED_HOLD_SECONDS,",
+     "        never_synced_hold_seconds=2 * 60 * 60,"),
 
     # ------------------------- the TEST FILE's own constants and controls ---
     # A guard on an architectural promise is exactly the thing that gets

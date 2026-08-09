@@ -68,13 +68,15 @@ STATE_FILENAME = "light-phase"
 # Seconds between ticks, and therefore the worst-case lateness at a boundary.
 #
 # Chosen against a MEASURED cost rather than a round number. Each tick spawns
-# one `timedatectl`, and on this Pi Zero W that is 0.169 s median over seven
-# runs (min 0.165, max 0.184) — so 30 s costs ~0.56% of one core, against a
-# camera path on the same host that spawns fswebcam twice per cycle. Half a
-# minute of lateness on a photoperiod boundary is not a quantity a plant can
-# measure; the boundary latency HA achieved was 4-7 s and nothing depended on
-# it. Going much shorter buys nothing and multiplies the only recurring cost
-# this feature has.
+# one `timedatectl`, and on this Pi Zero 2 W that is 0.169 s median over seven
+# runs (min 0.165, max 0.184). That figure is WALL TIME for a fork+exec, not
+# CPU time, so the derived "~0.56% of one core" is an upper bound rather than a
+# measurement — the real CPU share is smaller by however much of the 0.169 s
+# was spent waiting on D-Bus. Either way it sits against a camera path on the
+# same host that spawns fswebcam twice per cycle. Half a minute of lateness on
+# a photoperiod boundary is not a quantity a plant can measure; the boundary
+# latency HA achieved was 4-7 s and nothing depended on it. Going much shorter
+# buys nothing and multiplies the only recurring cost this feature has.
 TICK_SECONDS = 30
 
 # `timedatectl` talks to systemd-timedated over D-Bus, which is activated on
@@ -83,14 +85,46 @@ TICK_SECONDS = 30
 # stall the tick loop forever.
 NTP_QUERY_TIMEOUT_SECONDS = 10
 
-# systemd.exec(5) and org.freedesktop.timedate1(5): NTPSynchronized "shows
-# whether the kernel reports the time as synchronized (c.f. adjtimex(3))".
-# Read from the KERNEL, so it stays correct if this host is ever moved from
-# systemd-timesyncd to chrony — which is why this is preferred over stat()ing
+# org.freedesktop.timedate1(5): NTPSynchronized "shows whether the kernel
+# reports the time as synchronized (c.f. adjtimex(3))". Read from the KERNEL,
+# so it stays correct if this host is ever moved from systemd-timesyncd to
+# chrony — which is why this is preferred over stat()ing
 # /run/systemd/timesync/synchronized, a file systemd-timesyncd(8) documents as
-# its own and which chrony would never create. Verified against the man pages
-# on the host (systemd 252) rather than from recall.
+# its own and which chrony would never create. Verified against the man page on
+# the host (systemd 252) rather than from recall. (An earlier version of this
+# comment also credited systemd.exec(5), which documents StateDirectory= below
+# but says nothing about NTPSynchronized.)
 NTP_QUERY = ("timedatectl", "show", "--property=NTPSynchronized", "--value")
+
+# The three answers read_clock_state() can give. A tri-state and NOT a bool,
+# because the latch below must fire on evidence of a real synchronisation and
+# on nothing else — see LightScheduler._clock_verdict. Collapsing "the kernel
+# says no" and "the query broke" into one False, or into one True, is what
+# makes the latch either useless or dishonest.
+CLOCK_SYNCED = "synced"
+CLOCK_UNSYNCED = "unsynced"
+CLOCK_UNKNOWN = "unknown"
+
+# How long a process that has NEVER seen a synchronised clock holds the last
+# applied brightness before following the schedule regardless (T-527.19).
+#
+# The hold exists for one scenario: a boot with no network, where timesyncd
+# restores the clock from /var/lib/systemd/timesync/clock and the time of day
+# is wrong by however long the Pi was powered off. Held without a ceiling, a
+# persisted 0 keeps the garden dark for the whole outage — which is the failure
+# T-527 exists to remove, reached through the mechanism built to prevent it.
+# Two hours is long enough for a normal boot to reach the network (netwatch
+# reboots the host well inside it) and short enough that the worst case is a
+# photoperiod shifted by the outage rather than absent for its duration. A
+# shifted photoperiod is something plants tolerate; no photoperiod is not.
+NEVER_SYNCED_HOLD_SECONDS = 2 * 60 * 60
+
+# proc(5): the first field is seconds since boot. Read rather than derived from
+# monotonic() because the anchor has to survive a RESTART — mqtt.service carries
+# Restart=always with RestartSec=10, so a crash loop on a networkless boot would
+# otherwise reset a process-local timer every ten seconds and hold the lamp
+# forever, which is the exact hole NEVER_SYNCED_HOLD_SECONDS closes.
+UPTIME_PATH = "/proc/uptime"
 
 
 def parse_env(raw):
@@ -168,44 +202,69 @@ def load_schedule(path=CONFIG_PATH, _open=open):
         return DEFAULT_SCHEDULE, f"{path} is not usable ({exc}); using the built-in photoperiod"
 
 
-def clock_is_synced(_run=subprocess.run, timeout=NTP_QUERY_TIMEOUT_SECONDS):
-    """Does the kernel consider the clock synchronised? Returns (synced, note).
+def read_clock_state(_run=subprocess.run, timeout=NTP_QUERY_TIMEOUT_SECONDS):
+    """What does the kernel say about the clock? Returns (state, note).
 
-    WHEN THE QUERY ITSELF FAILS THIS ANSWERS "SYNCED", AND THAT IS THE
-    DELIBERATE HALF. A failed query is evidence about `timedatectl`, not about
-    the clock, so the question becomes which mistake is cheaper — the same test
-    light_schedule.decide() applies to its own no-persisted-phase branch.
+    `state` is CLOCK_SYNCED, CLOCK_UNSYNCED or CLOCK_UNKNOWN. THE THIRD ONE IS
+    THE POINT OF THIS FUNCTION'S SHAPE, and it used to be missing: an earlier
+    version returned a bool and folded "the query broke" into True, which is
+    the right DRIVING decision (see _clock_verdict) and the wrong thing to
+    remember. The latch in _clock_verdict must fire on evidence that the clock
+    really synchronised; a `timedatectl` that cannot be run is evidence about
+    `timedatectl`. Keeping the two apart is what stops a permanently broken
+    query from latching the gate open on no evidence at all.
 
-      believe a bad clock   the lamp follows a wrong-time photoperiod for the
-                            duration. Bounded, self-correcting the moment NTP
-                            lands, and a plant cannot measure it.
+    NOTHING HERE DECIDES WHETHER TO DRIVE. This function reports; the policy —
+    which mistake is cheaper, and for how long — lives in one place, in
+    _clock_verdict, so there is exactly one paragraph to read when it changes.
 
-      disbelieve a good     the unsynced branch HOLDS the last applied
-      clock                 brightness — forever, if the query is permanently
-                            broken. If it was holding `off` at the time, that
-                            is an indefinite dark garden, which is the exact
-                            failure this ticket exists to remove.
-
-    The scenario the gate is actually FOR — a boot with no network — does not
-    go down this path at all: systemd-timedated is D-Bus activated and answers
-    offline, reporting `no` correctly. A broken `timedatectl` is a different
-    and far rarer event, so it must not inherit the careful branch.
+    WHAT NTPSynchronized ACTUALLY ANSWERS, because the name misleads and it
+    cost this ticket a blocked deploy (T-527.19). It is NOT "is the clock
+    accurate". systemd v252's src/timedate/timedated.c computes it as
+    `txc.maxerror < 16000000` — 16 seconds of accumulated ERROR BOUND — while
+    the kernel (kernel/time/ntp.c) adds MAXFREQ, 500 µs, to maxerror once per
+    second whenever NTP is unreachable. So a perfectly accurate clock reports
+    `no` after 16,000,000 / 500 = 32,000 s, and that was CONFIRMED ON THIS PI
+    on 2026-08-09 by a read-only adjtimex(2) probe: exactly 500.0 µs/s, 8.89 h
+    from a standing start. It is a STALENESS reading, not an accuracy one.
     """
     try:
         proc = _run(list(NTP_QUERY), capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
-        return True, f"cannot read NTP sync state ({exc}); assuming the clock is good"
+        return CLOCK_UNKNOWN, f"cannot read NTP sync state ({exc})"
     if proc.returncode != 0:
         detail = (proc.stderr or "").strip() or f"exit {proc.returncode}"
-        return True, f"cannot read NTP sync state ({detail}); assuming the clock is good"
+        return CLOCK_UNKNOWN, f"cannot read NTP sync state ({detail})"
     answer = (proc.stdout or "").strip()
     if answer == "yes":
-        return True, None
+        return CLOCK_SYNCED, None
     if answer == "no":
-        return False, None
-    # A third answer is a contract change in systemd, not a clock fact. Same
-    # reasoning as the branches above: say so, and do not stop driving.
-    return True, f"NTPSynchronized answered {answer!r}, which is neither yes nor no; assuming the clock is good"
+        return CLOCK_UNSYNCED, None
+    # A third answer is a contract change in systemd, not a clock fact.
+    return CLOCK_UNKNOWN, f"NTPSynchronized answered {answer!r}, which is neither yes nor no"
+
+
+def seconds_since_boot(path=UPTIME_PATH, _open=open):
+    """Seconds since the kernel booted, or None if that cannot be read.
+
+    None rather than a raise, and None rather than 0, for the usual reason in
+    this file: the caller runs on a non-main thread where a raise is silent,
+    and a 0 here would read as "the host just booted" and extend the hold that
+    NEVER_SYNCED_HOLD_SECONDS exists to bound. The caller substitutes its own
+    process age instead and says so.
+
+    Not available off Linux, which is why the caller has a fallback at all —
+    every test in tests/test_light_scheduler.py runs on a laptop.
+    """
+    try:
+        with _open(path) as handle:
+            raw = handle.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        return float(raw.split()[0])
+    except (IndexError, ValueError):
+        return None
 
 
 def default_state_path(environ=os.environ):
@@ -307,7 +366,10 @@ class LightScheduler:
         state_path=None,
         tick_seconds=TICK_SECONDS,
         now=datetime.now,
-        synced_probe=clock_is_synced,
+        clock_probe=read_clock_state,
+        uptime=seconds_since_boot,
+        never_synced_hold_seconds=NEVER_SYNCED_HOLD_SECONDS,
+        monotonic_clock=monotonic,
         sleeper=sleep,
     ):
         self._light = light
@@ -316,12 +378,46 @@ class LightScheduler:
         self._state_path = state_path if state_path is not None else default_state_path()
         self._tick_seconds = tick_seconds
         self._now = now
-        self._synced_probe = synced_probe
+        self._clock_probe = clock_probe
+        self._uptime = uptime
+        self._never_synced_hold_seconds = never_synced_hold_seconds
+        self._monotonic = monotonic_clock
         self._sleeper = sleeper
 
+        # THE ONE LOCK, and it is held across the whole of tick() rather than
+        # around the override slot alone (T-527.20). Everything below is either
+        # read inside a tick or written by one, and three separate defects came
+        # from letting a second thread interleave with one: a command landing
+        # mid-tick was reverted and mis-persisted, a publish_now() racing a tick
+        # pinned the owner topic to the wrong writer indefinitely, and a failed
+        # pigpio write stranded Home Assistant's retained copy permanently.
+        #
+        # THE COST IS REAL AND IS BOUGHT DELIBERATELY. tick() spawns
+        # `timedatectl` (0.169 s median here, NTP_QUERY_TIMEOUT_SECONDS worst
+        # case), so an MQTT command or a button press arriving mid-tick waits
+        # that long before it is applied. That wait is the FIX, not a side
+        # effect: the alternative is the command being applied and then reverted
+        # by the tick already in flight, which is what shipped before.
+        #
+        # There is no RLock and no re-entrancy anywhere. Every public method
+        # takes the lock exactly once and calls a `_locked` helper; the helpers
+        # never take it. override_now() is the case that would otherwise nest,
+        # and it is written as one acquisition covering both halves — which it
+        # has to be anyway, or the override could expire between being recorded
+        # and being applied.
         self._lock = threading.Lock()
         self._override = None
         self._stop = threading.Event()
+        # Has this PROCESS ever seen a genuinely synchronised clock? Once true,
+        # never false again — see _clock_verdict for why that latch is the whole
+        # T-527.19 fix. Not persisted: it is a statement about this process's
+        # own evidence, and a restart has none.
+        self._ever_synced = False
+        # Anchor for the never-synced hold when /proc/uptime is unreadable.
+        self._started_monotonic = self._monotonic()
+        # Did the last _apply() leave the lamp where the decision said? A failed
+        # drive must not be recorded as published — see _tick_locked.
+        self._last_apply_ok = True
         # Last brightness this scheduler COMMANDED, used only to decide whether
         # a log line is news. Authority over what the lamp is actually at stays
         # with the hardware read in _apply() — this is not a shadow variable
@@ -347,7 +443,10 @@ class LightScheduler:
         clock is wrong — see Override's docstring in light_schedule.py.
         """
         with self._lock:
-            self._override = Override(brightness, self._now())
+            self._set_override_locked(brightness)
+
+    def _set_override_locked(self, brightness):
+        self._override = Override(brightness, self._now())
 
     def override_now(self, brightness):
         """Take the lamp off schedule and move it in the same breath.
@@ -367,9 +466,18 @@ class LightScheduler:
         implementation of "put the lamp here", which is the shape this file
         exists to remove. The same thread already spends a synchronous pigpio
         round-trip inside announce_to_home_assistant().
+
+        ONE ACQUISITION COVERS BOTH HALVES (T-527.20). Recording the override
+        and applying it used to be two separate lock acquisitions with a tick
+        able to run in between, so a command landing inside a tick was applied,
+        reverted by that tick, published as `schedule`, and PERSISTED at the
+        scheduled brightness — after which a power cut restored the reverted
+        value rather than the commanded one. Holding the lock across both means
+        the person wins, which is what a person pressing a button expects.
         """
-        self.set_override(brightness)
-        return self.tick()
+        with self._lock:
+            self._set_override_locked(brightness)
+            return self._tick_locked()
 
     def clear_override(self):
         """Hand the lamp back to the schedule immediately."""
@@ -384,7 +492,8 @@ class LightScheduler:
     @property
     def last_decision(self):
         """The most recent Decision, or None before the first tick."""
-        return self._last_decision
+        with self._lock:
+            return self._last_decision
 
     def publish_now(self):
         """Re-publish the last decision unconditionally.
@@ -394,33 +503,110 @@ class LightScheduler:
         of who-owns-the-lamp has to be re-sent or it sits at whatever the broker
         still holds. Unconditional, because the whole point is that the
         SUBSCRIBER changed, not the value.
+
+        UNDER THE LOCK, AND THE PUBLISH IS INSIDE IT (T-527.20). This runs on
+        paho's network thread from announce_to_home_assistant() while tick()
+        runs on the scheduler thread, and the two used to interleave: this
+        method read the decision, wrote _last_published, and then landed its
+        publish LAST, after a tick that had already published a newer one. The
+        broker's retained copy was left naming the wrong writer — `schedule`
+        while a person held the lamp — and the dedupe then suppressed every
+        correction until the override expired. The T-527.9 obedience automation
+        is specified to condition on exactly that topic.
         """
-        if self._last_decision is None:
-            return
-        self._last_published = (self._last_decision.brightness,
-                                self._last_decision.source)
-        self._publish(self._last_decision)
+        with self._lock:
+            decision = self._last_decision
+            if decision is None:
+                return
+            self._publish(decision)
+            self._record_published_locked(decision)
 
     # ----------------------------------------------------------------- tick
 
     def tick(self):
         """One pass. Returns the Decision, so a test can assert on it."""
+        with self._lock:
+            return self._tick_locked()
+
+    def _clock_verdict(self, state):
+        """Should we drive off the wall clock? Returns (trust_it, note).
+
+        THE LATCH IS THE T-527.19 FIX, and the defect it repairs was in the
+        QUESTION, not in the code that asked it. `NTPSynchronized` reports
+        whether NTP has checked in recently, not whether the clock is right —
+        see read_clock_state — so it flips to `no` about 8.9 h into ANY network
+        outage on a clock that is perfectly accurate. decide() then held the
+        last applied phase for the rest of the outage, which for a garden that
+        tipped over after 19:00 is darkness until the network returns. The
+        mechanism built to prevent a dark garden produced one.
+
+        So: once this process has seen a real synchronisation, trust the clock
+        from then on. That is sound rather than merely convenient. The gate
+        exists for a boot with no network, where timesyncd restores a
+        time-of-day from /var/lib/systemd/timesync/clock that is stale by
+        however long the Pi was powered off — an error measured in days. A
+        clock that DID sync this boot and has since free-run is out by the
+        crystal's drift, which is seconds. Those are different quantities and
+        only the first is worth holding a lamp for.
+
+        A FAILED QUERY DOES NOT LATCH, and that is the reason read_clock_state
+        returns three states instead of a bool. It still drives — the mistakes
+        are asymmetric, and believing a good clock costs a plant nothing while
+        disbelieving one costs it the photoperiod — but it must not be recorded
+        as evidence of a sync, or a permanently broken `timedatectl` would pin
+        the gate open on the strength of its own breakage.
+        """
+        if state == CLOCK_SYNCED:
+            if not self._ever_synced:
+                self._ever_synced = True
+                logger.info("Clock synchronised; the schedule is trusted from here on")
+            return True, None
+        if self._ever_synced:
+            # Latched. Not a note: this is the steady state during any outage
+            # longer than ~8.9 h, and it is correct, so it is not news.
+            return True, None
+        if state == CLOCK_UNKNOWN:
+            return True, None
+
+        # Never synchronised in this process's life, and the kernel says so.
+        # This is the scenario the gate is for — but it is bounded, because an
+        # unbounded hold of a persisted 0 is the dark garden all over again.
+        elapsed = self._elapsed_since_boot()
+        if elapsed < self._never_synced_hold_seconds:
+            return False, None
+        return True, (
+            f"the clock has never synchronised and the host has been up "
+            f"{elapsed / 3600:.1f} h; following the schedule anyway rather than "
+            f"holding the lamp indefinitely"
+        )
+
+    def _elapsed_since_boot(self):
+        """Seconds since boot, falling back to this process's own age.
+
+        The fallback UNDER-reports across a restart, which is the safe
+        direction: it lengthens the hold rather than ending it early. It exists
+        for the laptop the tests run on, where there is no /proc/uptime.
+        """
+        value = self._uptime()
+        if value is None:
+            return self._monotonic() - self._started_monotonic
+        return value
+
+    def _tick_locked(self):
+        """One pass, with self._lock already held. See __init__ on the lock."""
         schedule, note = load_schedule(self._config_path)
         self._report("config", note)
-        synced, note = self._synced_probe()
+        state, note = self._clock_probe()
         self._report("ntp", note)
+        synced, note = self._clock_verdict(state)
+        self._report("clock-hold", note)
 
         now = self._now()
 
-        with self._lock:
-            override = self._override
-            if override is not None and not override_is_live(schedule, override, now):
-                self._override = None
-                override = None
-                expired = True
-            else:
-                expired = False
-        if expired:
+        override = self._override
+        if override is not None and not override_is_live(schedule, override, now):
+            self._override = None
+            override = None
             logger.info("Schedule override expired; the schedule owns the lamp again")
 
         decision = decide(
@@ -430,20 +616,46 @@ class LightScheduler:
             last_applied=read_last_applied(self._state_path),
             override=override,
         )
-        self._apply(decision)
+        applied = self._apply(decision)
         self._last_decision = decision
+        self._last_apply_ok = applied
         # Publish on a change of OWNER as well as of brightness. An override
         # set to the brightness the schedule already wanted moves no pin, and
         # is still the difference between "the schedule is running" and "a
         # person has taken it".
+        #
+        # AND ALWAYS PUBLISH AFTER A FAILED DRIVE (T-527.20). The dedupe key is
+        # the INTENDED pair; the payload is the OBSERVED brightness, because
+        # publish_light_decision() re-reads the lamp. So a tick whose
+        # set_duty_cycle() raised — a transient pigpio drop, which the suite's
+        # own fake already models — used to record the intended pair as
+        # published while sending the hardware's stale value, and every later
+        # tick then deduped against it. Home Assistant showed the grow light
+        # OFF while it was on, until the next boundary or an MQTT reconnect.
         pair = (decision.brightness, decision.source)
-        if pair != self._last_published:
-            self._last_published = pair
+        if pair != self._last_published or not applied:
             self._publish(decision)
+            self._record_published_locked(decision)
         return decision
+
+    def _record_published_locked(self, decision):
+        """Remember what was published, but only if the lamp really got there.
+
+        None on a failed drive, so the next tick republishes rather than
+        deduping against a pair the lamp never reached.
+        """
+        if self._last_apply_ok:
+            self._last_published = (decision.brightness, decision.source)
+        else:
+            self._last_published = None
 
     def _apply(self, decision):
         """Move the lamp if it is not already where the decision says.
+
+        Returns True if the lamp is now where the decision says, False if the
+        drive raised. The caller needs that answer because the state it
+        publishes is READ BACK from the hardware, so a failed drive must force
+        a republish rather than be recorded as done — see _tick_locked.
 
         THE COMPARISON IS AGAINST THE HARDWARE, not against what we last sent.
         mqtt.py's toggle_light() and publish_light_state() both read the lamp
@@ -451,25 +663,38 @@ class LightScheduler:
         first time anything else writes to the pin — the physical button, a
         flash_lights() burst, or the MQTT command handlers.
 
-        A residual worth checking on the host at T-527.7 rather than reasoning
-        about here: PWM quantisation means get_brightness() need not return
-        exactly what was commanded. If a steady-state 1% disagreement exists,
-        this re-writes the pin every tick. That is cheap and harmless — the
-        rounding below absorbs it for the LOG, so it cannot produce log spam —
-        but `journalctl -u mqtt` after the deploy is what settles whether it
-        happens at all.
+        A residual worth checking on the host at deploy time rather than
+        reasoning about here: PWM quantisation means get_brightness() need not
+        return exactly what was commanded. If a steady-state 1% disagreement
+        exists, this re-writes the pin every tick.
+
+        THAT IS NOT FREE, AND AN EARLIER VERSION OF THIS DOCSTRING SAID IT WAS.
+        The rounding below silences THIS module's log line only.
+        app/sensors/light/light.py's set_duty_cycle() logs unconditionally on a
+        logger it raises to INFO at import, so a steady mismatch writes ~2,880
+        lines a day into an unrotated gardyn.log AND rewrites the SD card every
+        30 s through write_last_applied(). Neither cost is visible from here.
+        One command on the Pi settles whether it happens at all, and it is
+        owed BEFORE the deploy, not during it:
+
+            python3 -c "from gpiozero import PWMLED; \\
+              from gpiozero.pins.pigpio import PiGPIOFactory; \\
+              l=PWMLED(18,pin_factory=PiGPIOFactory()); l.value=0.5; \\
+              print(l.value*100)"
+
+        Anything other than 50.0 ± 0.5 means the rewrite loop is real.
         """
         actual = self._read_actual()
         target = decision.brightness
         if actual is not None and actual == target:
             self._last_logged_target = target
-            return
+            return True
 
         try:
             self._light.set_duty_cycle(target)
         except Exception:
             logger.exception("Schedule could not drive the light to %s%%", target)
-            return
+            return False
 
         if target != self._last_logged_target:
             logger.info(
@@ -483,6 +708,7 @@ class LightScheduler:
 
         note = write_last_applied(self._state_path, target)
         self._report("state", note)
+        return True
 
     def _read_actual(self):
         """The lamp's real duty cycle as a whole percent, or None if unreadable.

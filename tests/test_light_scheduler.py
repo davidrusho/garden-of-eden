@@ -103,20 +103,36 @@ def fake_ntp(answer="yes", returncode=0, stderr="", raises=None):
     Records the argv it was handed so a test can assert WHICH question was
     asked — a probe that runs the wrong command and gets a plausible answer is
     the failure mode this whole file exists to rule out elsewhere.
+
+    IT HONOURS text= AND capture_output= RATHER THAN IGNORING THEM, which is
+    the T-527.20 finding it was rebuilt for. Written from the happy path, this
+    double returned a `str` stdout whatever kwargs it was handed — so mutants
+    deleting `text=True` or `capture_output=True` from the real call SURVIVED a
+    full battery. Both are load-bearing against the real subprocess.run:
+    without `capture_output` stdout is None and the probe reads `""`; without
+    `text` it is `bytes`, and `b"yes"` never equals `"yes"`, so the gate would
+    report an unrecognised answer forever. A double that cannot tell those
+    apart makes the mutant undetectable no matter how the assertion is written.
     """
     calls = []
 
     class _Completed:
-        def __init__(self):
+        def __init__(self, stdout, stderr):
             self.returncode = returncode
-            self.stdout = answer
+            self.stdout = stdout
             self.stderr = stderr
 
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
         if raises is not None:
             raise raises
-        return _Completed()
+        if not kwargs.get("capture_output"):
+            # subprocess.run without capture_output leaves the child's output
+            # on the parent's stdout and sets .stdout to None.
+            return _Completed(None, None)
+        if kwargs.get("text"):
+            return _Completed(answer, stderr)
+        return _Completed(answer.encode(), stderr.encode())
 
     run.calls = calls
     return run
@@ -246,17 +262,35 @@ class LoadScheduleTests(unittest.TestCase):
                 self.assertIs(ls.DEFAULT_SCHEDULE, schedule)
 
 
-class ClockSyncTests(unittest.TestCase):
+class ClockStateTests(unittest.TestCase):
+    """read_clock_state REPORTS; it decides nothing.
+
+    The tri-state is the T-527.19 repair. An earlier version returned a bool
+    and mapped every failure to True, which is the right DRIVING decision and
+    destroys the distinction the latch needs: "the kernel says the clock is
+    good" and "I could not ask" must not be the same value, or a permanently
+    broken `timedatectl` latches the gate open on the strength of its own
+    breakage. ClockVerdictTests below is where the driving policy is pinned.
+    """
 
     def test_yes_is_synced(self):
-        synced, note = lsr.clock_is_synced(_run=fake_ntp("yes\n"))
-        self.assertTrue(synced)
+        state, note = lsr.read_clock_state(_run=fake_ntp("yes\n"))
+        self.assertEqual(lsr.CLOCK_SYNCED, state)
         self.assertIsNone(note)
 
     def test_no_is_unsynced(self):
-        synced, note = lsr.clock_is_synced(_run=fake_ntp("no\n"))
-        self.assertFalse(synced)
+        state, note = lsr.read_clock_state(_run=fake_ntp("no\n"))
+        self.assertEqual(lsr.CLOCK_UNSYNCED, state)
         self.assertIsNone(note)
+
+    def test_the_three_states_are_distinct(self):
+        """Three distinct strings, asserted rather than assumed. Collapsing any
+        two of them silently reinstates the bool this replaced — CLOCK_UNKNOWN
+        equal to CLOCK_SYNCED would latch on a broken query, and equal to
+        CLOCK_UNSYNCED would freeze the lamp on one."""
+        self.assertEqual(
+            3, len({lsr.CLOCK_SYNCED, lsr.CLOCK_UNSYNCED, lsr.CLOCK_UNKNOWN})
+        )
 
     def test_it_asks_the_kernel_question_and_not_some_other_one(self):
         """Which question is asked is the whole content of this probe. An
@@ -265,7 +299,7 @@ class ClockSyncTests(unittest.TestCase):
         `NTP` (is a time service enabled) instead of `NTPSynchronized` (does
         the kernel consider the clock good)."""
         run = fake_ntp("yes\n")
-        lsr.clock_is_synced(_run=run)
+        lsr.read_clock_state(_run=run)
         argv = run.calls[0][0]
         self.assertEqual(
             ["timedatectl", "show", "--property=NTPSynchronized", "--value"], argv
@@ -273,46 +307,117 @@ class ClockSyncTests(unittest.TestCase):
 
     def test_a_timeout_is_passed_to_the_subprocess(self):
         run = fake_ntp("yes\n")
-        lsr.clock_is_synced(_run=run, timeout=3)
+        lsr.read_clock_state(_run=run, timeout=3)
         self.assertEqual(3, run.calls[0][1]["timeout"])
 
-    def test_a_nonzero_exit_assumes_the_clock_is_good(self):
-        """The deliberate half. Believing a bad clock costs a wrong-time
-        photoperiod for a few seconds; disbelieving a good one HOLDS the lamp
-        wherever it was, indefinitely, which is the dark garden T-527 exists to
-        remove."""
-        synced, note = lsr.clock_is_synced(
+    def test_it_captures_output_as_text(self):
+        """Both kwargs are load-bearing and both used to be unpinned, so a
+        mutant deleting either survived a full battery (T-527.20). fake_ntp
+        now models what the real subprocess.run does without them; these
+        assertions are what make that modelling worth anything."""
+        run = fake_ntp("yes\n")
+        lsr.read_clock_state(_run=run)
+        kwargs = run.calls[0][1]
+        self.assertTrue(kwargs.get("capture_output"))
+        self.assertTrue(kwargs.get("text"))
+
+    def test_bytes_stdout_is_not_read_as_synced(self):
+        """Dropping text=True hands back bytes. b"yes" != "yes", so the gate
+        would report an unrecognised answer forever — and this is the
+        assertion that makes that mutant die instead of surviving."""
+        def run_without_text(argv, **kwargs):
+            kwargs.pop("text", None)
+            return fake_ntp("yes\n")(argv, **kwargs)
+
+        state, note = lsr.read_clock_state(_run=run_without_text)
+        self.assertEqual(lsr.CLOCK_UNKNOWN, state)
+        self.assertIsNotNone(note)
+
+    def test_a_nonzero_exit_is_unknown_and_not_unsynced(self):
+        """The deliberate half, and the reason it is UNKNOWN rather than
+        UNSYNCED. Believing a bad clock costs a wrong-time photoperiod;
+        disbelieving a good one HOLDS the lamp wherever it was, which is the
+        dark garden T-527 exists to remove. _clock_verdict drives on this —
+        but must not remember it as evidence of a sync."""
+        state, note = lsr.read_clock_state(
             _run=fake_ntp("", returncode=1, stderr="Failed to connect to bus\n")
         )
-        self.assertTrue(synced)
+        self.assertEqual(lsr.CLOCK_UNKNOWN, state)
         self.assertIn("Failed to connect to bus", note)
 
-    def test_a_missing_binary_assumes_the_clock_is_good(self):
-        synced, note = lsr.clock_is_synced(
+    def test_a_missing_binary_is_unknown(self):
+        state, note = lsr.read_clock_state(
             _run=fake_ntp(raises=FileNotFoundError(2, "No such file or directory"))
         )
-        self.assertTrue(synced)
+        self.assertEqual(lsr.CLOCK_UNKNOWN, state)
         self.assertIsNotNone(note)
 
-    def test_a_hung_bus_assumes_the_clock_is_good(self):
-        synced, note = lsr.clock_is_synced(
+    def test_a_hung_bus_is_unknown(self):
+        state, note = lsr.read_clock_state(
             _run=fake_ntp(raises=subprocess.TimeoutExpired("timedatectl", 10))
         )
-        self.assertTrue(synced)
+        self.assertEqual(lsr.CLOCK_UNKNOWN, state)
         self.assertIsNotNone(note)
 
-    def test_an_unrecognised_answer_assumes_the_clock_is_good_and_says_so(self):
-        synced, note = lsr.clock_is_synced(_run=fake_ntp("maybe\n"))
-        self.assertTrue(synced)
+    def test_an_unrecognised_answer_is_unknown_and_says_so(self):
+        state, note = lsr.read_clock_state(_run=fake_ntp("maybe\n"))
+        self.assertEqual(lsr.CLOCK_UNKNOWN, state)
         self.assertIn("maybe", note)
 
     def test_an_empty_answer_is_not_read_as_no(self):
         """`""` is falsy, and the tempting implementation is `answer == "yes"`.
         That reads an empty stdout — a `timedatectl` that printed nothing — as
         an unsynchronised clock, which is the freeze branch."""
-        synced, note = lsr.clock_is_synced(_run=fake_ntp(""))
-        self.assertTrue(synced)
+        state, note = lsr.read_clock_state(_run=fake_ntp(""))
+        self.assertEqual(lsr.CLOCK_UNKNOWN, state)
         self.assertIsNotNone(note)
+
+
+class SecondsSinceBootTests(unittest.TestCase):
+    """/proc/uptime, and every way it can fail to answer.
+
+    None and never 0 on failure: 0 reads as "the host just booted", which
+    EXTENDS the never-synced hold this value exists to bound. The failure
+    direction matters more than the parsing here.
+    """
+
+    def _reader(self, body):
+        import io
+
+        def _open(path):
+            return io.StringIO(body)
+        return _open
+
+    def test_it_reads_the_first_field(self):
+        self.assertEqual(
+            12345.67,
+            lsr.seconds_since_boot(_open=self._reader("12345.67 98765.43\n")),
+        )
+
+    def test_a_missing_procfs_is_none(self):
+        def _open(path):
+            raise FileNotFoundError(2, "No such file or directory")
+        self.assertIsNone(lsr.seconds_since_boot(_open=_open))
+
+    def test_a_binary_body_is_none(self):
+        def _open(path):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        self.assertIsNone(lsr.seconds_since_boot(_open=_open))
+
+    def test_an_empty_body_is_none_not_zero(self):
+        self.assertIsNone(lsr.seconds_since_boot(_open=self._reader("")))
+
+    def test_an_unparseable_body_is_none_not_zero(self):
+        self.assertIsNone(lsr.seconds_since_boot(_open=self._reader("up 3 days\n")))
+
+    def test_it_reads_the_real_file_where_there_is_one(self):
+        """A control on the two failure tests above: on Linux this returns a
+        real, positive number, and on a laptop with no procfs it returns None.
+        Both are correct; what would be wrong is a raise, since this runs on
+        the scheduler thread where a raise is silent."""
+        value = lsr.seconds_since_boot()
+        if value is not None:
+            self.assertGreater(value, 0)
 
 
 class StatePathTests(unittest.TestCase):
@@ -472,7 +577,14 @@ class SchedulerHarness(unittest.TestCase):
         kwargs.setdefault("config_path", self.config)
         kwargs.setdefault("state_path", self.state)
         kwargs.setdefault("now", lambda: self.clock)
-        kwargs.setdefault("synced_probe", lambda: (True, None))
+        kwargs.setdefault("clock_probe", lambda: (lsr.CLOCK_SYNCED, None))
+        # PINNED, NOT INHERITED, and this is not tidiness. The production
+        # default reads /proc/uptime, which exists on the Pi and not on the
+        # laptop these tests were written on — so an unpinned hold test would
+        # pass here by reading None and fail on Linux the moment the host had
+        # been up longer than the ceiling. A suite that has only ever run on
+        # one machine cannot tell correct code from a satisfied machine.
+        kwargs.setdefault("uptime", lambda: 0.0)
         return lsr.LightScheduler(
             self.light,
             lambda d: self.published.append((d.brightness, d.source)),
@@ -559,7 +671,7 @@ class TickTests(SchedulerHarness):
     def test_an_unsynced_clock_holds_the_persisted_brightness(self):
         lsr.write_last_applied(self.state, 50)
         self.light.brightness = 50
-        decision = self.build(synced_probe=lambda: (False, None)).tick()
+        decision = self.build(clock_probe=lambda: (lsr.CLOCK_UNSYNCED, None)).tick()
         self.assertEqual(50, decision.brightness)
         self.assertEqual(ls.SOURCE_HOLD, decision.source)
         self.assertEqual([], self.light.commands)
@@ -567,7 +679,7 @@ class TickTests(SchedulerHarness):
     def test_an_unsynced_clock_with_no_memory_uses_the_configured_fallback(self):
         with open(self.config, "w") as fh:
             fh.write(SHIPPED + "GARDYN_LIGHT_UNSYNCED_FALLBACK=60\n")
-        decision = self.build(synced_probe=lambda: (False, None)).tick()
+        decision = self.build(clock_probe=lambda: (lsr.CLOCK_UNSYNCED, None)).tick()
         self.assertEqual(60, decision.brightness)
         self.assertEqual(ls.SOURCE_FALLBACK, decision.source)
 
@@ -579,15 +691,15 @@ class TickTests(SchedulerHarness):
         with open(self.state, "w") as fh:
             fh.write("5")
             fh.write("\x00\x00")
-        decision = self.build(synced_probe=lambda: (False, None)).tick()
+        decision = self.build(clock_probe=lambda: (lsr.CLOCK_UNSYNCED, None)).tick()
         self.assertEqual(100, decision.brightness)
         self.assertEqual(ls.SOURCE_FALLBACK, decision.source)
 
     def test_a_clock_that_syncs_between_ticks_returns_to_the_schedule(self):
         lsr.write_last_applied(self.state, 50)
         self.light.brightness = 50
-        answers = iter([(False, None), (True, None)])
-        scheduler = self.build(synced_probe=lambda: next(answers))
+        answers = iter([(lsr.CLOCK_UNSYNCED, None), (lsr.CLOCK_SYNCED, None)])
+        scheduler = self.build(clock_probe=lambda: next(answers))
         self.assertEqual(ls.SOURCE_HOLD, scheduler.tick().source)
         second = scheduler.tick()
         self.assertEqual(ls.SOURCE_SCHEDULE, second.source)
@@ -606,7 +718,7 @@ class TickTests(SchedulerHarness):
         """decide()'s gate order, asserted from the outside. A person who has
         just published a brightness is better evidence than a schedule read
         against a clock we have already admitted is wrong."""
-        scheduler = self.build(synced_probe=lambda: (False, None))
+        scheduler = self.build(clock_probe=lambda: (lsr.CLOCK_UNSYNCED, None))
         scheduler.set_override(20)
         self.assertEqual(ls.SOURCE_OVERRIDE, scheduler.tick().source)
 
@@ -746,7 +858,7 @@ class TickTests(SchedulerHarness):
             raise OSError("broker unreachable")
         scheduler = lsr.LightScheduler(
             self.light, explode, config_path=self.config, state_path=self.state,
-            now=lambda: self.clock, synced_probe=lambda: (True, None),
+            now=lambda: self.clock, clock_probe=lambda: (lsr.CLOCK_SYNCED, None),
         )
         self.assertEqual(100, scheduler.tick().brightness)
         self.assertEqual([100], self.light.commands)
@@ -754,7 +866,7 @@ class TickTests(SchedulerHarness):
     def test_no_publisher_at_all_is_allowed(self):
         scheduler = lsr.LightScheduler(
             self.light, None, config_path=self.config, state_path=self.state,
-            now=lambda: self.clock, synced_probe=lambda: (True, None),
+            now=lambda: self.clock, clock_probe=lambda: (lsr.CLOCK_SYNCED, None),
         )
         self.assertEqual(100, scheduler.tick().brightness)
 
@@ -765,6 +877,476 @@ class TickTests(SchedulerHarness):
         scheduler = self.build(state_path=os.path.join(blocker, "light-phase"))
         self.assertEqual(100, scheduler.tick().brightness)
         self.assertEqual([100], self.light.commands)
+
+
+class ClockVerdictTests(SchedulerHarness):
+    """The latch and its ceiling — T-527.19, and the reason the deploy stopped.
+
+    `NTPSynchronized` answers "has NTP checked in recently", not "is the clock
+    good". Measured on the Pi on 2026-08-09 with a read-only adjtimex(2) probe:
+    maxerror climbs at exactly 500.0 µs/s toward systemd's 16 s threshold, so a
+    PERFECTLY ACCURATE clock is declared unsynchronised 8.89 h into any network
+    outage. The old gate then held the last applied phase for the rest of the
+    outage — darkness until the network returned, if it tipped over after 19:00.
+
+    Two rules replace it, and both are pinned here:
+      1. Once this process has seen a real sync, trust the clock from then on.
+      2. A process that has NEVER seen one holds only until the host has been
+         up NEVER_SYNCED_HOLD_SECONDS, then follows the schedule regardless.
+    """
+
+    UNSYNCED = (lsr.CLOCK_UNSYNCED, None)
+    SYNCED = (lsr.CLOCK_SYNCED, None)
+    UNKNOWN = (lsr.CLOCK_UNKNOWN, "cannot read NTP sync state (boom)")
+
+    def _probe(self, *answers):
+        """A clock probe returning each answer in turn, then repeating the last.
+
+        Repeating rather than raising StopIteration matters: the outage this
+        models does not end, and a probe that died at the end of its list would
+        make the ceiling test pass for the wrong reason.
+        """
+        seq = list(answers)
+
+        def probe():
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+        return probe
+
+    # ---------------------------------------------------------------- latch
+
+    def test_a_clock_that_synced_once_is_trusted_when_the_query_later_says_no(self):
+        """THE HEADLINE FIX. Tick one syncs; tick two is the 8.9-hour staleness
+        trip on a clock that is still accurate. Before the latch this returned
+        SOURCE_HOLD and the lamp stopped following the photoperiod."""
+        lsr.write_last_applied(self.state, 0)
+        self.light.brightness = 0
+        scheduler = self.build(clock_probe=self._probe(self.SYNCED, self.UNSYNCED))
+        self.assertEqual(ls.SOURCE_SCHEDULE, scheduler.tick().source)
+        second = scheduler.tick()
+        self.assertEqual(ls.SOURCE_SCHEDULE, second.source)
+        self.assertEqual(100, second.brightness)
+
+    def test_the_latch_survives_an_arbitrary_run_of_unsynced_answers(self):
+        """An outage is not two ticks long. Without the latch the 20th tick
+        holds exactly as the 2nd does, which is the whole complaint."""
+        scheduler = self.build(clock_probe=self._probe(self.SYNCED, self.UNSYNCED))
+        scheduler.tick()
+        for _ in range(20):
+            self.assertEqual(ls.SOURCE_SCHEDULE, scheduler.tick().source)
+
+    def test_a_process_that_has_never_synced_still_holds(self):
+        """The latch must not become "always trust the clock". The scenario the
+        gate exists for — a boot with no network, where timesyncd restored a
+        time-of-day that is stale by however long the Pi was off — still holds
+        inside the ceiling."""
+        lsr.write_last_applied(self.state, 50)
+        self.light.brightness = 50
+        decision = self.build(clock_probe=self._probe(self.UNSYNCED)).tick()
+        self.assertEqual(ls.SOURCE_HOLD, decision.source)
+        self.assertEqual(50, decision.brightness)
+
+    def test_a_broken_query_drives_but_does_NOT_latch(self):
+        """The reason read_clock_state returns three states rather than a bool.
+        CLOCK_UNKNOWN drives — believing a good clock is the cheap mistake — but
+        recording it as a sync would let a permanently broken `timedatectl`
+        pin the gate open on the strength of its own breakage. So the following
+        honest `no` must still hold."""
+        lsr.write_last_applied(self.state, 50)
+        self.light.brightness = 50
+        scheduler = self.build(clock_probe=self._probe(self.UNKNOWN, self.UNSYNCED))
+        self.assertEqual(ls.SOURCE_SCHEDULE, scheduler.tick().source)
+        self.assertEqual(ls.SOURCE_HOLD, scheduler.tick().source)
+
+    def test_the_latch_is_per_process_and_a_restart_does_not_inherit_it(self):
+        """It is a statement about THIS process's evidence, and a restarted one
+        has none. Deliberately not persisted — a latch on disk would survive the
+        power cut that produced the stale clock it exists to distrust."""
+        first = self.build(clock_probe=self._probe(self.SYNCED))
+        first.tick()
+        lsr.write_last_applied(self.state, 50)
+        self.light.brightness = 50
+        fresh = self.build(clock_probe=self._probe(self.UNSYNCED))
+        self.assertEqual(ls.SOURCE_HOLD, fresh.tick().source)
+
+    # -------------------------------------------------------------- ceiling
+
+    def test_a_never_synced_hold_ends_at_the_ceiling(self):
+        lsr.write_last_applied(self.state, 50)
+        self.light.brightness = 50
+        scheduler = self.build(
+            clock_probe=self._probe(self.UNSYNCED),
+            uptime=lambda: lsr.NEVER_SYNCED_HOLD_SECONDS + 1,
+        )
+        decision = scheduler.tick()
+        self.assertEqual(ls.SOURCE_SCHEDULE, decision.source)
+        self.assertEqual(100, decision.brightness)
+
+    def test_the_ceiling_is_exclusive_at_exactly_the_boundary(self):
+        """`<` and `<=` differ by one second here and by nothing anyone would
+        notice in production, which is exactly why it gets left unpinned."""
+        for elapsed, expected in (
+            (lsr.NEVER_SYNCED_HOLD_SECONDS - 1, ls.SOURCE_HOLD),
+            (lsr.NEVER_SYNCED_HOLD_SECONDS, ls.SOURCE_SCHEDULE),
+        ):
+            with self.subTest(elapsed=elapsed):
+                lsr.write_last_applied(self.state, 50)
+                self.light = FakeLight(brightness=50)
+                self.published = []
+                scheduler = self.build(
+                    clock_probe=self._probe(self.UNSYNCED), uptime=lambda: elapsed
+                )
+                self.assertEqual(expected, scheduler.tick().source)
+
+    def test_a_LEGITIMATE_persisted_zero_does_not_hold_the_garden_dark_forever(self):
+        """The residual finding from the T-527.7 review, and the other half of
+        T-527.19. decide()'s docstring argues at length that a CORRUPT state
+        file must not read as 0 because "0 held through an unsynced window is a
+        dark garden" — while a LEGITIMATE 0, the lamp really having been off at
+        19:00, produced the identical outcome with no mitigation at all. The
+        ceiling is what mitigates it."""
+        lsr.write_last_applied(self.state, 0)
+        self.light.brightness = 0
+        scheduler = self.build(
+            clock_probe=self._probe(self.UNSYNCED),
+            uptime=lambda: lsr.NEVER_SYNCED_HOLD_SECONDS + 1,
+        )
+        decision = scheduler.tick()
+        self.assertEqual(100, decision.brightness)
+        self.assertEqual([100], self.light.commands)
+
+    def test_ending_the_hold_is_reported_once(self):
+        """It is a real degradation — the schedule is now running on a clock
+        nothing has corroborated — so it must reach the log. Once, though: this
+        condition persists for the whole outage, and _report is what keeps it
+        from writing 2,880 lines a day."""
+        scheduler = self.build(
+            clock_probe=self._probe(self.UNSYNCED),
+            uptime=lambda: lsr.NEVER_SYNCED_HOLD_SECONDS + 1,
+        )
+        with self.assertLogs(lsr.logger, level="ERROR") as captured:
+            scheduler.tick()
+            scheduler.tick()
+        self.assertEqual(1, len(captured.records))
+        self.assertIn("never synchronised", captured.output[0])
+
+    def test_the_ceiling_is_measured_from_BOOT_not_from_process_start(self):
+        """A crash loop must not reset it. mqtt.service carries Restart=always
+        with RestartSec=10, so a process-local timer would grant a fresh two
+        hours every ten seconds and hold the lamp forever — reinstating the
+        unbounded hold through the back door. This scheduler was constructed a
+        microsecond ago and follows the schedule anyway, because the HOST has
+        been up longer than the ceiling."""
+        lsr.write_last_applied(self.state, 0)
+        self.light.brightness = 0
+        scheduler = self.build(
+            clock_probe=self._probe(self.UNSYNCED),
+            uptime=lambda: lsr.NEVER_SYNCED_HOLD_SECONDS * 10,
+        )
+        self.assertEqual(ls.SOURCE_SCHEDULE, scheduler.tick().source)
+
+    def test_an_unreadable_uptime_falls_back_to_this_process_age(self):
+        """No /proc/uptime — a laptop, or a container without procfs. The
+        fallback UNDER-reports across a restart, which lengthens the hold rather
+        than ending it early, and that is the safe direction."""
+        lsr.write_last_applied(self.state, 50)
+        self.light.brightness = 50
+        # The FIRST reading is consumed at construction, as the anchor. Both
+        # directions are asserted, or this passes against a fallback that
+        # always holds and against one that never does.
+        elapsed = iter([0.0, 10.0, lsr.NEVER_SYNCED_HOLD_SECONDS + 1])
+        scheduler = self.build(
+            clock_probe=self._probe(self.UNSYNCED),
+            uptime=lambda: None,
+            monotonic_clock=lambda: next(elapsed),
+        )
+        self.assertEqual(ls.SOURCE_HOLD, scheduler.tick().source)
+        self.assertEqual(ls.SOURCE_SCHEDULE, scheduler.tick().source)
+
+    def test_the_hold_ceiling_is_a_plausible_number(self):
+        """Pins the policy value itself, not a relation to it. Every test above
+        computes its uptime FROM the constant, so all of them move with a mutant
+        that changes it — a ceiling of a week would leave them green and the
+        garden dark for six days."""
+        self.assertEqual(2 * 60 * 60, lsr.NEVER_SYNCED_HOLD_SECONDS)
+
+
+class SerialisationTests(SchedulerHarness):
+    """T-527.20 — three defects from one root, and the suite could see none.
+
+    tick() was unserialised (the lock guarded the override slot alone) and
+    _last_published was written BEFORE the publish. An independent 15-mutant
+    battery left 10 survivors, including `with self._lock:` -> `if True:` in
+    both places, because there was no concurrent test in the file at all — and
+    the harness's own "constructs with no mutant" preamble did not name
+    threading, so the largest untested surface was the one declared covered by
+    omission.
+
+    EVERY TEST HERE FAILS WITHOUT THE LOCK. That is the point of the blocking
+    probe: it holds a tick open at a known point so a second thread can be made
+    to interleave deterministically, rather than hoping a stress loop hits the
+    ~0.1%-per-command window.
+    """
+
+    def _blocking_probe(self, entered, release):
+        """A clock probe that parks inside the tick until told to continue.
+
+        Stands in for the real `timedatectl` fork+exec, which is where a tick
+        actually spends its time (0.169 s median on the Pi, up to
+        NTP_QUERY_TIMEOUT_SECONDS) and therefore where a second thread lands.
+        """
+        def probe():
+            entered.set()
+            self.assertTrue(release.wait(5), "the test never released the tick")
+            return (lsr.CLOCK_SYNCED, None)
+        return probe
+
+    def _run_off_thread(self, fn):
+        thread = threading.Thread(target=fn, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        return thread
+
+    def test_a_command_landing_inside_a_tick_is_not_reverted(self):
+        """DEFECT 3. You press the button to turn the lamp off; before this it
+        came back on for up to a cadence, Home Assistant was told the SCHEDULE
+        owned it, and the state file recorded the scheduled brightness — so a
+        power cut in that window restored 100 rather than the 0 you asked for.
+        Roughly 0.1% per command, and the button, the HA toggle and the HA
+        brightness slider all traverse it."""
+        entered, release = threading.Event(), threading.Event()
+        scheduler = self.build(clock_probe=self._blocking_probe(entered, release))
+
+        self._run_off_thread(scheduler.tick)
+        self.assertTrue(entered.wait(5), "the tick never started")
+
+        done = threading.Event()
+
+        def command():
+            scheduler.override_now(0)
+            done.set()
+
+        self._run_off_thread(command)
+        # The command must NOT be able to complete while a tick is in flight.
+        # This is the assertion that goes red with the lock removed: without it
+        # the override lands, and the parked tick then reverts it on resume.
+        self.assertFalse(done.wait(0.2), "the command interleaved with the tick")
+
+        release.set()
+        self.assertTrue(done.wait(5), "the command never completed")
+
+        self.assertEqual(0, self.light.brightness)
+        self.assertEqual((0, ls.SOURCE_OVERRIDE), self.published[-1])
+        self.assertEqual(0, lsr.read_last_applied(self.state))
+
+    def test_publish_now_cannot_interleave_with_a_tick(self):
+        """DEFECT 2. publish_now() runs on paho's network thread from
+        announce_to_home_assistant(); tick() runs on the scheduler thread. It
+        used to read the decision, write _last_published, and land its publish
+        LAST — after a tick that had already published a newer one. The
+        broker's retained `gardyn/light/source` was left naming `schedule`
+        while a person held the lamp, held until the override expired, and the
+        T-527.9 obedience automation is specified to condition on that topic."""
+        entered, release = threading.Event(), threading.Event()
+        scheduler = self.build(clock_probe=self._blocking_probe(entered, release))
+        # Seed a decision for publish_now to republish. The probe blocks, so
+        # this first tick has to be let through before it can park.
+        release.set()
+        scheduler.tick()
+
+        entered.clear()
+        release.clear()
+        self._run_off_thread(scheduler.tick)
+        self.assertTrue(entered.wait(5), "the second tick never started")
+
+        published = threading.Event()
+        self._run_off_thread(lambda: (scheduler.publish_now(), published.set()))
+        self.assertFalse(
+            published.wait(0.2), "publish_now interleaved with a tick"
+        )
+
+        release.set()
+        self.assertTrue(published.wait(5), "publish_now never completed")
+
+        # The invariant the race broke: what we remember publishing is what was
+        # published last. Nothing can observe a torn pair from outside.
+        self.assertEqual(scheduler._last_published, self.published[-1])
+
+    def test_the_remembered_pair_matches_the_last_publish_under_contention(self):
+        """The same invariant as a stress run rather than a staged interleave —
+        a second instrument on one property, because the staged test proves the
+        lock blocks and this proves the bookkeeping is right on both sides of
+        it. Deliberately not the only evidence: a stress loop that happens to
+        miss the window passes for the wrong reason."""
+        scheduler = self.build()
+        scheduler.tick()
+        threads = []
+        for index in range(40):
+            target = scheduler.tick if index % 2 else scheduler.publish_now
+            threads.append(self._run_off_thread(target))
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive(), "a thread deadlocked")
+        self.assertEqual(scheduler._last_published, self.published[-1])
+
+    # --------------------------------------------- the failed-drive republish
+
+    def test_a_failed_drive_forces_a_republish_on_the_next_tick(self):
+        """DEFECT 1, and the one that strands Home Assistant PERMANENTLY.
+
+        The dedupe key is the INTENDED (brightness, source); the payload is the
+        OBSERVED brightness, because publish_light_decision() re-reads the lamp.
+        So tick 1 with pigpio down caught the raise, did not move the lamp, and
+        published the hardware's 0 — while recording (100, schedule) as sent.
+        Tick 2, with pigpio back, drove the lamp to 100, found the decision pair
+        unchanged, and deduped. Home Assistant showed the grow light OFF while
+        it was on, until the next boundary (up to 8 h) or an MQTT reconnect.
+        RuntimeError("pigpio connection lost") is a failure FakeLight already
+        models, so nothing about this is hypothetical."""
+        scheduler = self.build()
+        self.light.fail_on_set = RuntimeError("pigpio connection lost")
+        with self.assertLogs(lsr.logger, level="ERROR"):
+            scheduler.tick()
+        self.assertEqual(0.0, self.light.brightness)
+        self.assertEqual([(100, ls.SOURCE_SCHEDULE)], self.published)
+
+        self.light.fail_on_set = None
+        scheduler.tick()
+        self.assertEqual(100.0, self.light.brightness)
+        self.assertEqual(
+            2, len(self.published), "the recovery tick was deduped away"
+        )
+
+    def test_a_failed_drive_republishes_even_when_the_DECISION_has_not_changed(self):
+        """The case the first battery had no corpus for, and the reason
+        `or not applied` is not redundant with _record_published_locked.
+
+        Every other failed-drive test starts from a CHANGED pair, which
+        publishes on the dedupe's own terms — so the clause could be deleted
+        and nothing went red. Reaching it needs the pair to be UNCHANGED while
+        the lamp has drifted off target, which happens whenever something else
+        writes the pin: the physical button, a flash_lights() burst, or an MQTT
+        command handler. Then the drive back fails, and without the clause the
+        scheduler stays silent and Home Assistant keeps a retained value that
+        no longer describes the lamp."""
+        scheduler = self.build()
+        scheduler.tick()
+        self.assertEqual([(100, ls.SOURCE_SCHEDULE)], self.published)
+
+        # Something else moved the pin, and pigpio is now failing.
+        self.light.brightness = 0.0
+        self.light.fail_on_set = RuntimeError("pigpio connection lost")
+        with self.assertLogs(lsr.logger, level="ERROR"):
+            scheduler.tick()
+        self.assertEqual(
+            2, len(self.published),
+            "an unchanged decision with a failed drive published nothing",
+        )
+        self.assertIsNone(scheduler._last_published)
+
+    def test_a_failed_drive_is_not_recorded_as_persisted_either(self):
+        """The state file is the unsynced hold's memory, so recording a
+        brightness the lamp never reached would make a later hold restore a
+        value that was never applied."""
+        scheduler = self.build()
+        self.light.fail_on_set = RuntimeError("pigpio connection lost")
+        with self.assertLogs(lsr.logger, level="ERROR"):
+            scheduler.tick()
+        self.assertIsNone(lsr.read_last_applied(self.state))
+
+    def test_a_successful_drive_is_still_deduped(self):
+        """The paired assertion, and the one that stops the fix over-correcting.
+        Republishing an unchanged pair every 30 s is pure broker traffic on
+        retained topics — the behaviour T-527.6 built the dedupe for."""
+        scheduler = self.build()
+        scheduler.tick()
+        scheduler.tick()
+        scheduler.tick()
+        self.assertEqual([(100, ls.SOURCE_SCHEDULE)], self.published)
+
+    def test_publish_now_after_a_failed_drive_does_not_re_arm_the_dedupe(self):
+        """publish_now() is unconditional, so it must not record a pair the
+        lamp never reached — that would silently reinstate defect 1 through the
+        reconnect path, which is exactly where it looks most like recovery."""
+        scheduler = self.build()
+        self.light.fail_on_set = RuntimeError("pigpio connection lost")
+        with self.assertLogs(lsr.logger, level="ERROR"):
+            scheduler.tick()
+        scheduler.publish_now()
+        self.assertIsNone(scheduler._last_published)
+
+        self.light.fail_on_set = None
+        before = len(self.published)
+        scheduler.tick()
+        self.assertEqual(before + 1, len(self.published))
+
+
+class ModuleDefaultTests(unittest.TestCase):
+    """The constructor's defaults, which every other test overrides.
+
+    T-527.20's battery found these unpinned: a mutant repointing CONFIG_PATH at
+    a nonexistent path was SILENT, and mutants on TICK_SECONDS and
+    NTP_QUERY_TIMEOUT_SECONDS survived, because every test passes those
+    explicitly. A default nothing asserts is a default nothing protects.
+    """
+
+    def test_the_config_path_default_is_the_deployed_one(self):
+        self.assertEqual("/etc/gardyn/light.env", lsr.CONFIG_PATH)
+
+    def test_the_state_path_default_is_the_deployed_one(self):
+        """Must agree with StateDirectory=gardyn in services/mqtt.service."""
+        self.assertEqual("/var/lib/gardyn", lsr.STATE_DIR_FALLBACK)
+        self.assertEqual("light-phase", lsr.STATE_FILENAME)
+
+    def test_the_uptime_path_default_is_the_kernel_one(self):
+        self.assertEqual("/proc/uptime", lsr.UPTIME_PATH)
+
+    def test_the_tick_cadence_default_is_thirty_seconds(self):
+        self.assertEqual(30, lsr.TICK_SECONDS)
+
+    def test_the_ntp_query_timeout_default_is_ten_seconds(self):
+        self.assertEqual(10, lsr.NTP_QUERY_TIMEOUT_SECONDS)
+
+    def test_a_scheduler_built_with_no_kwargs_takes_the_module_defaults(self):
+        """The constants above are only worth pinning if the constructor still
+        reads them."""
+        scheduler = lsr.LightScheduler(FakeLight())
+        self.assertEqual(lsr.CONFIG_PATH, scheduler._config_path)
+        self.assertEqual(lsr.TICK_SECONDS, scheduler._tick_seconds)
+        self.assertEqual(
+            lsr.NEVER_SYNCED_HOLD_SECONDS, scheduler._never_synced_hold_seconds
+        )
+        # Functions are not interned, so identity here is real evidence that
+        # the constructor took the module's callable rather than a copy.
+        self.assertIs(lsr.read_clock_state, scheduler._clock_probe)
+        self.assertIs(lsr.seconds_since_boot, scheduler._uptime)
+
+    def test_the_scalar_defaults_are_written_as_NAMES_in_the_source(self):
+        """The test above cannot see a hardcoded scalar, and no runtime
+        assertion can — the literal and the constant are EQUAL, so every
+        instrument agrees while the single source of truth is gone. A mutant
+        rewriting `config_path=CONFIG_PATH` to the same path spelled out
+        survived a full battery for exactly that reason.
+
+        So assert the DERIVATION, in the source, which is the only place the
+        difference exists. `is` would not do it either: identical string
+        literals in one module fold to one constant object, so identity passes
+        against the copy it is meant to forbid.
+        """
+        import inspect
+
+        signature = inspect.getsource(lsr.LightScheduler.__init__)
+        for parameter, constant in (
+            ("config_path", "CONFIG_PATH"),
+            ("tick_seconds", "TICK_SECONDS"),
+            ("never_synced_hold_seconds", "NEVER_SYNCED_HOLD_SECONDS"),
+            ("clock_probe", "read_clock_state"),
+            ("uptime", "seconds_since_boot"),
+        ):
+            with self.subTest(parameter=parameter):
+                self.assertRegex(
+                    signature, rf"\n\s*{parameter}={constant},",
+                    f"{parameter}'s default is not derived from {constant}",
+                )
 
 
 class LoggingTests(SchedulerHarness):

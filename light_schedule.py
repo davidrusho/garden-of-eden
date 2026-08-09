@@ -496,6 +496,15 @@ def decide(
        to have been persisted across the restart, which is why T-527.5 writes
        it to disk.
 
+       WHO DECIDES `clock_synced` MATTERS AS MUCH AS THIS BRANCH DOES, and it
+       is deliberately not decided here. This function is pure and cannot know
+       how long a hold has lasted; an unbounded hold is a dark garden, which is
+       the failure T-527 exists to remove. light_scheduler._clock_verdict()
+       owns that policy — it latches on the first real synchronisation and puts
+       a ceiling on a never-synced hold (T-527.19). Read it before reasoning
+       about how often this branch can fire, because the answer is "far less
+       often than the systemd property alone would suggest".
+
     3. Otherwise the schedule decides.
 
     The unsynced branch's fallback — no persisted brightness at all, i.e. a
@@ -504,9 +513,14 @@ def decide(
     configured fallback can leave the lamp lit at the wrong time of day. Doing
     nothing leaves the garden dark for the whole outage. The T-527 design
     chose the first explicitly: refusing to drive "would degrade INTO the
-    failure mode this work exists to avoid rather than away from it". The
-    window is small in practice — NTP syncs within seconds of the network
-    returning, and the next tick corrects it.
+    failure mode this work exists to avoid rather than away from it".
+
+    AN EARLIER VERSION OF THIS PARAGRAPH ENDED "the window is small in practice
+    — NTP syncs within seconds of the network returning, and the next tick
+    corrects it." That is a true statement about the RETURN and says nothing
+    about the OUTAGE'S DURATION, which is the quantity that matters and can be
+    days. It read as a bound and was not one. The real bound is
+    light_scheduler.NEVER_SYNCED_HOLD_SECONDS, in the caller.
 
     Every returned brightness goes through _clamped(), so a hostile MQTT
     publish cannot reach Light.set_duty_cycle() with something it will raise
