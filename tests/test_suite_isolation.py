@@ -404,7 +404,11 @@ class MutationHarnessRestoreTests(unittest.TestCase):
     # anything behind and need no restore - which is the better design, and the
     # reason they are listed rather than exempted silently.
     SANDBOXED = {"mutate_health_log.py", "mutate_upgrade_policy.py",
-                 "mutate_netwatch.py", "mutate_deploy_verify.py"}
+                 "mutate_netwatch.py", "mutate_deploy_verify.py",
+                 # T-527.5. Sandboxed from the start rather than converted
+                 # later: this battery mutates mqtt.py and mqtt.service, which
+                 # a concurrent session is as likely to be editing as not.
+                 "mutate_light_scheduler.py"}
 
     # Harnesses that also DELETE a file rather than only editing one. The
     # restore path for a deletion is different code (move to a stash, copy

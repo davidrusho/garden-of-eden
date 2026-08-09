@@ -21,6 +21,7 @@ from config import USERNAME, PASSWORD, BROKER, PORT, KEEP_ALIVE_INTERVAL, BASE_T
 from gpiozero import Button  # Import gpiozero Button
 from gpiozero.pins.pigpio import PiGPIOFactory
 
+from light_scheduler import LightScheduler
 from app.sensors.light.light import Light
 from app.sensors.pump.pump import Pump
 from app.sensors.pcb_temp.pcb_temp import get_pcb_temperature
@@ -1464,6 +1465,27 @@ if __name__ == "__main__":
     # seconds and parks the unit in `failed` permanently. A router reboot that
     # brought this Pi up before the broker used to leave the garden dark.
     warn_if_topic_collides()
+
+    # The local photoperiod (T-527.5), started BEFORE the connection and
+    # deliberately not gated on it. That ordering IS the feature: the whole
+    # point of T-527 is that the lamp keeps its schedule when Home Assistant is
+    # down, when the broker is down, and when this Pi is off the network. Two
+    # outages in 2026 came from a schedule that lived at the far end of that
+    # chain; a third came from this Pi rebooting mid-phase, which is why the
+    # engine computes "what phase is it now" rather than reacting to boundary
+    # edges — a restart at 14:00 lands on the right brightness on its first
+    # tick.
+    #
+    # It is NOT started from on_connect() alongside start_publisher_threads():
+    # that path only runs once a broker has accepted a CONNACK, so putting the
+    # scheduler there would reintroduce the dependency this change removes.
+    #
+    # publish_light_state is best-effort and is called only after the lamp
+    # actually moves. A publish on a client that has not connected yet returns
+    # an error code rather than raising, and the reconnect path republishes the
+    # retained state through announce_to_home_assistant() anyway.
+    light_scheduler = LightScheduler(light, lambda: publish_light_state(client))
+    light_scheduler.start()
 
     client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)
 

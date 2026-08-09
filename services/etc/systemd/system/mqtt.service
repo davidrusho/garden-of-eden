@@ -38,6 +38,21 @@ StartLimitIntervalSec=0
 # Available since systemd 240; this host runs 252.
 Type=exec
 User=gardyn
+# Creates /var/lib/gardyn owned by User= at mode 0755 and exports
+# $STATE_DIRECTORY pointing at it (systemd.exec(5), verified against the man
+# page on this host — systemd 252). light_scheduler.py persists the last
+# brightness it applied there, which is what lets a boot with no network HOLD
+# the previous phase instead of guessing at a clock it cannot trust.
+#
+# NOT under WorkingDirectory=, which is a git checkout: state written into a
+# working tree is one `git clean` away from being lost, and would show up as
+# an untracked file in every deploy.
+#
+# Losing this directory degrades exactly one thing — the unsynced-clock branch
+# falls back to GARDYN_LIGHT_UNSYNCED_FALLBACK instead of holding. It is not
+# on the path of any ordinary tick, so a failure here cannot stop the
+# photoperiod.
+StateDirectory=gardyn
 WorkingDirectory=/home/gardyn/garden-of-eden
 ExecStart=/home/gardyn/garden-of-eden/venv/bin/python /home/gardyn/garden-of-eden/mqtt.py
 Restart=always
