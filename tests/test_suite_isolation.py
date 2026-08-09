@@ -392,12 +392,6 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         "mutate_pump_api_interlock.py": ["app/sensors/pump/routes.py"],
         "mutate_ha_birth_message.py": ["mqtt.py"],
         "mutate_connack_refusal.py": ["mqtt.py"],
-        # Two targets, and the second one is the point: this battery mutates
-        # its own test file as well, because PurityTests is the only guard on
-        # light_schedule's stdlib-only promise and a guard nobody has shown
-        # can fail is not a guard (T-527.4).
-        "mutate_light_schedule.py": ["light_schedule.py",
-                                     "tests/test_light_schedule.py"],
     }
 
     # Harnesses that copy the repository and mutate the COPY. They cannot leave
@@ -408,7 +402,12 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                  # T-527.5. Sandboxed from the start rather than converted
                  # later: this battery mutates mqtt.py and mqtt.service, which
                  # a concurrent session is as likely to be editing as not.
-                 "mutate_light_scheduler.py"}
+                 "mutate_light_scheduler.py",
+                 # T-527.13. Moved here from IN_PLACE. It mutated TWO files in
+                 # the live tree, and its docstring's argument for doing so —
+                 # "a sandbox buys nothing here" — was disproved by a reviewer
+                 # simply running the battery from a copy.
+                 "mutate_light_schedule.py"}
 
     # Harnesses that also DELETE a file rather than only editing one. The
     # restore path for a deletion is different code (move to a stash, copy

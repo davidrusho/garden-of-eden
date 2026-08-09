@@ -8,16 +8,34 @@ cannot go red is not evidence, and this engine decides the photoperiod of a
 garden attached to a Pi with no console — so "the tests pass" has to mean
 something before anything ships.
 
-MUTATES IN PLACE, which is why the restore machinery below is three-deep. The
-alternative, a shutil.copytree sandbox, buys nothing here: light_schedule.py
-has no dependency on its surroundings and the suite resolves the repo root
-from __file__, so a copy would only add a second place for the mutant to be
-left behind.
+RUNS IN A shutil.copytree SANDBOX. The working tree is never written to, so no
+restore path has to be trusted and an interrupted run cannot strand a mutant in
+a tree somebody else is committing from.
 
-TWO MUTANTS ARE DELIBERATELY ABSENT, and saying so is the honest report — a
+This file argued the opposite until T-527.13, and the argument was wrong in the
+direction that kept the risky design: it said a sandbox "buys nothing here…
+a copy would only add a second place for the mutant to be left behind." A
+reviewer disproved it by running the unmodified battery from a four-file copy —
+45 killed, 0 survived, both controls gated, both files restored identical. The
+claim was also load-bearing in the wrong place: this battery mutates TWO files
+rather than one, doubling the window in which a concurrent session can commit a
+mutant, and on 2026-08-08 this repo had two review agents and a worktree agent
+live against it while the battery ran.
+
+Read that as the general caution: a rationale for keeping a risky design is
+worth testing before the design is.
+
+THREE MUTANTS ARE DELIBERATELY ABSENT, and saying so is the honest report — a
 kill count bounds only the mutants somebody thought to write, so an unexplained
-gap reads as coverage. Both were run once, both survived, and both survivors
-are questions about the CODE rather than about the suite:
+gap reads as coverage. Each was run once, each survived, and each survivor is a
+question about the CODE rather than about the suite.
+
+(This paragraph said "TWO" while listing three from the moment a third was
+added, and a reviewer caught it. Left as a note rather than silently corrected,
+because it is the smallest possible instance of the failure that has dominated
+every review round on this ticket: prose that no test can reach, drifting from
+the thing it describes, in a file whose entire purpose is proving that claims
+are checkable.)
 
   * Removing the `else: break` in phase_at() is behaviour-preserving by
     construction. The boundaries are sorted, so once one compares greater than
@@ -43,14 +61,20 @@ above. Read that as the standing caution about any score here: a kill count
 bounds only the mutants somebody thought to write, and the ones you write are
 biased toward the code you were already thinking about.
 """
-import atexit
 import hashlib
 import os
-import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Where the battery actually runs. Rebound to the sandbox by main() before any
+# mutant is applied; the REPO default exists so the module can be imported and
+# inspected (tests/test_suite_isolation.py does exactly that) without a copy
+# being made. Nothing between here and main() touches the filesystem.
+ROOT = REPO
 TARGET = os.path.join(REPO, "light_schedule.py")
 
 SUITES = ["tests.test_light_schedule"]
@@ -343,7 +367,7 @@ def purge_pycache():
     code that never executed. -B suppresses writing a cache, not reading a
     stale one.
     """
-    for root, dirs, _ in os.walk(REPO):
+    for root, dirs, _ in os.walk(ROOT):
         if ".git" in root:
             continue
         for name in list(dirs):
@@ -379,12 +403,6 @@ def restore():
         with open(path, "w") as fh:
             fh.write(src)
         os.chmod(path, mode)
-
-
-def _on_signal(signum, _frame):
-    # try/finally does not cover a signal and atexit does not either.
-    restore()
-    sys.exit(128 + signum)
 
 
 def apply_mutation(anchor, replacement):
@@ -426,7 +444,7 @@ def run_suites():
     for suite in SUITES:
         proc = subprocess.run(
             [sys.executable, "-m", "unittest", suite],
-            cwd=REPO,
+            cwd=ROOT,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -438,22 +456,38 @@ def run_suites():
 
 
 def main():
-    """Three restore paths, none of which subsumes another.
+    """Copy the repo, point the battery at the copy, run, delete the copy.
 
-      try/finally      an exception out of the run, including the
-                       KeyboardInterrupt tests/test_suite_isolation.py injects.
-      atexit           a clean exit down a path that skips the finally.
-      SIGTERM/SIGINT   a signal, which runs NEITHER of the above.
+    THE THREE-DEEP RESTORE MACHINERY THIS REPLACED IS GONE ON PURPOSE
+    (T-527.13). try/finally, atexit and a SIGTERM/SIGINT handler all existed to
+    put the WORKING TREE back after an interrupted in-place run. There is no
+    working tree in the loop any more, so keeping them would be code claiming a
+    protection it is no longer providing — and a reader would reasonably infer
+    from their presence that the tree was still at risk.
+
+    `restore()` survives because it does a different job: it reverts each
+    mutant between iterations, inside the sandbox. The byte-identity assertion
+    at the end of _run() likewise now speaks about the sandbox, which is a
+    weaker statement than it used to make and is labelled as such there.
+
+    An interrupt now strands at most a directory under the system temp dir,
+    which is the OS's problem rather than git history's.
     """
-    for path in (TARGET, TEST_FILE):
-        _ORIGINALS[path] = (open(path).read(), os.stat(path).st_mode)
-    atexit.register(restore)
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT, _on_signal)
-    try:
-        return _run()
-    finally:
-        restore()
+    global ROOT, TARGET, TEST_FILE
+    with tempfile.TemporaryDirectory(prefix="mutate-light-schedule-") as tmp:
+        root = os.path.join(tmp, "repo")
+        shutil.copytree(REPO, root,
+                        ignore=shutil.ignore_patterns("__pycache__", "venv",
+                                                      ".git", "node_modules"))
+        ROOT = root
+        TARGET = os.path.join(root, "light_schedule.py")
+        TEST_FILE = os.path.join(root, "tests", "test_light_schedule.py")
+        for path in (TARGET, TEST_FILE):
+            _ORIGINALS[path] = (open(path).read(), os.stat(path).st_mode)
+        try:
+            return _run()
+        finally:
+            restore()
 
 
 def _run():
@@ -546,8 +580,12 @@ def _run():
             print(f"  - {label}")
     print("=" * 72)
 
-    # Byte-identity, asserted rather than assumed. A wait loop proves a process
-    # exited, not that its cleanup ran, so this line is the evidence.
+    # Byte-identity, asserted rather than assumed — but read what it is now a
+    # statement ABOUT. Since T-527.13 these paths are inside the copytree
+    # sandbox, so this says the per-mutant revert kept up with the battery, NOT
+    # that the working tree is safe. The working tree is safe because it is
+    # never opened for writing, which is a stronger guarantee and a different
+    # one; do not read this line as evidence for it.
     clean = True
     for path, (src, mode) in _ORIGINALS.items():
         on_disk = open(path).read()
@@ -556,7 +594,7 @@ def _run():
         ).hexdigest()
         mode_ok = os.stat(path).st_mode == mode
         print(
-            f"RESTORED {os.path.relpath(path, REPO)}: "
+            f"RESTORED {os.path.relpath(path, ROOT)}: "
             f"content {'identical' if same else 'DIFFERS'}, "
             f"mode {'identical' if mode_ok else 'DIFFERS'}"
         )
