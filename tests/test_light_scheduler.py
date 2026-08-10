@@ -1298,6 +1298,83 @@ class SerialisationTests(SchedulerHarness):
         )
         self.assertIsNone(scheduler._last_published)
 
+    def test_a_failed_PUBLISH_forces_a_republish_on_the_next_tick(self):
+        """The publish-path twin of the failed-drive rule, and it was missing.
+
+        f631652 stopped a failed DRIVE being recorded as published; a failed
+        PUBLISH was recorded regardless, one line away, because _publish
+        swallowed its exception and returned None. Nothing left the process, the
+        pair was remembered as sent, and every later tick deduped against it —
+        so Home Assistant held a retained value that did not describe the lamp
+        until the next boundary (up to 8 h) or an MQTT reconnect.
+
+        Not hypothetical: publish_light_decision() begins with
+        light.get_brightness(), the same pigpio round-trip _read_actual() wraps
+        precisely because it can raise."""
+        attempts = []
+
+        def flaky(decision):
+            attempts.append((decision.brightness, decision.source))
+            if len(attempts) == 1:
+                raise OSError("broker unreachable")
+            self.published.append((decision.brightness, decision.source))
+
+        scheduler = lsr.LightScheduler(
+            self.light, flaky, config_path=self.config, state_path=self.state,
+            now=lambda: self.clock, clock_probe=lambda: (lsr.CLOCK_SYNCED, None),
+            uptime=lambda: 0.0,
+        )
+        with self.assertLogs(lsr.logger, level="ERROR"):
+            scheduler.tick()
+        self.assertEqual([], self.published, "the broker got it after all?")
+        self.assertIsNone(
+            scheduler._last_published,
+            "a publish that raised was remembered as sent",
+        )
+
+        scheduler.tick()
+        self.assertEqual([(100, ls.SOURCE_SCHEDULE)], self.published)
+        self.assertEqual((100, ls.SOURCE_SCHEDULE), scheduler._last_published)
+
+    def test_publish_now_before_the_first_tick_is_a_SILENT_no_op(self):
+        """The guard's own regression test, and it was only ever enforced by
+        accident.
+
+        `publish_now()` runs from announce_to_home_assistant() on the connect
+        path, while the scheduler's first tick is still pending on its own
+        thread — a real window. The `decision is None` guard is what makes that
+        a no-op. It used to be pinned only by the AttributeError that escaped
+        when the guard was removed, and making _publish() return a bool meant
+        _publish swallowed that AttributeError instead: the mutant deleting the
+        guard SURVIVED the battery, silently. So assert the observable that
+        remains, which is the better one anyway — nothing published, and
+        nothing logged. A traceback per broker reconnect is not a no-op."""
+        scheduler = self.build()
+        with self.assertNoLogs(lsr.logger, level="ERROR"):
+            scheduler.publish_now()
+        self.assertEqual([], self.published)
+        self.assertIsNone(scheduler._last_published)
+
+    def test_a_publish_that_SUCCEEDS_is_still_deduped(self):
+        """The paired assertion that stops the fix over-correcting into
+        republishing an unchanged pair on every tick."""
+        scheduler = self.build()
+        for _ in range(3):
+            scheduler.tick()
+        self.assertEqual([(100, ls.SOURCE_SCHEDULE)], self.published)
+
+    def test_a_scheduler_with_no_publisher_does_not_spin(self):
+        """`publish_state=None` means nothing failed — there is no subscriber.
+        Returning False there would make every tick look like a failed publish
+        and defeat the dedupe permanently."""
+        scheduler = lsr.LightScheduler(
+            self.light, None, config_path=self.config, state_path=self.state,
+            now=lambda: self.clock, clock_probe=lambda: (lsr.CLOCK_SYNCED, None),
+            uptime=lambda: 0.0,
+        )
+        scheduler.tick()
+        self.assertEqual((100, ls.SOURCE_SCHEDULE), scheduler._last_published)
+
     def test_a_failed_drive_is_not_recorded_as_persisted_either(self):
         """The state file is the unsynced hold's memory, so recording a
         brightness the lamp never reached would make a later hold restore a

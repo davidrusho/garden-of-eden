@@ -231,8 +231,7 @@ MUTANTS = [
      "        note = None"),
     ("the state is never published, so HA never learns the lamp moved", SRC,
      "        if pair != self._last_published or not applied:\n"
-     "            self._publish(decision)\n"
-     "            self._record_published_locked(decision)",
+     "            self._record_published_locked(decision, self._publish(decision))",
      "        self._last_published = pair"),
 
     # ---------------------------------------------------- who owns the lamp
@@ -246,12 +245,11 @@ MUTANTS = [
      "            self._set_override_locked(brightness)\n            return self._last_decision"),
     ("publish_now honours the dedupe, so a reconnecting HA is never re-told "
      "who owns the lamp", SRC,
-     "                return\n            self._publish(decision)\n"
-     "            self._record_published_locked(decision)",
+     "                return\n"
+     "            self._record_published_locked(decision, self._publish(decision))",
      "                return\n            pair = (decision.brightness, decision.source)\n"
      "            if pair != self._last_published:\n"
-     "                self._publish(decision)\n"
-     "                self._record_published_locked(decision)"),
+     "                self._record_published_locked(decision, self._publish(decision))"),
     ("publish_now publishes before any decision exists", SRC,
      "            if decision is None:\n                return",
      "            if False:\n                return"),
@@ -356,8 +354,26 @@ MUTANTS = [
      "            return True"),
     ("the published pair is remembered even when the lamp never got there",
      SRC,
-     "        if self._last_apply_ok:\n            self._last_published = (decision.brightness, decision.source)",
+     "        if self._last_apply_ok and published_ok:\n"
+     "            self._last_published = (decision.brightness, decision.source)",
      "        if True:\n            self._last_published = (decision.brightness, decision.source)"),
+    # The publish-path half, added with the fix that closed it. This mutant
+    # REINTRODUCES the exact defect: a publish that raised recorded as sent.
+    ("a failed PUBLISH is recorded as published, stranding HA on a retained "
+     "value that never left the process", SRC,
+     "        if self._last_apply_ok and published_ok:",
+     "        if self._last_apply_ok:"),
+    ("_publish reports success after the publish raised", SRC,
+     '            logger.exception("Schedule could not publish the light\'s state")\n'
+     "            return False",
+     '            logger.exception("Schedule could not publish the light\'s state")\n'
+     "            return True"),
+    ("a scheduler with no publisher reports every tick as a FAILED publish, "
+     "so the dedupe never engages", SRC,
+     "            # No subscriber configured. Nothing failed, so the dedupe should\n"
+     "            # behave normally rather than republishing into the void forever.\n"
+     "            return True",
+     "            return False"),
 
     # ------------------------------------- the clock gate (T-527.19) -------
     ("the latch never sets, so the 8.9-hour staleness trip freezes the lamp "

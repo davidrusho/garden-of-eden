@@ -30,6 +30,10 @@ from unittest.mock import MagicMock, patch
 
 from tests.test_water_interlock import mqtt_mod
 
+# Standard-library-only and pulled in by mqtt_mod anyway; imported explicitly so
+# the Decision type used below is the real one rather than a look-alike tuple.
+import light_schedule as ls  # noqa: E402
+
 # IDENTIFIER as the stubbed config sets it. Written out rather than imported,
 # for the same reason the topic lists are.
 ID = "gardyn-xx"
@@ -518,6 +522,59 @@ class TestRetiredCommandSurface(RetiredEntitiesTestBase):
         self.addCleanup(setattr, mqtt_mod, "light_scheduler", None)
         self._send("light/command", "ON")
         mqtt_mod.light_scheduler.override_now.assert_called_once()
+
+    def test_publish_light_decision_publishes_state_brightness_and_owner(self):
+        """publish_light_decision() WAS EXECUTED BY NO TEST IN THE REPOSITORY.
+
+        Proven by a reviewer, not suspected: replacing its whole body with one
+        that dropped `publish_light_state(client)`, dropped `retain=True` and
+        typo'd the source topic left all 931 tests green. That hole was opened
+        by the commit that rewrote the test above — its docstring claimed "the
+        publish itself is pinned in test_light_scheduler.py", which is false:
+        that module injects a FAKE publish_state callable and never reaches
+        this function. A comment claiming coverage is worse than the gap it
+        hides, because it is what stops the next reader looking.
+
+        What ships blind without this: drop publish_light_state() here and the
+        scheduler stops updating gardyn/light/state entirely. Since T-527.6
+        also removed the handlers' own publishes, NOTHING would update
+        light.gardyn_light — Home Assistant would sit on the retained value
+        from before the deploy, showing the lamp ON all night.
+        """
+        mqtt_mod.light.get_brightness.return_value = 55.0
+        mqtt_mod.publish_light_decision(
+            self.client, ls.Decision(55, ls.SOURCE_OVERRIDE)
+        )
+
+        state = self.client.to("gardyn/light/state")
+        self.assertEqual(1, len(state), "the ON/OFF state topic was not published")
+        self.assertEqual("ON", state[0].payload)
+        self.assertTrue(state[0].retain, "state must be retained")
+
+        brightness = self.client.to("gardyn/light/brightness/state")
+        self.assertEqual(1, len(brightness))
+        self.assertEqual("55", brightness[0].payload)
+        self.assertTrue(brightness[0].retain)
+
+        # The exact topic, so a typo cannot pass. This is the one the T-527.9
+        # obedience automation is specified to condition on.
+        owner = self.client.to("gardyn/light/source")
+        self.assertEqual(1, len(owner), "the owner topic was not published")
+        self.assertEqual(ls.SOURCE_OVERRIDE, owner[0].payload)
+        self.assertTrue(owner[0].retain, "the owner must be retained")
+
+    def test_publish_light_decision_reads_the_HARDWARE_not_the_decision(self):
+        """The brightness published is the lamp's ACTUAL duty cycle, which is
+        what makes a failed drive detectable downstream. A decision of 100 with
+        a lamp stuck at 0 must publish 0 and OFF, not 100 and ON."""
+        mqtt_mod.light.get_brightness.return_value = 0.0
+        mqtt_mod.publish_light_decision(
+            self.client, ls.Decision(100, ls.SOURCE_SCHEDULE)
+        )
+        self.assertEqual("OFF", self.client.to("gardyn/light/state")[0].payload)
+        self.assertEqual(
+            "0", self.client.to("gardyn/light/brightness/state")[0].payload
+        )
 
     def test_a_light_command_with_NO_scheduler_drives_nothing(self):
         """The other half, and the reason the test above is not just weaker.

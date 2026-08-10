@@ -548,8 +548,7 @@ class LightScheduler:
             decision = self._last_decision
             if decision is None:
                 return
-            self._publish(decision)
-            self._record_published_locked(decision)
+            self._record_published_locked(decision, self._publish(decision))
 
     # ----------------------------------------------------------------- tick
 
@@ -685,17 +684,20 @@ class LightScheduler:
         # which is pre-existing. Suppressing it would reinstate the strand.
         pair = (decision.brightness, decision.source)
         if pair != self._last_published or not applied:
-            self._publish(decision)
-            self._record_published_locked(decision)
+            self._record_published_locked(decision, self._publish(decision))
         return decision
 
-    def _record_published_locked(self, decision):
-        """Remember what was published, but only if the lamp really got there.
+    def _record_published_locked(self, decision, published_ok):
+        """Remember what was published, and ONLY if it really was.
 
-        None on a failed drive, so the next tick republishes rather than
-        deduping against a pair the lamp never reached.
+        Both halves have to hold. A failed DRIVE means the payload carried the
+        hardware's stale value rather than the decision's, and a failed PUBLISH
+        means nothing left the process at all — either way the broker's retained
+        copy does not describe the lamp, so recording the pair would let the
+        dedupe suppress every later correction. None forces the next tick to
+        republish.
         """
-        if self._last_apply_ok:
+        if self._last_apply_ok and published_ok:
             self._last_published = (decision.brightness, decision.source)
         else:
             self._last_published = None
@@ -774,13 +776,35 @@ class LightScheduler:
             return None
 
     def _publish(self, decision):
+        """Publish the decision. Returns True if it actually went out.
+
+        THE RETURN VALUE IS THE POINT, and its absence was a defect one line
+        away from the one f631652 went to real trouble to close. That commit
+        stopped a failed DRIVE being recorded as published; this stops a failed
+        PUBLISH being recorded as published. Both strand Home Assistant on a
+        retained value that no longer describes the lamp, and the dedupe then
+        suppresses every later correction.
+
+        It is not hypothetical: publish_light_decision() begins with
+        light.get_brightness(), a pigpio round-trip — exactly the call
+        _read_actual() exists to wrap because it can raise. One blip there at a
+        boundary used to strand HA until the next boundary, up to 8 h.
+
+        The exception is still swallowed. The broker being down is the PREMISE
+        of T-527 and must never stop the photoperiod; what changes is that we
+        no longer remember a publish that did not happen.
+        """
         if self._publish_state is None:
-            return
+            # No subscriber configured. Nothing failed, so the dedupe should
+            # behave normally rather than republishing into the void forever.
+            return True
         try:
             self._publish_state(decision)
         except Exception:
             # The broker is allowed to be down. That is the premise of T-527.
             logger.exception("Schedule could not publish the light's state")
+            return False
+        return True
 
     def _report(self, category, note):
         """Log a note once per distinct message, not once per tick."""

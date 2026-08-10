@@ -82,6 +82,30 @@ TEMPERATURE_BLOCK_RESTORED = '''    TEMP_CONFIG_TOPIC = "homeassistant/sensor/ga
     # Discovery configuration for Camera A (image entity)'''
 
 MUTANTS = [
+    # --- publish_light_decision (T-527.6/.7) --------------------------------
+    # ADDED because a reviewer proved this function was executed by NO TEST in
+    # the repository: replacing its whole body left all 931 tests green. It is
+    # the single writer of gardyn/light/state, .../brightness/state and
+    # .../source now that T-527.6 removed the command handlers' own publishes,
+    # so a silent break here means Home Assistant sits on a retained value from
+    # before the deploy — showing the lamp ON all night — with nothing red.
+    ("the lamp's ON/OFF and brightness state stop being published, so HA keeps "
+     "whatever the broker still holds",
+     "    publish_light_state(client)\n"
+     "    client.publish(LIGHT_SOURCE_TOPIC, decision.source, retain=True)",
+     "    client.publish(LIGHT_SOURCE_TOPIC, decision.source, retain=True)"),
+    ("the owner topic is not retained, so a reconnecting HA is never told who "
+     "holds the lamp",
+     "    client.publish(LIGHT_SOURCE_TOPIC, decision.source, retain=True)",
+     "    client.publish(LIGHT_SOURCE_TOPIC, decision.source)"),
+    ("the owner is published to the wrong topic, which no subscriber reads",
+     "    client.publish(LIGHT_SOURCE_TOPIC, decision.source, retain=True)",
+     '    client.publish(LIGHT_SOURCE_TOPIC + "_x", decision.source, retain=True)'),
+    ("the DECISION's brightness is published instead of the hardware's, so a "
+     "failed drive reads as success",
+     "    duty = light.get_brightness()",
+     "    duty = 100.0"),
+
     # --- reintroduce deleted code (the central risk of this change) ---------
     ("REINTRODUCE the Pump discovery block",
      "    # The Pump discovery block stood here (T-475).",
@@ -178,10 +202,23 @@ MUTANTS = [
      '    (BASE_TOPIC + "/pump/command", 1),',
      '    (BASE_TOPIC + "/pump/command", 0),'),
 
+    # STALE SINCE b95e263, AND THAT IS THE FINDING. T-527.6 inserted the light
+    # SOURCE discovery block between this anchor's two halves, so the anchor
+    # stopped matching and this mutant has been reported NOT APPLIED — i.e.
+    # unverified — ever since, in the same commit that shipped four failing
+    # tests. Re-anchored on the light's own publish_config call, which is what
+    # the mutant is actually about and which no neighbouring insertion can
+    # split.
+    # Anchored on the light's UNIQUE topic rather than on its publish_config
+    # call, because `publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)`
+    # appears four times — the file reuses those two names as scratch
+    # variables for every entity, so any call-site anchor is ambiguous and any
+    # surrounding-context anchor breaks the next time somebody inserts a block
+    # nearby. Announcing under a topic Home Assistant does not read is
+    # equivalent to deleting the entity, from HA's point of view.
     ("delete a SURVIVING discovery block (the light)",
-     "    publish_config(TEMP_CONFIG_TOPIC, temp_config_payload)\n\n"
-     "    # The Pump discovery block stood here (T-475).",
-     "\n    # The Pump discovery block stood here (T-475)."),
+     '    TEMP_CONFIG_TOPIC = "homeassistant/light/gardyn/"+IDENTIFIER+"_light/config"',
+     '    TEMP_CONFIG_TOPIC = "homeassistant/light/gardyn/"+IDENTIFIER+"_gone/config"'),
 
     # --- the interlock: the irreversible action, mutated explicitly ---------
     ("INVERT the interlock's no-reading refusal (fail OPEN on unknown water)",
