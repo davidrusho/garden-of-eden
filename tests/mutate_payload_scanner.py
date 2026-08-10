@@ -79,6 +79,20 @@ MUTANTS = [
      '                    and func.value.id == "logger"):',
      "reports_the_shapes_that_defeated_the_old_one"),
 
+    # Per-NAME, because emptying the set is not the same test as narrowing it,
+    # and narrowing is what actually happened: `fatal` was simply absent.
+    # `debug` and `fatal` stand for the two halves a review found unpinned -
+    # an everyday level, and a deprecated alias.
+    ("a single sink-method name dropped - `debug` stops being a sink",
+     '    "debug", "info", "warning", "warn", "error", "exception", "critical",',
+     '    "info", "warning", "warn", "error", "exception", "critical",',
+     "sink_method_set_is_pinned_AS_A_SET"),
+
+    ("the alias a review found missing goes missing again - `fatal`",
+     '    "fatal", "log",',
+     '    "log",',
+     "sink_method_set_is_pinned_AS_A_SET"),
+
     ("print() dropped as a sink - stdout reaches the journal unwatched",
      '_BARE_CALL_SINKS = frozenset({"print"})',
      "_BARE_CALL_SINKS = frozenset()",
@@ -158,9 +172,22 @@ MUTANTS = [
 #    survivor from test-and-review-code.md: the code under mutation is
 #    redundant, not the test weak.
 #
-# 2. Nothing mutates the sink-method NAMES individually (`debug` vs `warning`
-#    vs `exception`). One mutant emptying _BARE_CALL_SINKS covers the shape;
-#    per-name mutants would test the frozenset literal, not the rule.
+# 2. WITHDRAWN, and it was wrong in the way that matters. It read: "Nothing
+#    mutates the sink-method NAMES individually (`debug` vs `warning` vs
+#    `exception`). One mutant emptying _BARE_CALL_SINKS covers the shape."
+#    _BARE_CALL_SINKS is {"print"} - those three names live in _LOG_METHODS,
+#    which no mutant touched at all. A review swept the set per name and found
+#    SIX of eight pinned by nothing, and the same gap had already let
+#    `logger.fatal` ship missing from the set entirely: a real forgery path,
+#    one word wide. The sentence is exactly what stopped anyone asking whether
+#    the set was COMPLETE. Per-name mutants are below.
+#
+# 3. Nothing mutates the WIDENING direction - a defect of the form "something
+#    is wrongly called safe". A review confirmed several survive
+#    (_SANITISERS gaining "str", _SAFE_FORMAT gaining "s"). Those are guards
+#    against a future edit rather than a present hole, since str(payload) is
+#    correctly RAW today. Declared rather than fixed: the mutant set below
+#    covers the narrowing direction, which is where the shipped defects were.
 
 # Control B. A deliberately broken scanner that MUST score RED, kept distinct
 # from every scored mutant so a failure here is unambiguously the scorer.
@@ -263,10 +290,15 @@ def main():
     sandbox = tempfile.mkdtemp(prefix="mutate-payload-scanner-")
     root = os.path.join(sandbox, "repo")
     try:
-        shutil.copytree(
-            REPO, root,
-            ignore=shutil.ignore_patterns(".git", "__pycache__", "venv", "*.pyc"),
-        )
+        # `shutil.copytree(REPO` stays on ONE line deliberately:
+        # test_suite_isolation.py's test_a_sandboxed_harness_still_works_on_a_copy
+        # asserts that literal, and it is the sole evidence entitling this
+        # harness to sit in SANDBOXED rather than IN_PLACE. Wrapped across two
+        # lines the assertion fails, and the harness keeps its exemption from
+        # the interrupted-battery check while the test earning it is red.
+        shutil.copytree(REPO, root,
+                        ignore=shutil.ignore_patterns(
+                            ".git", "__pycache__", "venv", "*.pyc"))
         target = os.path.join(root, TARGET_REL)
         pristine = open(target).read()
 

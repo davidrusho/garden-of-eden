@@ -315,9 +315,23 @@ _CANONICAL_FORMS = {"!r", "repr()"}
 # green. `print()` and a raised exception's arguments are here for the same
 # reason - both end up in gardyn.log through the service's stdout capture and
 # through on_message's `logger.exception(...)` handler respectively.
+# `fatal` is here because a review found it missing: it is a real method on
+# logging.Logger (an alias for critical, like `warn` is for warning), so
+# `logger.fatal(f"{payload}")` was a live forgery path reachable by one word.
+# The set already carried `warn`, which is what made the omission read as a
+# decision rather than an oversight. Both aliases are deprecated and both
+# still emit.
 _LOG_METHODS = frozenset({
-    "debug", "info", "warning", "warn", "error", "exception", "critical", "log",
+    "debug", "info", "warning", "warn", "error", "exception", "critical",
+    "fatal", "log",
 })
+# print() is a sink, but NOT because it reaches gardyn.log - it does not.
+# mqtt.service sets no StandardOutput=, so systemd's default sends stdout to
+# the journal, while gardyn.log is written only by the logging.FileHandler in
+# mqtt.py. An earlier version of this comment claimed otherwise. The journal
+# is still a durable record a human reads during an incident, which is reason
+# enough; it is simply a different artifact from the one the module docstring's
+# rotation argument is about.
 _BARE_CALL_SINKS = frozenset({"print"})
 
 # WHERE TAINT STOPS. The result of these cannot carry a control character, so
@@ -334,7 +348,7 @@ _SANITISERS = frozenset({"int", "float", "bool", "len", "round", "abs", "ord"})
 # meaningless there, and guessing is how a false negative gets in.
 _PERCENT_SPEC = re.compile(
     r"%(?:\((?P<key>[^)]*)\))?"
-    r"[-#0 +]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[hlL]?"
+    r"[-#0 +]*(?P<width>\*|\d+)?(?:\.(?P<prec>\*|\d+))?[hlL]?"
     r"(?P<conv>[diouxXeEfFgGcrsa%])"
 )
 
@@ -470,13 +484,17 @@ def _percent_conversions(fmt):
     `*` width that consumes an argument and breaks positional matching. The
     caller then falls through to reporting RAW, which is the safe direction.
     """
-    if "*" in fmt:
-        return None
     convs = []
     for match in _PERCENT_SPEC.finditer(fmt):
         if match.group("conv") == "%":
             continue
         if match.group("key") is not None:
+            return None
+        # A `*` WIDTH or PRECISION, not any asterisk in the string. This was
+        # `if "*" in fmt` and a review caught it: "*** rejected %r" bailed to
+        # RAW on correctly-escaped code. Only a star inside a specifier
+        # consumes an argument and breaks positional matching.
+        if "*" in (match.group("width") or "", match.group("prec") or ""):
             return None
         convs.append(match.group("conv"))
     return convs
@@ -533,7 +551,17 @@ def _payload_sinks(func):
         by `logger.exception(f"...: {e}")` is a real forgery path that no AST
         rule can confirm, because whether a given exception's message quotes
         its input is a runtime property of that exception class. mqtt.py:1420
-        is exactly that shape. It is not currently reachable - every int()/
+        is exactly that shape.
+
+        It appears unreachable TODAY, but NOT for the reason this paragraph
+        first gave. It said the int() calls are gated on `.isdigit()`, which
+        is not a guarantee at all: `"\N{SUPERSCRIPT TWO}".isdigit()` is True
+        and int() of it raises, so the exception really does reach :1420. What
+        actually holds is narrower - a string passing `.isdigit()` cannot
+        contain a newline or a carriage return, so the operand CPython quotes
+        into that message cannot break a log line. Right verdict, wrong
+        argument, caught by review. Superseded reasoning, kept visible so the
+        next reader does not restore it: every int()/
         float() over the payload is either gated on `.isdigit()` or caught
         locally and logged with `!r` - but that is a property of today's
         branches, not of the guard. The blanket fix is `{e!r}`, and it is
@@ -682,9 +710,18 @@ def _classify_payload_uses(method, args, kwargs, names=frozenset()):
             pairs.append((conv, node.args[index]))
         if not usable:
             continue
-        for conv, value in pairs:
-            if _carries_taint(value, names) and unclaimed(value):
-                claim(value, value.lineno, _SAFE_FORMAT.get(conv, "RAW"))
+        # Every FIELD gets its verdict before anything is claimed. One
+        # argument can fill two fields - `"{0!r} also at {0}".format(body)` -
+        # and that is ONE AST node, so claiming on the first field made
+        # unclaimed() false for the second and the raw half vanished from the
+        # report while the call was scored as escaped. Found by review; the
+        # forged newline really did reach the record.
+        pending = [(conv, value) for conv, value in pairs
+                   if _carries_taint(value, names) and unclaimed(value)]
+        for conv, value in pending:
+            found.append((value.lineno, _SAFE_FORMAT.get(conv, "RAW")))
+        for _, value in pending:
+            claim(value)
 
     # 5. f-strings.
     for node in walk_all():
@@ -1284,6 +1321,19 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
         def keyword_argument(msg, sink):
             sink.error("nothing raw here", extra={"raw": msg.payload})
 
+        def fatal_alias(msg, sink):
+            # logging.Logger.fatal is a real alias for critical, and it was
+            # missing from the sink set - so this exact line was a live
+            # forgery path reachable by renaming one word. Found by review.
+            sink.fatal("water threshold rejected: %s" % msg.payload.decode())
+
+        def reused_format_argument(msg, sink):
+            # One argument, two fields. The escaped field used to claim the
+            # node and hide the raw one, so this whole call reported as
+            # `{!r}` while half of it reached the record verbatim.
+            body = msg.payload.decode()
+            sink.error("{0!r} also at {0}".format(body))
+
         def printed(msg, sink):
             print(f"stdout is captured into the journal too: {msg.payload}")
 
@@ -1295,7 +1345,8 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
         for shape in (multi_line_fstring, percent_style_lazy_logging,
                       str_format, concatenation, str_conversion,
                       bound_intermediate, renamed_local, taint_through_a_chain,
-                      taint_through_nested_blocks,
+                      taint_through_nested_blocks, fatal_alias,
+                      reused_format_argument,
                       attribute_receiver, module_level_logging,
                       keyword_argument, printed, raised):
             with self.subTest(shape=shape.__name__):
@@ -1397,11 +1448,18 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
         def format_ascii(msg, sink):
             sink.error("bad: {0!a}".format(msg.payload))
 
+        def literal_stars_are_not_a_star_width(msg, sink):
+            # `if "*" in fmt` bailed on this and called correctly-escaped code
+            # RAW. Only a star inside a specifier consumes an argument.
+            sink.error("*** rejected %r ***" % msg.payload)
+
         expected = {"percent_repr": "%r", "percent_ascii": "%a",
                     "percent_lazy_repr": "%r", "format_repr": "{!r}",
-                    "format_ascii": "{!a}"}
+                    "format_ascii": "{!a}",
+                    "literal_stars_are_not_a_star_width": "%r"}
         for shape in (percent_repr, percent_ascii, percent_lazy_repr,
-                      format_repr, format_ascii):
+                      format_repr, format_ascii,
+                      literal_stars_are_not_a_star_width):
             with self.subTest(shape=shape.__name__):
                 forms = [form for _, form, _ in _payload_sinks(shape)]
                 self.assertEqual([expected[shape.__name__]], forms)
@@ -1438,6 +1496,43 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
             "the string instead of the one that matches its position calls "
             "this escaped when it is not",
         )
+
+    def test_the_sink_method_set_is_pinned_AS_A_SET_and_every_name_is_real(self):
+        """Six of the eight names in _LOG_METHODS were pinned by nothing, and
+        `fatal` was missing from it entirely - a live forgery path one word
+        wide. A review swept the set per name and found both.
+
+        The set is asserted as a WHOLE against a literal, not iterated over.
+        Iterating would be self-referential: dropping a name would delete its
+        own case and the test would stay green, which is how the omission
+        survived in the first place. Each name is then checked twice - that
+        logging.Logger really has it, so the set cannot accumulate names that
+        do nothing, and that _sink_calls actually treats it as a sink, so a
+        name can be in the set and still be unwired.
+        """
+        import logging
+
+        self.assertEqual(
+            ("critical", "debug", "error", "exception", "fatal", "info",
+             "log", "warn", "warning"),
+            tuple(sorted(_LOG_METHODS)),
+            "the sink-method set changed. Adding a name is fine; REMOVING one "
+            "opens a forgery path, which is what happened with `fatal`",
+        )
+
+        for method in sorted(_LOG_METHODS):
+            with self.subTest(method=method):
+                self.assertTrue(
+                    callable(getattr(logging.Logger, method, None)),
+                    f"logging.Logger has no {method}(), so this name in the "
+                    f"set matches calls that are not log sinks at all",
+                )
+                tree = ast.parse(f"sink.{method}(f'raw: {{body}}')")
+                self.assertEqual(
+                    [method], [m for m, _, _ in _sink_calls(tree)],
+                    f"{method} is in _LOG_METHODS but _sink_calls does not "
+                    f"yield it, so nothing in the set reaches the scanner",
+                )
 
     def test_taint_stops_at_a_numeric_conversion(self):
         """Without this the scanner reddens correct shipping code.
