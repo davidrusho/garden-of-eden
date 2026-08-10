@@ -145,6 +145,8 @@ Run:  python3 -m unittest tests.test_connack_refusal
 
 import ast
 import inspect
+import re
+import string
 import textwrap
 import unittest
 from unittest.mock import MagicMock, patch
@@ -296,19 +298,200 @@ def call_on_disconnect_as_paho_does(client, rc, userdata=None,
 # separate those two verdicts instead of conflating them.
 _SAFE_CONVERSIONS = {ord("r"): "!r", ord("a"): "!a"}
 _SAFE_WRAPPERS = {"repr": "repr()", "ascii": "ascii()"}
+# The same escaping reached through the other two formatting syntaxes. Until
+# T-527.17 the scanner understood neither, so `"%r" % payload`,
+# `logger.error("%r", payload)` and `"{!r}".format(payload)` were all reported
+# RAW - four false alarms telling the next reader that correct, escaped code
+# was a remote log-forgery path. A check that cries wolf on shipping code is
+# the kind that gets deleted rather than fixed.
+_SAFE_PERCENT = {"r": "%r", "a": "%a"}
+_SAFE_FORMAT = {"r": "{!r}", "a": "{!a}"}
 _CANONICAL_FORMS = {"!r", "repr()"}
 
+# WHAT COUNTS AS A SINK. Matched on the METHOD NAME against any receiver, not
+# on the receiver being spelled `logger`. Keying on the receiver is what made
+# T-527.17's H2 escape work: renaming a local and reaching a sink through
+# `self.logger`, `logging` or `log` disarmed the rule with 32 tests still
+# green. `print()` and a raised exception's arguments are here for the same
+# reason - both end up in gardyn.log through the service's stdout capture and
+# through on_message's `logger.exception(...)` handler respectively.
+_LOG_METHODS = frozenset({
+    "debug", "info", "warning", "warn", "error", "exception", "critical", "log",
+})
+_BARE_CALL_SINKS = frozenset({"print"})
 
-def _mentions_payload(node):
-    return any(_is_payload_reference(sub) for sub in ast.walk(node))
+# WHERE TAINT STOPS. The result of these cannot carry a control character, so
+# a value derived through one of them cannot forge a line. This is not a
+# nicety: mqtt.py binds `requested = int(payload)`, `brightness = int(payload)`
+# and `candidate = float(payload)`, and `WATER_LOW_CM` descends from the last
+# of those and is logged at mqtt.py:1405. Without this set the propagation
+# below reddens correct shipping code, which is the direction that gets a
+# check deleted rather than fixed.
+_SANITISERS = frozenset({"int", "float", "bool", "len", "round", "abs", "ord"})
+
+# `%`-format specifiers, in the order they appear. Deliberately rejects the
+# mapping form `%(name)s` by capturing it and bailing - positional matching is
+# meaningless there, and guessing is how a false negative gets in.
+_PERCENT_SPEC = re.compile(
+    r"%(?:\((?P<key>[^)]*)\))?"
+    r"[-#0 +]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[hlL]?"
+    r"(?P<conv>[diouxXeEfFgGcrsa%])"
+)
+
+
+def _log_it(value):
+    """Stand-in for a helper that logs, used by one fixture below.
+
+    Never called - the fixture is read with inspect.getsource() and parsed,
+    never executed - but defined so the module has no undefined name in it.
+    """
+    raise AssertionError("fixture helper is parsed, never run")
+
+
+def _is_taint_seed(node):
+    """The two places untrusted bytes ENTER, independent of what they get called.
+
+    `msg.payload` is the real one - paho hands the callback an object and the
+    bytes are an attribute of it. A bare name `payload` is kept because
+    mqtt.py binds it at on_message's first statement and several tests below
+    hand one straight in as a parameter.
+
+    Seeding on the SOURCE rather than on the spelling is the whole T-527.17
+    H2 fix: `body = msg.payload.decode()` is tainted because of where it came
+    from, so a rename cannot disarm the rule.
+    """
+    return ((isinstance(node, ast.Name) and node.id == "payload")
+            or (isinstance(node, ast.Attribute) and node.attr == "payload"))
+
+
+def _is_payload_reference(node, names=frozenset()):
+    return _is_taint_seed(node) or (isinstance(node, ast.Name)
+                                    and node.id in names)
+
+
+def _carries_taint(node, names):
+    """Does evaluating `node` produce something a remote client controls?
+
+    Short-circuits at a sanitiser, which is why it recurses through
+    iter_child_nodes rather than using ast.walk - `int(payload)` must claim
+    its whole subtree, not merely fail to match at the top.
+    """
+    if node is None:
+        return False
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in _SANITISERS):
+        return False
+    if _is_payload_reference(node, names):
+        return True
+    return any(_carries_taint(child, names)
+               for child in ast.iter_child_nodes(node))
+
+
+def _bindings(node):
+    """(target names, value expression) for every statement that binds a name.
+
+    Covers assignment in its four spellings plus `for` and `with`, which bind
+    without looking like it. NOT covered, and stated here rather than left to
+    be discovered: `except ... as e`, subscript and attribute targets, and
+    anything binding inside a comprehension. See the boundary list on
+    _payload_sinks().
+    """
+    def names_in(target):
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [n for elt in target.elts for n in names_in(elt)]
+        return []
+
+    if isinstance(node, ast.Assign):
+        return [n for t in node.targets for n in names_in(t)], node.value
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+        return names_in(node.target), node.value
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        return names_in(node.target), node.iter
+    if isinstance(node, ast.withitem):
+        return names_in(node.optional_vars), node.context_expr
+    return [], None
+
+
+def _tainted_names(tree):
+    """Every local that carries remote bytes, by transitive assignment.
+
+    Fixpoint rather than a single pass, so a chain (`raw = msg.payload`,
+    `body = raw.decode()`, `trimmed = body.strip()`) is followed however long
+    it is and whatever order the statements appear in. Flow-insensitive on
+    purpose: a name tainted anywhere in the function is treated as tainted
+    everywhere, which over-reports rather than under-reports.
+    """
+    names = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            targets, value = _bindings(node)
+            if value is None or not _carries_taint(value, names):
+                continue
+            for name in targets:
+                if name not in names:
+                    names.add(name)
+                    changed = True
+    return frozenset(names)
+
+
+def _sink_calls(tree):
+    """Every sink, as (method name, positional args, keyword value nodes).
+
+    Yielded per CALL rather than per argument, because %-style lazy logging -
+    `logger.error("bad: %r", payload)`, the idiom the logging docs recommend -
+    spreads the format string and the value it escapes across two arguments of
+    the same call. An argument-at-a-time scanner cannot see that the payload
+    landed in an `%r` slot, so it reported the most common escaped spelling in
+    the language as RAW.
+
+    Keyword arguments are included: unscanned before T-527.17, so
+    `logger.error("...", extra={"raw": payload})` slipped past entirely.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in _LOG_METHODS:
+                yield func.attr, node.args, [kw.value for kw in node.keywords]
+            elif (isinstance(func, ast.Name)
+                    and func.id in _BARE_CALL_SINKS):
+                yield func.id, node.args, [kw.value for kw in node.keywords]
+        elif isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+            yield "raise", node.exc.args, [kw.value for kw in node.exc.keywords]
+
+
+def _percent_conversions(fmt):
+    """The conversion character of each `%` placeholder, in order.
+
+    None means "do not analyse this one" - a mapping-keyed format string, or a
+    `*` width that consumes an argument and breaks positional matching. The
+    caller then falls through to reporting RAW, which is the safe direction.
+    """
+    if "*" in fmt:
+        return None
+    convs = []
+    for match in _PERCENT_SPEC.finditer(fmt):
+        if match.group("conv") == "%":
+            continue
+        if match.group("key") is not None:
+            return None
+        convs.append(match.group("conv"))
+    return convs
+
+
+def _mentions_payload(node, names=frozenset()):
+    return any(_is_payload_reference(sub, names) for sub in ast.walk(node))
 
 
 def _payload_sinks(func):
-    """Every place a logger.*() call in `func` puts the payload into a record.
+    """Every place `func` puts remote-controlled bytes into a durable record.
 
     Returns [(lineno, form, source_line)], where `form` is how that occurrence
-    is escaped - '!r', '!a', 'repr()', 'ascii()' - or 'RAW' for an occurrence
-    that reaches the record byte for byte.
+    is escaped - '!r', '!a', 'repr()', 'ascii()', '%r', '%a', '{!r}', '{!a}' -
+    or 'RAW' for an occurrence that reaches the record byte for byte.
 
     AST, NOT A LINE FILTER, and the difference is the whole point. The filter
     this replaces kept lines containing both 'logger.' and '{payload}', which
@@ -318,69 +501,204 @@ def _payload_sinks(func):
     planted there with the whole suite staying green. Measured before this was
     rewritten, not assumed: 23 tests, OK.
 
-    'RAW' covers every shape that filter also could not see - %-style lazy
-    logging (`logger.error("...%s", payload)`, which logging interpolates in
-    getMessage()), str.format(), plain concatenation, and `{payload!s}`. The
-    test below this one is the positive control that it really reports them.
+    TAINT, NOT A NAME (T-527.17). The version before this one matched the
+    literal identifier `payload` at a call whose receiver was spelled
+    `logger`, and both halves were escapable by writing ordinary code:
+
+        requested = payload                            # H1, a bound local
+        logger.error(f"Unsupported effect: {requested}")
+
+        body = msg.payload.decode()                    # H2, a rename
+        self.logger.error(f"bad: {body}")
+
+    Both were CONFIRMED by running - the first left all four scored suites at
+    `Ran 175 tests ... OK` with a live forgery in the tree, the second needed
+    only a no-op refactor of a local. 13 of 18 measured shapes escaped. So the
+    seed is now the SOURCE (`msg.payload`, or a parameter named `payload`),
+    taint follows assignments to a fixpoint, and a sink is any of the logging
+    method names on ANY receiver, plus `print`, plus a raised exception's
+    arguments - keyword arguments included.
+
+    WHAT IT STILL CANNOT SEE, stated specifically because the acceptance for
+    T-527.17 asks for it and because a guard that overstates its reach is what
+    stops the next reader looking:
+
+      * A sink in a HELPER the function calls. This is intraprocedural; a
+        tainted value passed to `_log_rejection(payload)` is invisible here.
+      * Taint through a CONTAINER or an attribute - `d["raw"] = payload`,
+        `self.last = payload`, `items.append(payload)`. Only plain name
+        binding propagates.
+      * Taint carried by an EXCEPTION. `int(payload)` raises a ValueError
+        whose str() embeds the operand, so `except Exception as e:` followed
+        by `logger.exception(f"...: {e}")` is a real forgery path that no AST
+        rule can confirm, because whether a given exception's message quotes
+        its input is a runtime property of that exception class. mqtt.py:1420
+        is exactly that shape. It is not currently reachable - every int()/
+        float() over the payload is either gated on `.isdigit()` or caught
+        locally and logged with `!r` - but that is a property of today's
+        branches, not of the guard. The blanket fix is `{e!r}`, and it is
+        filed against T-527.12, which already touches this file.
+      * A format string that is not a literal, `%`-formatting with a mapping
+        key or a `*` width, and `.format()` with keyword fields or a splat.
+        Each of those bails to RAW rather than guessing, so they are loud.
+      * `%s`-vs-`%r` position matching assumes the argument tuple lines up
+        with the specifiers. A mismatched count bails to RAW.
+
+    The tests below this one are the positive and negative controls that it
+    really reports the shapes it claims, and really does not report the ones
+    it claims are safe.
     """
     source = textwrap.dedent(inspect.getsource(func))
     lines = source.splitlines()
+    tree = ast.parse(source)
+    names = _tainted_names(tree)
     found = []
-    for node in ast.walk(ast.parse(source)):
-        if not (isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "logger"):
-            continue
-        for arg in node.args:
-            found.extend(_classify_payload_uses(arg))
+    for method, args, kwargs in _sink_calls(tree):
+        found.extend(_classify_payload_uses(method, args, kwargs, names))
     return [(lineno, form, lines[lineno - 1].strip())
             for lineno, form in sorted(found)]
 
 
-def _classify_payload_uses(arg):
-    """One logging argument -> [(lineno, form)] for each payload occurrence.
+def _classify_payload_uses(method, args, kwargs, names=frozenset()):
+    """One sink call -> [(lineno, form)] for each tainted occurrence in it.
 
-    Three passes, and the ORDER matters. Wrappers are claimed first, because a
+    Six passes over the call's arguments, and the ORDER matters. Lazy logging
+    is claimed first because it is the only pass that needs the call's shape
+    rather than one argument's. Sanitisers and wrappers come next, because
     `repr(payload)` sits inside a FormattedValue carrying no conversion of its
     own - scanning the f-string first reports that as RAW and then reports the
     repr() separately, which is one false alarm and one missed accounting from
-    a single expression. Whatever no pass has claimed by the end is reported
-    RAW: reporting the REMAINDER rather than enumerating known-bad shapes means
-    a shape nobody thought of comes out as RAW by default rather than as
+    a single expression. The two in-argument formatting syntaxes follow, then
+    f-strings, and whatever no pass has claimed by the end is reported RAW:
+    reporting the REMAINDER rather than enumerating known-bad shapes means a
+    shape nobody thought of comes out as RAW by default rather than as
     silence, which is the failure the line filter had.
     """
     accounted, found = set(), []
+    every_arg = list(args) + list(kwargs)
 
-    def claim(node, lineno, form):
-        found.append((lineno, form))
+    def claim(node, lineno=None, form=None):
+        """Account for a subtree, optionally reporting how it was escaped.
+
+        The no-form call is pass 1's: a sanitiser's subtree is claimed so no
+        later pass reports the payload inside it, and there is nothing to
+        report about it, so `lineno` is not required either.
+        """
+        if form is not None:
+            found.append((lineno, form))
         accounted.update(id(sub) for sub in ast.walk(node))
 
-    for node in ast.walk(arg):
+    def unclaimed(node):
+        return any(id(sub) not in accounted for sub in ast.walk(node)
+                   if _is_payload_reference(sub, names))
+
+    def walk_all():
+        for argument in every_arg:
+            yield from ast.walk(argument)
+
+    # 0. %-style LAZY LOGGING, the idiom the logging docs recommend and the
+    #    one an argument-at-a-time scanner structurally cannot read:
+    #
+    #        logger.error("rejected %r on %s", payload, topic)
+    #
+    #    logging does the interpolation itself inside getMessage(), so the
+    #    format string is args[0] (args[1] for logger.log(), whose first
+    #    argument is the level) and the values fill its specifiers in order.
+    #    Matched by POSITION, never by whether an `%r` appears somewhere in
+    #    the string - "at %s on %r" escapes the second argument and not the
+    #    first, and a presence test would call both of them safe.
+    offset = 1 if method == "log" else 0
+    if len(args) > offset:
+        template = args[offset]
+        values = args[offset + 1:]
+        if isinstance(template, ast.Constant) and isinstance(template.value, str):
+            convs = _percent_conversions(template.value)
+            if convs and len(convs) == len(values):
+                for conv, value in zip(convs, values):
+                    if _carries_taint(value, names):
+                        claim(value, value.lineno,
+                              _SAFE_PERCENT.get(conv, "RAW"))
+
+    # 1. Sanitisers. int(payload) cannot carry a control character, so the
+    #    whole subtree is claimed and nothing is reported for it.
+    for node in walk_all():
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in _SANITISERS):
+            claim(node)
+
+    # 2. repr() / ascii() wrappers.
+    for node in walk_all():
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id in _SAFE_WRAPPERS):
             for wrapped in node.args:
-                if _mentions_payload(wrapped):
+                if _mentions_payload(wrapped, names) and unclaimed(wrapped):
                     claim(wrapped, node.lineno, _SAFE_WRAPPERS[node.func.id])
 
-    for node in ast.walk(arg):
+    # 3. "..." % (...) - positional, so the specifier is matched to the
+    #    argument that fills it rather than assumed.
+    for node in walk_all():
+        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod)
+                and isinstance(node.left, ast.Constant)
+                and isinstance(node.left.value, str)):
+            continue
+        convs = _percent_conversions(node.left.value)
+        if convs is None:
+            continue
+        values = (node.right.elts if isinstance(node.right, ast.Tuple)
+                  else [node.right])
+        if len(values) != len(convs):
+            continue
+        for conv, value in zip(convs, values):
+            if _carries_taint(value, names) and unclaimed(value):
+                claim(value, value.lineno, _SAFE_PERCENT.get(conv, "RAW"))
+
+    # 4. "...".format(...) - same, via the stdlib's own field parser so the
+    #    grammar cannot drift from what str.format actually accepts.
+    for node in walk_all():
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "format"
+                and isinstance(node.func.value, ast.Constant)
+                and isinstance(node.func.value.value, str)):
+            continue
+        if node.keywords or any(isinstance(a, ast.Starred) for a in node.args):
+            continue
+        auto, pairs, usable = 0, [], True
+        for _, field, _, conv in string.Formatter().parse(node.func.value.value):
+            if field is None:
+                continue
+            head = field.split(".")[0].split("[")[0]
+            if head == "":
+                index, auto = auto, auto + 1
+            elif head.isdigit():
+                index = int(head)
+            else:
+                usable = False
+                break
+            if index >= len(node.args):
+                usable = False
+                break
+            pairs.append((conv, node.args[index]))
+        if not usable:
+            continue
+        for conv, value in pairs:
+            if _carries_taint(value, names) and unclaimed(value):
+                claim(value, value.lineno, _SAFE_FORMAT.get(conv, "RAW"))
+
+    # 5. f-strings.
+    for node in walk_all():
         if (isinstance(node, ast.FormattedValue)
-                and _mentions_payload(node.value)
-                and any(id(sub) not in accounted for sub in ast.walk(node.value)
-                        if _is_payload_reference(sub))):
+                and _mentions_payload(node.value, names)
+                and unclaimed(node.value)):
             claim(node.value, node.lineno,
                   _SAFE_CONVERSIONS.get(node.conversion, "RAW"))
 
-    for node in ast.walk(arg):
-        if id(node) not in accounted and _is_payload_reference(node):
+    # 6. The remainder. Anything tainted that no pass above explained.
+    for node in walk_all():
+        if id(node) not in accounted and _is_payload_reference(node, names):
             found.append((node.lineno, "RAW"))
     return found
-
-
-def _is_payload_reference(node):
-    return ((isinstance(node, ast.Name) and node.id == "payload")
-            or (isinstance(node, ast.Attribute) and node.attr == "payload"))
 
 
 class ConnackTestBase(unittest.TestCase):
@@ -897,27 +1215,89 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
         shape gets fed to the scanner directly, including the four the line
         filter missed: the multi-line f-string, %-style lazy logging,
         str.format(), and concatenation.
+
+        NOT ONE OF THESE FIXTURES IS SPELLED THE WAY THE SCANNER USED TO
+        REQUIRE, and that is the T-527.17 M1 fix rather than a style choice.
+        Every fixture here previously took parameters named exactly `payload`
+        and `logger` - the two names the old scanner matched on - so the
+        control supplied the scanner with the only two things it could read
+        and could therefore only vary the dimension already handled. That is
+        the "assertion satisfied by the test's own input" shape, and it is why
+        two confirmed escapes lived under a green control. These take `msg`
+        and a receiver named `sink`, so the taint has to be found through
+        `msg.payload` and the sink through a name the scanner does not know.
         """
-        def multi_line_fstring(payload, logger):
-            logger.error(
-                f"Rejecting water low threshold {payload} - "
+        def multi_line_fstring(msg, sink):
+            body = msg.payload.decode()
+            sink.error(
+                f"Rejecting water low threshold {body} - "
                 f"must be a number"
             )
 
-        def percent_style_lazy_logging(payload, logger):
-            logger.error("Rejecting water low threshold %s", payload)
+        def percent_style_lazy_logging(msg, sink):
+            sink.error("Rejecting water low threshold %s", msg.payload)
 
-        def str_format(payload, logger):
-            logger.error("Rejecting water low threshold {}".format(payload))
+        def str_format(msg, sink):
+            sink.error("Rejecting water low threshold {}".format(msg.payload))
 
-        def concatenation(payload, logger):
-            logger.error("Rejecting water low threshold " + payload)
+        def concatenation(msg, sink):
+            sink.error("Rejecting water low threshold " + msg.payload)
 
-        def str_conversion(payload, logger):
-            logger.error(f"Rejecting water low threshold {payload!s}")
+        def str_conversion(msg, sink):
+            sink.error(f"Rejecting water low threshold {msg.payload!s}")
+
+        def bound_intermediate(msg, sink):
+            # H1, confirmed by running: the normal way a new branch gets
+            # written. Left all four scored suites at `Ran 175 tests ... OK`
+            # with a live forgery in the tree.
+            requested = msg.payload
+            sink.error(f"Unsupported light effect: {requested}")
+
+        def renamed_local(msg, sink):
+            # H2: a no-op refactor of the local disarmed the whole rule.
+            body = msg.payload.decode("utf-8").strip()
+            sink.error(f"bad: {body}")
+
+        def taint_through_a_chain(msg, sink):
+            raw = msg.payload
+            decoded = raw.decode()
+            trimmed = decoded.strip()
+            sink.warning(f"three hops from the wire: {trimmed}")
+
+        def taint_through_nested_blocks(msg, sink):
+            # The fixpoint's reason for existing, and it took a surviving
+            # mutant to find a case that needs it. ast.walk is BREADTH-first,
+            # not source order, so the depth-2 assignment below is visited
+            # AFTER the depth-1 one that consumes it. A single pass sees `raw`
+            # as untainted at the moment it processes `body` and stops there.
+            if msg.topic:
+                raw = msg.payload
+            body = raw.decode()
+            sink.error(f"across two nesting levels: {body}")
+
+        def attribute_receiver(msg, self_like):
+            self_like.logger.error(f"through self.logger: {msg.payload}")
+
+        def module_level_logging(msg, logging_mod):
+            logging_mod.error("through the logging module: %s", msg.payload)
+
+        def keyword_argument(msg, sink):
+            sink.error("nothing raw here", extra={"raw": msg.payload})
+
+        def printed(msg, sink):
+            print(f"stdout is captured into the journal too: {msg.payload}")
+
+        def raised(msg, sink):
+            # on_message wraps everything in `except Exception as e:` and logs
+            # it, so a raised message is a sink one indirection away.
+            raise ValueError(f"cannot parse {msg.payload}")
 
         for shape in (multi_line_fstring, percent_style_lazy_logging,
-                      str_format, concatenation, str_conversion):
+                      str_format, concatenation, str_conversion,
+                      bound_intermediate, renamed_local, taint_through_a_chain,
+                      taint_through_nested_blocks,
+                      attribute_receiver, module_level_logging,
+                      keyword_argument, printed, raised):
             with self.subTest(shape=shape.__name__):
                 forms = [form for _, form, _ in _payload_sinks(shape)]
                 self.assertIn(
@@ -926,11 +1306,71 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
                     f"{shape.__name__}, so a clean report from it means nothing",
                 )
 
+    def test_the_control_fixtures_do_not_hand_the_scanner_the_names_it_reads(self):
+        """Pins the T-527.17 M1 fix, which nothing else can see.
+
+        The control above is only a control while its fixtures are spelled in
+        a way the scanner does not already special-case. Every one of them
+        used to take parameters named `payload` and `logger` - the two names
+        the old scanner matched on - so the control supplied the scanner with
+        its own answer and could only ever vary the dimension already handled.
+        Two confirmed forgery escapes lived underneath it, green.
+
+        Nothing about that failure is visible from reading either the control
+        or the scanner: both are correct in isolation, and the defect is only
+        in their relationship. A mutant renaming a fixture parameter back to
+        `payload` would restore the blind spot and no other assertion in this
+        file would move. So the relationship is asserted directly.
+        """
+        control = self.test_the_payload_sink_scanner_reports_the_shapes_that_defeated_the_old_one
+        tree = ast.parse(textwrap.dedent(inspect.getsource(control)))
+        fixtures = [n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name != control.__name__]
+        self.assertGreaterEqual(len(fixtures), 13, "fixtures went missing")
+
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture.name):
+                params = [a.arg for a in fixture.args.args]
+                self.assertNotIn(
+                    "payload", params,
+                    "this fixture hands the scanner a parameter named exactly "
+                    "`payload`, which is one of its two taint seeds - so it "
+                    "can no longer prove the scanner finds taint any OTHER "
+                    "way, which is the whole point of the control",
+                )
+                # Every NAME anywhere in the receiver expression, not just a
+                # bare `logger.error(...)`. A surviving mutant found this:
+                # renaming a fixture's parameter so it reached its sink as
+                # `logger.logger.error(...)` left the receiver an Attribute
+                # rather than a Name, and the narrower comprehension this
+                # replaces could not see it at all.
+                receivers = {
+                    name.id
+                    for node in ast.walk(fixture)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    for name in ast.walk(node.func.value)
+                    if isinstance(name, ast.Name)
+                }
+                self.assertNotIn(
+                    "logger", receivers,
+                    "this fixture reaches its sink through a receiver spelled "
+                    "`logger`, the name the pre-T-527.17 scanner required. A "
+                    "control that only exercises the recognised spelling "
+                    "cannot fail for the reason it exists",
+                )
+
     def test_the_payload_sink_scanner_does_not_cry_wolf_over_escaped_ones(self):
         """The other half of the control. A scanner that reported RAW for
         everything would pass the case above and be equally useless - it would
         redden on the shipping code, which is the direction that gets a check
-        deleted rather than fixed."""
+        deleted rather than fixed.
+
+        The last four forms are the T-527.17 M2 fix. `%r`, `%a`, `{!r}` and
+        `{!a}` escape exactly as `!r` does and were all reported RAW, so the
+        failure message told the reader that four correctly-escaped spellings
+        were remote forgery paths.
+        """
         def every_escaped_form(payload, logger):
             logger.error(f"a {payload!r} b {payload!a} c {repr(payload)} "
                          f"d {ascii(payload)}")
@@ -938,6 +1378,144 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
         forms = [form for _, form, _ in _payload_sinks(every_escaped_form)]
         self.assertNotIn("RAW", forms, forms)
         self.assertEqual(["!a", "!r", "ascii()", "repr()"], sorted(forms))
+
+    def test_the_other_two_formatting_syntaxes_escape_too(self):
+        """T-527.17 M2. Each of these was reported RAW before the scanner
+        learned to read a format string positionally."""
+        def percent_repr(msg, sink):
+            sink.error("bad: %r" % msg.payload)
+
+        def percent_ascii(msg, sink):
+            sink.error("bad: %a" % msg.payload)
+
+        def percent_lazy_repr(msg, sink):
+            sink.error("bad: %r", msg.payload)
+
+        def format_repr(msg, sink):
+            sink.error("bad: {!r}".format(msg.payload))
+
+        def format_ascii(msg, sink):
+            sink.error("bad: {0!a}".format(msg.payload))
+
+        expected = {"percent_repr": "%r", "percent_ascii": "%a",
+                    "percent_lazy_repr": "%r", "format_repr": "{!r}",
+                    "format_ascii": "{!a}"}
+        for shape in (percent_repr, percent_ascii, percent_lazy_repr,
+                      format_repr, format_ascii):
+            with self.subTest(shape=shape.__name__):
+                forms = [form for _, form, _ in _payload_sinks(shape)]
+                self.assertEqual([expected[shape.__name__]], forms)
+
+    def test_a_mixed_format_string_is_matched_by_POSITION_not_by_presence(self):
+        """The reason pass 3 parses specifiers in order instead of asking
+        whether the string contains an `%r` anywhere.
+
+        A presence test would call both of these safe. Only one of them is.
+        """
+        def payload_at_the_escaped_slot(msg, sink):
+            sink.error("at %r on %s", msg.payload, "topic")
+
+        def payload_at_the_raw_slot(msg, sink):
+            sink.error("at %s on %r", msg.payload, "topic")
+
+        def payload_SECOND_at_the_raw_slot(msg, sink):
+            # The case the first pair cannot distinguish, and a surviving
+            # mutant is what found it. In both fixtures above the payload is
+            # argument ONE, so reading `convs[0]` instead of the specifier
+            # that actually matches it gives the right answer by accident.
+            # Here the two disagree: convs[0] is `r`, and the payload lands in
+            # the `%s` slot.
+            sink.error("at %r on %s", "topic", msg.payload)
+
+        self.assertEqual(
+            ["%r"], [f for _, f, _ in _payload_sinks(payload_at_the_escaped_slot)])
+        self.assertEqual(
+            ["RAW"], [f for _, f, _ in _payload_sinks(payload_at_the_raw_slot)])
+        self.assertEqual(
+            ["RAW"],
+            [f for _, f, _ in _payload_sinks(payload_SECOND_at_the_raw_slot)],
+            "the payload is in the %s slot; reading the first specifier in "
+            "the string instead of the one that matches its position calls "
+            "this escaped when it is not",
+        )
+
+    def test_taint_stops_at_a_numeric_conversion(self):
+        """Without this the scanner reddens correct shipping code.
+
+        mqtt.py binds `candidate = float(payload)` at 1367 and logs a value
+        derived from it at 1405; `requested = int(payload)` and `brightness =
+        int(payload)` are the same shape. An int cannot carry a newline, so
+        propagating taint through one would report a forgery path that does
+        not exist - and a check that cries wolf on shipping code is the kind
+        that gets deleted rather than fixed.
+        """
+        def sanitised(msg, sink):
+            candidate = float(msg.payload)
+            sink.info(f"threshold now {candidate:.2f}cm")
+
+        def sanitised_inline(msg, sink):
+            sink.info(f"speed {int(msg.payload)}")
+
+        self.assertEqual([], _payload_sinks(sanitised))
+        self.assertEqual([], _payload_sinks(sanitised_inline))
+
+    def test_the_real_on_message_is_clean_under_the_widened_scanner(self):
+        """The widening is only trustworthy if it did not also start lying.
+
+        Separate from the shipping-code test above it because that one asserts
+        the RULE and this one asserts that widening the rule did not change
+        the verdict on the code it has always covered. If this goes red while
+        that one is green, the new passes have introduced a false positive.
+        """
+        forms = [(lineno, form, line) for lineno, form, line
+                 in _payload_sinks(mqtt_mod.on_message) if form == "RAW"]
+        self.assertEqual([], forms)
+
+    def test_the_boundaries_the_scanner_DOES_NOT_see_are_pinned_as_such(self):
+        """A guard that overstates its reach is what stops the next reader
+        looking, so _payload_sinks()'s docstring enumerates what it cannot
+        see - and a docstring is a claim until something checks it.
+
+        These assert the LIMITATION. Each is a real forgery path that this
+        scanner reports clean, and each is listed in that docstring. If one of
+        these ever goes red, that is good news and the docstring is now wrong:
+        delete the case and delete the corresponding bullet, together.
+        """
+        def sink_in_a_helper(msg, sink):
+            _log_it(msg.payload)
+
+        def taint_through_a_container(msg, sink):
+            box = {}
+            box["raw"] = msg.payload
+            sink.error(f"via a dict: {box['raw']}")
+
+        def taint_through_an_exception(msg, sink):
+            try:
+                value = int(msg.payload)
+            except ValueError as exc:
+                sink.exception(f"cannot parse: {exc}")
+
+        def non_literal_format_string(msg, sink, template):
+            sink.error(template % msg.payload)
+
+        for shape in (sink_in_a_helper, taint_through_a_container,
+                      taint_through_an_exception):
+            with self.subTest(shape=shape.__name__):
+                forms = [form for _, form, _ in _payload_sinks(shape)]
+                self.assertNotIn(
+                    "RAW", forms,
+                    f"{shape.__name__} is now VISIBLE to the scanner. That is "
+                    f"an improvement - remove this case and the matching "
+                    f"bullet from _payload_sinks()'s docstring together, so "
+                    f"the two cannot disagree about what it covers",
+                )
+
+        self.assertEqual(
+            ["RAW"],
+            [f for _, f, _ in _payload_sinks(non_literal_format_string)],
+            "a format string the scanner cannot read must bail to RAW rather "
+            "than to silence - guessing is how a false negative gets in",
+        )
 
     def test_every_payload_sink_uses_the_canonical_repr_spelling(self):
         """Separate from the safety test above, and reported separately,

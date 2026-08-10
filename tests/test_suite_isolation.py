@@ -429,7 +429,14 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                  # the live tree, and its docstring's argument for doing so —
                  # "a sandbox buys nothing here" — was disproved by a reviewer
                  # simply running the battery from a copy.
-                 "mutate_light_schedule.py"}
+                 "mutate_light_schedule.py",
+                 # T-527.17. The only harness whose TARGET is a test file
+                 # rather than a shipping one: it mutates the payload-sink
+                 # scanner in tests/test_connack_refusal.py. A battery over
+                 # mqtt.py structurally cannot narrow the rule that reads
+                 # mqtt.py, which is how that scanner shipped with two
+                 # confirmed forgery escapes under a green control.
+                 "mutate_payload_scanner.py"}
 
     # Harnesses that also DELETE a file rather than only editing one. The
     # restore path for a deletion is different code (move to a stash, copy
