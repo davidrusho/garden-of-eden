@@ -340,6 +340,41 @@ MUTANTS = [
         '        {"gpiozero", "paho", "flask", "dotenv", "mqtt", "app", "config"}\n'
         "    )",
     ),
+    # --- T-527.14: the DST table and the derivation that pins it -----------
+    #
+    # The table is PROSE inside a docstring, which is exactly why it went
+    # unpinned and why an earlier version of it shipped naming one hour for
+    # both transitions. These first three mutants perturb the prose; they are
+    # only killable because a test now parses and re-derives it. Before
+    # T-527.14 all three would have survived in silence.
+    (
+        "DST table: the skipped hour is restated as the repeated one "
+        "(the exact error that shipped)",
+        "      spring forward  2026-03-08  01:00 MST -> 03:00 MDT   02:00-02:59 SKIPPED",
+        "      spring forward  2026-03-08  01:00 MST -> 03:00 MDT   01:00-01:59 SKIPPED",
+    ),
+    (
+        "DST table: the fall-back DATE drifts a week",
+        "      fall back       2026-11-01  01:00 MDT -> 01:00 MST   01:00-01:59 REPEATED",
+        "      fall back       2026-11-08  01:00 MDT -> 01:00 MST   01:00-01:59 REPEATED",
+    ),
+    (
+        "DST table: the two transitions swap KIND, so the gap is called a fold",
+        "      fall back       2026-11-01  01:00 MDT -> 01:00 MST   01:00-01:59 REPEATED",
+        "      fall back       2026-11-01  01:00 MDT -> 01:00 MST   01:00-01:59 SKIPPED",
+    ),
+    (
+        "DST derivation: 'repeated' collapses back to bare ambiguity, which is "
+        "also true of the SKIPPED hour",
+        "return self._is_ambiguous(naive) and not self._is_skipped(naive)",
+        "return self._is_ambiguous(naive)",
+    ),
+    (
+        "DST sequence: the wall-clock readings stop being local, so nothing "
+        "ever crosses a transition",
+        "            .astimezone(self.tz)\n            .replace(tzinfo=None)",
+        "            .replace(tzinfo=None)",
+    ),
 ]
 
 # The negative control. Must score RED or the scorer cannot tell pass from
@@ -406,7 +441,16 @@ def _path_for(anchor):
     zero times and apply_mutation refuses with no verdict - but a refusal
     reads as a harness bug at the moment you least want to debug one.
     """
-    test_only = ("FORBIDDEN = frozenset", "_forbidden_names_pulled_by")
+    test_only = (
+        "FORBIDDEN = frozenset",
+        "_forbidden_names_pulled_by",
+        # T-527.14's derivation helpers. Both live in the test file because
+        # they ARE the instrument: the DST table is pinned by deriving it, so
+        # a battery that could not perturb the derivation would certify the
+        # table on the strength of a check nobody had shown could fail.
+        "return self._is_ambiguous(naive) and not self._is_skipped(naive)",
+        ".astimezone(self.tz)",
+    )
     return TEST_FILE if any(name in anchor for name in test_only) else TARGET
 
 

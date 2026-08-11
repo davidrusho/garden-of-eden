@@ -19,12 +19,13 @@ a hostile brightness published by any client with broker rights. Those are
 tested here or nowhere.
 """
 import json
+import re
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -716,6 +717,324 @@ class ShippedDefaultTests(unittest.TestCase):
         repeated_hour = ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": "01:30=50,12:00=100"})
         self.assertEqual(ls.phase_at(repeated_hour, time(1, 30)), 50)
         self.assertEqual(ls.phase_at(repeated_hour, time(1, 29)), 100)
+
+
+# --- T-527.14: the DST table, derived rather than restated ------------------
+#
+# next_boundary_after's docstring carries a measured tzdb table. Nothing pinned
+# it, and an earlier version of that docstring named ONE hour for both
+# transitions and shipped. A table that is load-bearing evidence and that no
+# test reads is exactly the artifact that goes stale silently — the more so
+# with live US DST legislation, which would move these hours without touching
+# a line of this repo.
+#
+# The class below derives the hours from zoneinfo and fails if they move.
+# It does NOT restate them from literals anywhere except in the assertion that
+# the derivation still matches what the docstring claims, which is the whole
+# point: the literal is the thing under test, not the input to it.
+
+_DENVER = "America/Denver"
+
+
+def _tz_available(name=_DENVER):
+    """Is the tzdb reachable? A missing tzdb is a SKIP, not a failure.
+
+    light_schedule uses naive local time on purpose and needs no tzdb at
+    runtime, so its absence says nothing about the code under test — only that
+    this particular instrument is unavailable here.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(name)
+    except Exception:
+        return False
+    return True
+
+
+@unittest.skipUnless(_tz_available(), f"tzdb entry for {_DENVER} unavailable")
+class DstTableIsDerivedFromTheTzdb(unittest.TestCase):
+    """Pins next_boundary_after's docstring table against the real tzdb."""
+
+    @classmethod
+    def setUpClass(cls):
+        from zoneinfo import ZoneInfo
+
+        cls.tz = ZoneInfo(_DENVER)
+
+    # -- the two predicates, and why they are not the same question ---------
+
+    def _is_skipped(self, naive):
+        """True if this wall-clock time does not exist on that date."""
+        aware = naive.replace(tzinfo=self.tz)
+        round_tripped = aware.astimezone(timezone.utc).astimezone(self.tz)
+        return round_tripped.replace(tzinfo=None) != naive
+
+    def _is_ambiguous(self, naive):
+        """True if fold=0 and fold=1 disagree about the UTC offset."""
+        return (
+            naive.replace(tzinfo=self.tz, fold=0).utcoffset()
+            != naive.replace(tzinfo=self.tz, fold=1).utcoffset()
+        )
+
+    def _is_repeated(self, naive):
+        """True if this wall-clock time occurs TWICE on that date."""
+        return self._is_ambiguous(naive) and not self._is_skipped(naive)
+
+    def test_ambiguity_alone_cannot_tell_a_gap_from_a_fold(self):
+        # THIS TEST EXISTS TO STOP _is_repeated BEING "SIMPLIFIED" BACK TO
+        # _is_ambiguous. PEP 495 gives `fold` a meaning on BOTH sides of a
+        # transition, so differing offsets are true of the SKIPPED hour as
+        # well as the repeated one. Written naively, the derivation below
+        # would report 02:30 on spring-forward morning as "repeated" — the
+        # exact conflation of the two hours that the docstring shipped once
+        # already and that this whole class exists to prevent recurring.
+        spring_gap = datetime(2026, 3, 8, 2, 30)
+        self.assertTrue(self._is_ambiguous(spring_gap))  # the trap
+        self.assertTrue(self._is_skipped(spring_gap))
+        self.assertFalse(self._is_repeated(spring_gap))  # the fix
+
+    # -- the derivation -----------------------------------------------------
+
+    def _transition_dates(self, year):
+        """Days in `year` where the noon UTC offset differs from the day before."""
+        found = []
+        day = datetime(year, 1, 1, 12)
+        previous = day.replace(tzinfo=self.tz).utcoffset()
+        while day.year == year:
+            day += timedelta(days=1)
+            current = day.replace(tzinfo=self.tz).utcoffset()
+            if current != previous:
+                found.append(day.date())
+            previous = current
+        return found
+
+    def test_the_docstring_table_still_matches_the_tzdb(self):
+        spring, fall = self._transition_dates(2026)
+
+        # The dates the docstring names.
+        self.assertEqual((spring.month, spring.day), (3, 8))
+        self.assertEqual((fall.month, fall.day), (11, 1))
+
+        skipped = [
+            hour
+            for hour in range(24)
+            if self._is_skipped(datetime(2026, spring.month, spring.day, hour, 30))
+        ]
+        repeated = [
+            hour
+            for hour in range(24)
+            if self._is_repeated(datetime(2026, fall.month, fall.day, hour, 30))
+        ]
+
+        # "02:00-02:59 SKIPPED" and "01:00-01:59 REPEATED", as measured.
+        self.assertEqual(skipped, [2])
+        self.assertEqual(repeated, [1])
+
+        # And the claim the wrong version of the docstring got wrong: these
+        # are NOT the same hour, so a rule of the form "keep boundaries out of
+        # the transition hour" would have to name both.
+        self.assertNotEqual(skipped, repeated)
+
+    def test_the_docstring_itself_is_read_and_matched_against_the_tzdb(self):
+        # THE TEST ABOVE CLOSES ONLY ONE DIRECTION. It compares the tzdb
+        # against literals living in THIS file, so it fails if the tzdb moves
+        # — and stays green if somebody edits the docstring wrongly, which is
+        # the failure that actually happened here: an earlier version named
+        # one hour for both transitions and shipped.
+        #
+        # So parse the table out of the docstring and check it against the
+        # same derivation. Now either half going wrong is a red test.
+        doc = ls.next_boundary_after.__doc__
+        self.assertIsNotNone(doc, "the table lives in the docstring; -OO would remove it")
+
+        matches = re.findall(
+            r"^\s*(spring forward|fall back)\s+"
+            r"(\d{4}-\d{2}-\d{2})\s+"
+            r".*?(\d{2}):00-(\d{2}):59\s+"
+            r"(SKIPPED|REPEATED)\s*$",
+            doc,
+            re.M,
+        )
+        rows = {label: rest for label, *rest in matches}
+        self.assertEqual(
+            set(rows), {"spring forward", "fall back"},
+            "the docstring table did not parse — it has been reformatted, and "
+            "this test is the only reader of it",
+        )
+
+        spring_date, s_from, s_to, s_kind = rows["spring forward"]
+        fall_date, f_from, f_to, f_kind = rows["fall back"]
+
+        # The docstring says which hour, and which KIND each transition is.
+        self.assertEqual((s_kind, f_kind), ("SKIPPED", "REPEATED"))
+        self.assertEqual(s_from, s_to)
+        self.assertEqual(f_from, f_to)
+
+        derived_spring, derived_fall = self._transition_dates(2026)
+        self.assertEqual(spring_date, derived_spring.isoformat())
+        self.assertEqual(fall_date, derived_fall.isoformat())
+        self.assertTrue(
+            self._is_skipped(datetime(2026, derived_spring.month, derived_spring.day,
+                                      int(s_from), 30)),
+            f"the docstring calls {s_from}:00 skipped; the tzdb disagrees",
+        )
+        self.assertTrue(
+            self._is_repeated(datetime(2026, derived_fall.month, derived_fall.day,
+                                       int(f_from), 30)),
+            f"the docstring calls {f_from}:00 repeated; the tzdb disagrees",
+        )
+
+    def test_each_transition_day_has_exactly_one_anomalous_hour(self):
+        # Guards the derivation itself rather than the table: if a future tzdb
+        # introduced a half-hour or double transition, the lists above would
+        # still be [2] and [1] by luck of the :30 sample. Sample every quarter
+        # hour and assert the anomaly is exactly one contiguous hour wide.
+        spring, fall = self._transition_dates(2026)
+        quarter_hours = [(h, m) for h in range(24) for m in (0, 15, 30, 45)]
+
+        gaps = [
+            (h, m)
+            for h, m in quarter_hours
+            if self._is_skipped(datetime(2026, spring.month, spring.day, h, m))
+        ]
+        folds = [
+            (h, m)
+            for h, m in quarter_hours
+            if self._is_repeated(datetime(2026, fall.month, fall.day, h, m))
+        ]
+        self.assertEqual(gaps, [(2, 0), (2, 15), (2, 30), (2, 45)])
+        self.assertEqual(folds, [(1, 0), (1, 15), (1, 30), (1, 45)])
+
+
+@unittest.skipUnless(_tz_available(), f"tzdb entry for {_DENVER} unavailable")
+class DecideSelfCorrectsAcrossARealTransition(unittest.TestCase):
+    """Drives decide() over the wall-clock sequence a real transition produces.
+
+    THE TEST THIS REPLACES ASSERTED A LOOKUP. It called phase_at at hand-picked
+    times and called that "self-correction", which restates the claim rather
+    than demonstrating it — nothing in it crossed a transition, and its
+    "repeated hour" half duplicated the ordinary wrap case.
+
+    What makes the naive arithmetic safe is that decide() asks what phase it is
+    NOW instead of reacting to boundary edges. That is a claim about a sequence
+    of clock readings, so the only honest way to test it is to generate the
+    sequence the Pi's clock actually produces — walk real UTC instants across
+    the transition and read each one off as naive local time, exactly as
+    datetime.now() would on the host.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from zoneinfo import ZoneInfo
+
+        cls.tz = ZoneInfo(_DENVER)
+
+    def _wall_clock_readings(self, start_utc, count, step_minutes):
+        """The naive local times a host's clock shows over a real UTC span."""
+        return [
+            (start_utc + timedelta(minutes=step_minutes * i))
+            .astimezone(self.tz)
+            .replace(tzinfo=None)
+            for i in range(count)
+        ]
+
+    def test_a_phase_opening_in_the_skipped_hour_is_never_entered_but_lands_on_the_next_tick(self):
+        # A boundary at 02:30 on spring-forward morning. The clock reads
+        # 01:55 then 03:00; 02:30 never happens.
+        schedule = ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": "02:30=50,12:00=100"})
+        readings = self._wall_clock_readings(
+            datetime(2026, 3, 8, 8, 45, tzinfo=timezone.utc), 8, 5
+        )
+
+        # The gap is real in this sample: the clock jumps an hour.
+        self.assertIn(datetime(2026, 3, 8, 1, 55), readings)
+        self.assertIn(datetime(2026, 3, 8, 3, 0), readings)
+        self.assertFalse(
+            [r for r in readings if r.hour == 2],
+            "the sample never enters the skipped hour, so it can demonstrate the gap",
+        )
+
+        decisions = [ls.decide(schedule, r, clock_synced=True) for r in readings]
+
+        # Before the jump the lamp is on the previous day's last phase (100,
+        # wrapped from 12:00); the 02:30 phase is never applied AT 02:30
+        # because that time does not occur.
+        before = [d for r, d in zip(readings, decisions) if r.hour == 1]
+        self.assertTrue(before)
+        self.assertEqual({d.brightness for d in before}, {100})
+
+        # THE SELF-CORRECTION: the very first tick after the jump already
+        # reports the 02:30 phase, without anything having fired at 02:30.
+        first_after = next(d for r, d in zip(readings, decisions) if r.hour >= 3)
+        self.assertEqual(first_after.brightness, 50)
+        self.assertEqual(first_after.source, ls.SOURCE_SCHEDULE)
+
+    def test_a_phase_opening_in_the_repeated_hour_is_entered_twice_with_the_same_result(self):
+        # A boundary at 01:30 on fall-back morning. The clock reads 01:30
+        # twice, an hour apart in real time.
+        schedule = ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": "01:30=50,12:00=100"})
+        readings = self._wall_clock_readings(
+            datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc), 13, 10
+        )
+
+        # The fold is real in this sample: one wall-clock time, twice.
+        self.assertEqual(readings.count(datetime(2026, 11, 1, 1, 30)), 2)
+
+        decisions = [ls.decide(schedule, r, clock_synced=True) for r in readings]
+        at_0130 = [
+            d for r, d in zip(readings, decisions) if r == datetime(2026, 11, 1, 1, 30)
+        ]
+
+        # Entered twice, and the second entry applies the SAME brightness from
+        # the SAME source — so the repeated hour costs a duplicate decision,
+        # never a flap.
+        self.assertEqual(len(at_0130), 2)
+        self.assertEqual(at_0130[0], at_0130[1])
+        self.assertEqual(at_0130[0], ls.Decision(50, ls.SOURCE_SCHEDULE))
+
+    def test_an_overrides_expiry_runs_an_extra_REAL_hour_across_the_fold(self):
+        # The one cost the docstring admits to — "an override's expiry can
+        # land an hour early or late across a transition" — MEASURED, not
+        # restated. The measurement has to be in real elapsed time, because in
+        # wall-clock terms nothing is wrong at all: that is the whole point.
+        schedule = ls.parse_schedule({"GARDYN_LIGHT_SCHEDULE": "01:30=50,12:00=100"})
+
+        applied_at = datetime(2026, 11, 1, 1, 45)  # first pass through 01:45
+        override = ls.Override(brightness=7, applied_at=applied_at)
+        expires_at = ls.next_boundary_after(schedule, applied_at)
+        self.assertEqual(expires_at, datetime(2026, 11, 1, 12, 0))
+
+        # Still the override's lamp a wall-clock minute before expiry, and the
+        # schedule's the moment it lands. (Without this pair the durations
+        # below would be arithmetic about a boundary nothing honours.)
+        self.assertEqual(
+            ls.decide(schedule, expires_at - timedelta(minutes=1),
+                      clock_synced=True, override=override),
+            ls.Decision(7, ls.SOURCE_OVERRIDE),
+        )
+        self.assertEqual(
+            ls.decide(schedule, expires_at, clock_synced=True, override=override),
+            ls.Decision(100, ls.SOURCE_SCHEDULE),  # 12:00 opens the 100 phase
+        )
+
+        # By the wall clock the override held for 10h15m...
+        self.assertEqual(expires_at - applied_at, timedelta(hours=10, minutes=15))
+
+        # ...and in real time for an hour longer, because the clock read
+        # 01:00-01:59 twice on the way. fold=0 picks the FIRST pass through
+        # 01:45, which is the one a host actually stamps when the override
+        # arrives; 12:00 is unambiguous so its fold does not matter.
+        real_applied = applied_at.replace(tzinfo=self.tz, fold=0).astimezone(timezone.utc)
+        real_expires = expires_at.replace(tzinfo=self.tz).astimezone(timezone.utc)
+        self.assertEqual(real_expires - real_applied, timedelta(hours=11, minutes=15))
+
+        # Stated as the delta, so this fails if the fold ever stops costing
+        # exactly one hour here.
+        self.assertEqual(
+            (real_expires - real_applied) - (expires_at - applied_at),
+            timedelta(hours=1),
+        )
 
 
 class PurityTests(unittest.TestCase):
