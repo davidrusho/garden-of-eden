@@ -1176,11 +1176,27 @@ def on_message(client, userdata, msg):
         # `self._topic.decode(...)`, so a `_topic` holding anything but bytes
         # raises there instead - the same process-exit shape, one exception
         # class over, and a guard presented as closing a class should close it.
-        # Deliberately NOT `except Exception`: this runs before any dispatch,
-        # so a blanket catch here would swallow faults that belong to the
-        # handler chain below and has no business being that wide.
+        #
+        # ~~"Deliberately NOT `except Exception`: this runs before any
+        # dispatch, so a blanket catch here would swallow faults that belong to
+        # the handler chain below and has no business being that wide."~~ False,
+        # and copied verbatim into the payload guard below where it was found
+        # by the review of bfef37f. This `try` covers ONE statement - the
+        # attribute read - so there is no handler-chain fault it could reach.
+        # The real reason to keep this arm narrow is diagnosis, not scope, and
+        # the catch-all below now closes the class the sentence above claimed
+        # was already closed.
         logger.error("Dropped an inbound message whose TOPIC could not be "
                      "decoded: %r", getattr(msg, "_topic", None))
+        return
+    except Exception as exc:
+        # The topic-side twin of the payload catch-all below, added in the same
+        # change and for the same reason: two named types are not a class, and
+        # anything else out of `msg.topic` exited the process. Named arm first
+        # so an undecodable topic keeps its own diagnosis; this one says
+        # UNEXPECTED because that is a different thing to go and look at.
+        logger.error("Dropped an inbound message whose TOPIC raised an "
+                     "UNEXPECTED error: %r", exc)
         return
 
     try:
@@ -1222,17 +1238,39 @@ def on_message(client, userdata, msg):
         # `gardyn/humidity/get` left COMMAND_SUBSCRIPTIONS at 3ed7081, which is
         # a descendant of 9e00c2f, so a durable session still carries them.
         #
-        # All ten are literal and LOCALLY DERIVED. That is the whole load-
-        # bearing property, and it is the only one asserted here on purpose:
-        # this sentence said "literal, ASCII and derived from local config"
-        # until 2026-08-12, and ASCII was an assumption about a file nobody
-        # reading this repo can see. Nine of the ten are ASCII literals in
-        # this module, but every one is prefixed with BASE_TOPIC, which is
-        # `os.getenv("MQTT_BASETOPIC", "gardyn")` (config.py) read from a
-        # GITIGNORED .env - so `MQTT_BASETOPIC=gardyn-café` makes the claim
-        # false and changes nothing about the conclusion. Locally derived is
-        # what matters: whatever those bytes are, WE chose them, not a peer.
-        # So under a
+        # All ten are LOCALLY DERIVED. That is the whole load-bearing
+        # property, and it is the only one asserted here on purpose. The two
+        # sentences this replaces were each wrong, in opposite ways, and the
+        # second was wrong INSIDE the commit that fixed the first - so the
+        # breakdown is spelled out rather than summarised:
+        #
+        #   * NINE are `BASE_TOPIC + "<suffix>"`. Seven of those nine still
+        #     carry their suffix literal in this module (COMMAND_SUBSCRIPTIONS
+        #     above); the other two, `/temperature/get` and `/humidity/get`,
+        #     left at 3ed7081 and survive only in the durable session, so no
+        #     literal for them exists anywhere in the current file.
+        #   * The TENTH is `homeassistant/status` - HA_STATUS_TOPIC, defined
+        #     at the top of this module and subscribed through
+        #     LIFECYCLE_SUBSCRIPTIONS. It is a bare ASCII literal with NO
+        #     BASE_TOPIC prefix, and it is precisely the topic the collision
+        #     guard below intercepts.
+        #   * So the count of ASCII literals present in this file is EIGHT:
+        #     the seven command suffixes plus `homeassistant/status`.
+        #
+        # ~~"literal, ASCII and derived from local config"~~ (until
+        # 2026-08-12) claimed ASCII for all ten, which is an assumption about
+        # `.env`: BASE_TOPIC is `os.getenv("MQTT_BASETOPIC", "gardyn")`
+        # (config.py) read from a GITIGNORED file, so `MQTT_BASETOPIC=gardyn-
+        # café` makes it false. ~~"Nine of the ten are ASCII literals in this
+        # module, but every one is prefixed with BASE_TOPIC"~~ (bfef37f, the
+        # correction) traded that unfalsifiable claim for a falsifiable wrong
+        # one: it is wrong about the count and wrong about the prefix, and the
+        # topic it misdescribes is the one whose guard is eighty lines below.
+        # An operator reading this during an incident was being told something
+        # false about exactly the topic they were looking at.
+        #
+        # Locally derived is what carries the argument either way: whatever
+        # those bytes are, WE chose them, not a peer. So under a
         # CONFORMING broker a topic arriving here is never remotely chosen, and
         # the reachable forgery case is a broker that does not conform, or one
         # an attacker controls - which is the same threat model that justifies
@@ -1281,18 +1319,65 @@ def on_message(client, userdata, msg):
         # thing an incident gets reconstructed from. Undecodable bytes point
         # at the broker or a device; a payload with no `.decode` points at the
         # library having moved underneath us, which sends the reader somewhere
-        # completely different. Deliberately NOT `except Exception`: this runs
-        # before dispatch and has no business swallowing handler faults.
+        # completely different. That property IS pinned - mutant 31 in
+        # mutate_connack_refusal.py merges the arms and dies at named cases.
+        #
+        # ~~"Deliberately NOT `except Exception`: this runs before dispatch and
+        # has no business swallowing handler faults."~~ Two things wrong with
+        # that sentence, both found by the review of bfef37f. The reason was
+        # false - this `try` covers exactly two statements, the decode and the
+        # INFO log below it, both operating on values already in hand; no
+        # dispatch code is inside it and a blanket catch here could not reach
+        # any. And the conclusion was wrong too, by this guard's own argument:
+        # closing two named types is not closing a class. `TypeError` from a
+        # payload property, and `MemoryError` from `bytes.decode`, took the
+        # same route out of the process as the two that are named.
         #
         # getattr, NOT msg.payload, to name the type. Reading the attribute
         # that just raised, inside the handler for that raise, is the precise
         # shape of the process-killer T-527.12 found at the topic guard - and
-        # `msg` here may have no `payload` at all.
+        # `msg` here may have no `payload` at all. NARROWS that hazard rather
+        # than removing it, which this comment claimed until 2026-08-12:
+        # `getattr` re-invokes the descriptor and suppresses only
+        # `AttributeError`, so a property raising `AttributeError` and then
+        # something else on consecutive reads still escapes from inside this
+        # handler. Nil against paho's `payload`, which is a `__slots__` data
+        # attribute rather than a property - but nil-because-of-the-library is
+        # what this whole ticket exists to stop asserting as safety.
         payload_type = type(getattr(msg, "payload", None)).__name__
         logger.error(
             f"Dropped an inbound message on topic {topic!r} whose PAYLOAD has "
             f"no usable bytes (type {payload_type!r}). This is a library "
             f"shape change rather than a bad message: {exc!r}")
+        return
+    except Exception as exc:
+        # CLOSING THE CLASS, which the two named arms above only claimed to.
+        # T-527.30/T-527.29 remediation, 2026-08-12.
+        #
+        # Every named arm above reports a specific cause because that is what
+        # gardyn.log is for. This one exists for the causes nobody enumerated:
+        # whatever else `bytes.decode` or a non-paho message object can raise.
+        # Before it, those left on_message, left loop_forever(), and exited the
+        # process into the ten-second Restart=always loop with the grow light
+        # off - the exact outcome the two arms above were added to prevent, for
+        # every exception class they happened not to name.
+        #
+        # Kept LAST and kept DISTINCT on purpose. Ordering means the two named
+        # arms still own their own diagnosis, so this cannot silently relabel a
+        # binary payload or a library shape change; and the wording says
+        # UNEXPECTED, so an operator reading it knows the fault is one this
+        # module has no model for, which is a different next step from either
+        # of the two above. Merging any named arm into this one is a mutant in
+        # mutate_connack_refusal.py precisely so that stays true.
+        #
+        # BaseException is deliberately NOT caught: KeyboardInterrupt and
+        # SystemExit must still stop the process, and paho's own shutdown path
+        # depends on that.
+        logger.error(
+            f"Dropped an inbound message on topic {topic!r} whose payload "
+            f"raised an UNEXPECTED error while being decoded or logged. This "
+            f"is neither undecodable bytes nor a missing .decode, so it is a "
+            f"fault this handler has no model for: {exc!r}")
         return
 
     topic_suffix = topic.replace(BASE_TOPIC + "/", "")

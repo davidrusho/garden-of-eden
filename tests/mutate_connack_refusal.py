@@ -332,9 +332,17 @@ MUTANTS = [
     # putting `msg.topic` back in the PAYLOAD handler below is harmless now.
     # The guard returns early on an undecodable topic, so that line can never
     # see one, and a mutant there would survive honestly.
+    # The replacement moves the READ out of the guard and leaves a `try: pass`
+    # behind, rather than the `if False:` it used until 2026-08-12. That older
+    # spelling stopped compiling the moment the guard gained a second handler
+    # (the T-527.30 catch-all), because the trailing `except Exception` was
+    # left with no `try` - and the harness correctly reported NOT APPLIED
+    # rather than scoring it, which is the compile gate doing its job. Keeping
+    # both arms present but dead is also closer to the state being restored:
+    # the pre-fix defect was an UNGUARDED read, not a missing handler.
     ("delete the decode-once guard - an undecodable topic kills the process",
      "    try:\n        topic = msg.topic\n    except (UnicodeDecodeError, AttributeError):",
-     "    topic = msg.topic\n    if False:"),
+     "    topic = msg.topic\n    try:\n        pass\n    except (UnicodeDecodeError, AttributeError):"),
 
     # Narrowing, not deleting - the mutation a maintainer plausibly makes.
     # AttributeError was added to the guard on review: the property is
@@ -376,6 +384,50 @@ MUTANTS = [
     ("the payload handler reads msg.payload again - the re-raise, relocated",
      '        payload_type = type(getattr(msg, "payload", None)).__name__',
      '        payload_type = type(msg.payload).__name__'),
+
+    # --- T-527.30 remediation: the four regressions the three above missed --
+    # All four come from the reviews of 094eac0 and bfef37f rather than from
+    # this file's author, which is the point: a battery written alongside the
+    # code it scores measures agreement, and these are the mutations that
+    # survived it.
+    #
+    # F4 of the bfef37f review, and the only one of the four with a blast
+    # radius on the plants. Losing the `return` is not a mutation anybody
+    # writes deliberately - it is what a careless edit to the log line above
+    # it does - and control then falls into the dispatch chain with `payload`
+    # UNBOUND. Three branches never read it and run to completion: the
+    # HA/status collision guard, water/level/get and pcb/temperature/get. A
+    # distance measurement or a sensor publish, one statement after a line
+    # saying the message was DROPPED.
+    ("delete the payload drop's return - dispatch runs with payload unbound",
+     '            f"shape change rather than a bad message: {exc!r}")\n'
+     '        return',
+     '            f"shape change rather than a bad message: {exc!r}")'),
+
+    # F3 of the same review: of two properties that commit stated as
+    # deliberate, only one was machine-checked. `except Exception` here still
+    # catches the fault and reports it with the wrong cause - it relabels
+    # every unexpected fault as a missing `.decode` - which is invisible to
+    # any test asserting only that nothing escaped.
+    ("widen the named payload arm to except Exception - one cause for three",
+     "    except AttributeError as exc:",
+     "    except Exception as exc:"),
+
+    # F7 of the same review, now closed rather than re-worded: the two named
+    # arms are not a class. Deleting the catch-all puts every unmodelled fault
+    # back on the route out of on_message, out of loop_forever(), out of the
+    # process.
+    ("delete the payload catch-all - unmodelled faults exit the process again",
+     '    except Exception as exc:\n'
+     '        # CLOSING THE CLASS',
+     '    except RuntimeError as exc:\n'
+     '        # CLOSING THE CLASS'),
+
+    ("delete the topic catch-all - the same route, one guard up",
+     '    except Exception as exc:\n'
+     '        # The topic-side twin',
+     '    except RuntimeError as exc:\n'
+     '        # The topic-side twin'),
 
     # --- 24-25: the invariant the fix RELIES on, in both directions ---------
     # Neither line is in the diff. The fix's whole argument is that the flag is

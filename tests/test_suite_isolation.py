@@ -525,10 +525,57 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         `copytree(REPO, ...)` after `from shutil import copytree`; the grep
         this replaces silently rejected the second, so its only realistic
         failure was spurious.
+
+        WHAT THIS IS AND IS NOT, stated because the review of 094eac0 measured
+        it against 21 synthetic harnesses and the answer is narrower than the
+        AST framing suggests. This finds a CALL NODE. It says nothing about
+        whether that call EXECUTES, and nothing about where the mutants land.
+        Measured accepting, all five confirmed: the call under `if False:`;
+        the call inside a function nobody invokes; the call after a `return`
+        or `raise`; `copytree(REPO, backup)` followed by `root = REPO`, which
+        copies and then mutates the originals; and a locally-defined
+        `def copytree(a, b): pass`. The fourth is the mechanism the failure
+        message below warns about, standing on its own.
+
+        THE DESIGN CALL, made deliberately 2026-08-12 rather than left open:
+        this stays call-presence. Execution-reachability is the property that
+        actually matters, and the honest way to get it is to DRIVE each
+        sandboxed harness and assert the live tree is untouched - the same
+        instrument `test_an_interrupted_battery_leaves_no_mutant_behind` uses
+        for IN_PLACE. That is not a docstring's worth of work: the probe's
+        runner-name interception does not reach these harnesses as written
+        (driving mutate_netwatch.py through it returns "main() returned
+        without the injected interrupt" in 0.3s, so nothing was exercised),
+        so it needs the harnesses' own entry points changed. Until that
+        exists, the gate is a NECESSARY condition on SANDBOXED membership and
+        is not claimed as a sufficient one - which is why the reverse test's
+        failure message refuses to prescribe a move.
+
+        Also rejected, and this direction is the safe one because it fails
+        LOUDLY: `copytree(src=REPO, dst=...)` keyword form, a bound alias,
+        `str(REPO)`, a helper module, `cp -a`, `git worktree add`. A harness
+        that genuinely sandboxes by one of those spellings fails this test and
+        gets read by a human, which is the correct outcome for a construct
+        nothing here can verify.
+        """
+        return MutationHarnessRestoreTests._copy_calls_in_source(
+            read_text(os.path.join(REPO, "tests", harness)))
+
+    @staticmethod
+    def _copy_calls_in_source(source):
+        """The text-analysis half, split out 2026-08-12 so it can be pinned.
+
+        Nothing tested the AST walk itself - see
+        test_the_sandbox_gate_does_not_count_PROSE below, and F3 of the
+        094eac0 review, which measured that swapping the walk back for
+        c536b3b's grep changed no verdict in this file. Taking SOURCE rather
+        than a harness NAME is what lets that control run on files written for
+        the purpose, without writing anything into the live tree - which this
+        class exists to keep clean.
         """
         import ast
 
-        tree = ast.parse(read_text(os.path.join(REPO, "tests", harness)))
+        tree = ast.parse(source)
         found = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not node.args:
@@ -585,8 +632,61 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                 self.assertFalse(
                     calls,
                     f"{harness} calls copytree(REPO, ...) but is listed "
-                    f"IN_PLACE. If it now sandboxes, move it to SANDBOXED; "
-                    f"the lists are the thing this file trusts.")
+                    f"IN_PLACE, so the lists have stopped describing the "
+                    f"tree. DO NOT resolve this by moving it to SANDBOXED on "
+                    f"the strength of the call alone: SANDBOXED exempts a "
+                    f"harness from the interrupted-battery restore check, and "
+                    f"a harness that copies the tree AND STILL WRITES the "
+                    f"originals satisfies this gate while needing that check "
+                    f"more than ever. Move it only after confirming every "
+                    f"mutant it writes lands under the copy.")
+
+    def test_the_sandbox_gate_does_not_count_PROSE(self):
+        """NEGATIVE AND POSITIVE CONTROL for the AST walk, which nothing
+        pinned until 2026-08-12.
+
+        F3 of the 094eac0 review: swapping the walk back for c536b3b's
+        comment-stripping grep changes no verdict anywhere in this file,
+        because every real harness carries BOTH the prose and the call - which
+        is precisely why the old gate was fooled twice. A "simplification"
+        back to text would have been invisible. So state the property on
+        inputs written for it rather than on the corpus, where the two
+        implementations agree by accident.
+
+        Controls first: if the walk cannot see a real call, every other
+        verdict in this class is void.
+        """
+        cases = {
+            "a real shutil.copytree(REPO, ...) call":
+                ("import shutil\nREPO = '/x'\nshutil.copytree(REPO, '/y')\n",
+                 True),
+            "a bare copytree(REPO, ...) after from-import":
+                ("from shutil import copytree\nREPO = '/x'\n"
+                 "copytree(REPO, '/y')\n", True),
+            "a module DOCSTRING quoting the call (the 2026-08-12 defect)":
+                ('"""RUNS IN A shutil.copytree(REPO) SANDBOX."""\n'
+                 'REPO = "/x"\n', False),
+            "a COMMENT quoting the call (the 2026-08-11 defect)":
+                ("REPO = '/x'\n"
+                 "# shutil.copytree(REPO, dst) stays on ONE line\n", False),
+            "a string literal quoting the call":
+                ("REPO = '/x'\nNOTE = 'shutil.copytree(REPO, dst)'\n", False),
+        }
+        for label, (source, expected) in cases.items():
+            with self.subTest(case=label):
+                found = self._copy_calls_in_source(source)
+                if expected:
+                    self.assertTrue(
+                        found,
+                        f"CONTROL FAILED - {label}: the gate cannot see a "
+                        f"real copytree(REPO, ...) call, so every other "
+                        f"verdict in this class is void")
+                else:
+                    self.assertFalse(
+                        found,
+                        f"{label}: the gate counted text that is not code - "
+                        f"the exact defect c536b3b and 094eac0 were each "
+                        f"written for")
 
     def test_every_mutation_harness_is_covered(self):
         """A new harness must be listed above, or it is untested by default -

@@ -1860,8 +1860,13 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
 
     So this is DEFENCE IN DEPTH, not the closure of a live path - the same
     distinction the `{e!r}` comment in mqtt.py had to be corrected to make.
-    Under a conforming broker this client only ever receives the ten literal
-    ASCII topics its session has subscribed to. It is still worth having:
+    Under a conforming broker this client only ever receives the ten LOCALLY
+    DERIVED topics its session has subscribed to. ~~"ten literal ASCII
+    topics"~~ - struck 2026-08-12 for the same reason the equivalent sentence
+    in mqtt.py was: nine of the ten are `BASE_TOPIC + "<ascii suffix>"` and
+    BASE_TOPIC comes from a gitignored `.env`, so neither "literal" nor
+    "ASCII" is a property this repo can assert about them. Locally derived is,
+    and is the one the argument rests on. It is still worth having:
     paho hands over whatever arrived without validating it, the failure mode
     is the process exiting on a host with no recovery path, and the guard
     costs four lines.
@@ -2034,6 +2039,16 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
         no_payload = self._PahoShapedMessage(LIGHT_COMMAND.encode(), b"ON")
         del no_payload.payload
         with self.subTest(shape="no payload attribute"):
+            # Fixture control, added 2026-08-12. The two loop shapes above
+            # carried one and this block did not, while the commit message and
+            # the docstring said all three did - a false coverage claim of the
+            # cheapest kind, found by the review of bfef37f. It did not matter
+            # in fact (a normal payload logs at INFO, so `assertLogs(ERROR)`
+            # would raise rather than pass vacuously), which is exactly why it
+            # was worth closing rather than re-wording: the claim now costs one
+            # line to make true.
+            with self.assertRaises(AttributeError):
+                no_payload.payload
             try:
                 with self.assertLogs(mqtt_mod.logger, level="ERROR") as caught:
                     mqtt_mod.on_message(self.client, None, no_payload)
@@ -2046,6 +2061,242 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
                 any("PAYLOAD has no usable bytes" in r.getMessage()
                     for r in caught.records),
                 [r.getMessage() for r in caught.records])
+
+    def test_an_UNEXPECTED_fault_in_either_decode_is_caught_and_named(self):
+        """T-527.30 remediation. The two named arms at each guard closed two
+        exception classes and the comments called that closing a class.
+
+        Both reviews landed on the same sentence from opposite sides. The
+        bfef37f review named it as an over-claim (F7): a `payload` property
+        raising `TypeError`, or `MemoryError` out of `bytes.decode`, took the
+        same route out of `on_message`, out of `loop_forever()` and out of the
+        process as the two classes that ARE named - a ten-second
+        Restart=always loop with the grow light off on a host with no physical
+        recovery path. And the stated reason for refusing a blanket catch
+        ("this runs before dispatch and has no business swallowing handler
+        faults") was false: each `try` covers one or two statements and no
+        dispatch code is reachable from inside either.
+
+        So the class is now actually closed, at BOTH guards, with the named
+        arms kept in front so their diagnosis survives. This test drives the
+        arm that was added; the one below asserts the diagnoses stay apart,
+        which is the property that makes keeping three arms rather than one
+        worth the lines.
+        """
+        class _Exploding:
+            def decode(self, *_a, **_k):
+                raise ValueError("not a decode failure this module models")
+
+        payload_side = self._PahoShapedMessage(LIGHT_COMMAND.encode(),
+                                               _Exploding())
+        # Fixture control: the fault has to be one NEITHER named arm catches,
+        # or this measures the arms that were already there.
+        with self.assertRaises(ValueError):
+            payload_side.payload.decode("utf-8")
+        with self.subTest(guard="payload"):
+            try:
+                with self.assertLogs(mqtt_mod.logger, level="ERROR") as caught:
+                    mqtt_mod.on_message(self.client, None, payload_side)
+            except ValueError as exc:
+                self.fail(
+                    f"on_message let a ValueError out of the payload decode "
+                    f"({exc}); paho does not catch it, so the process exits")
+            messages = [r.getMessage() for r in caught.records]
+            self.assertTrue(any("UNEXPECTED" in m for m in messages), messages)
+
+        class _ExplodingTopic:
+            _topic = b"unused"
+            payload = b"ON"
+            qos, retain = 1, False
+
+            @property
+            def topic(self):
+                raise ValueError("not a topic decode failure either")
+
+        topic_side = _ExplodingTopic()
+        with self.assertRaises(ValueError):
+            topic_side.topic
+        with self.subTest(guard="topic"):
+            try:
+                with self.assertLogs(mqtt_mod.logger, level="ERROR") as caught:
+                    mqtt_mod.on_message(self.client, None, topic_side)
+            except ValueError as exc:
+                self.fail(
+                    f"on_message let a ValueError out of the topic read "
+                    f"({exc}); this is the T-527.12 process-exit route with a "
+                    f"different exception class")
+            messages = [r.getMessage() for r in caught.records]
+            self.assertTrue(any("UNEXPECTED" in m for m in messages), messages)
+            self.assertTrue(any("TOPIC" in m for m in messages), messages)
+
+    def test_a_dropped_payload_does_not_reach_a_dispatch_branch(self):
+        """The `return` in each drop arm, which nothing pinned.
+
+        F4 of the bfef37f review, and the one finding there with a real blast
+        radius. The battery carried three mutants for the new arm - delete,
+        merge, re-read - and deleting its `return` SURVIVED all of them at
+        zero named failing cases. Lose that statement and control falls
+        through to the dispatch chain with `payload` UNBOUND, and three of the
+        branches never read it, so they run to completion: the HA/status
+        collision guard, `water/level/get`, and `pcb/temperature/get`. On the
+        Pi that is a distance measurement or a sensor publish executing one
+        statement after a log line saying the message was DROPPED. The other
+        six raise UnboundLocalError into the catch-all - noisy and harmless,
+        which is why nothing noticed.
+
+        `pcb/temperature/get` is the cheapest of the three to observe: with
+        the return in place the drop is logged and nothing is published; with
+        it gone the branch publishes a temperature. The positive control below
+        is what makes the absence mean something.
+        """
+        topic = (mqtt_mod.BASE_TOPIC + "/pcb/temperature/get").encode()
+
+        # POSITIVE CONTROL. A branch that never publishes under ANY input
+        # would make the assertion below pass while measuring nothing.
+        healthy = self._PahoShapedMessage(topic, b"")
+        mqtt_mod.on_message(self.client, None, healthy)
+        published = [c.args[0] for c in self.client.publish.call_args_list]
+        self.assertIn(
+            mqtt_mod.BASE_TOPIC + "/pcb/temperature", published,
+            "CONTROL FAILED: this branch does not publish even on a good "
+            "payload, so the drop assertion below proves nothing")
+
+        for label, payload in (("no .decode", None),
+                               ("already a str", "20.0")):
+            with self.subTest(shape=label):
+                self.client.reset_mock()
+                with self.assertLogs(mqtt_mod.logger, level="ERROR"):
+                    mqtt_mod.on_message(
+                        self.client, None,
+                        self._PahoShapedMessage(topic, payload))
+                self.assertEqual(
+                    [], self.client.publish.call_args_list,
+                    f"a message logged as DROPPED went on to run a dispatch "
+                    f"branch and publish - the drop arm's `return` is gone, "
+                    f"and `payload` was unbound for the whole chain")
+
+    def test_the_topic_guards_two_arms_report_two_DIFFERENT_causes(self):
+        """The topic-side pair of the payload test below, and the one the
+        catch-all made necessary.
+
+        Measured consequence of adding that arm, caught by re-running the
+        battery rather than by reading the diff: mutant 27 ("narrow the guard
+        back to UnicodeDecodeError") had been dying because a non-bytes
+        `_topic` then escaped on_message and exited the process. With a
+        catch-all present it no longer escapes - it is caught one arm lower
+        and logged as UNEXPECTED - so the mutant SURVIVED at zero named cases
+        and the narrowing became invisible. The property that remains, and
+        that this pins, is the DIAGNOSIS: both named causes belong to the
+        named arm and say "could not be decoded", because on this host that is
+        the difference between an incident record pointing at the broker and
+        one pointing nowhere.
+
+        This is the shape the rules call widening what can SET a signal: the
+        production change was right and it silently retired a test's only
+        observable.
+        """
+        cases = {
+            # UnicodeDecodeError - bytes that are not UTF-8.
+            "undecodable topic bytes":
+                (self._PahoShapedMessage(b"gardyn/light/\xff", b"ON"),
+                 "could not be decoded"),
+            # AttributeError - `_topic` holding something with no `.decode`,
+            # which is the class the guard was widened for in 4601f55.
+            "topic attribute is not bytes":
+                (self._PahoShapedMessage(b"unused", b"ON"),
+                 "could not be decoded"),
+        }
+        cases["topic attribute is not bytes"][0]._topic = "already a str"
+
+        for label, (msg, expected) in cases.items():
+            with self.subTest(cause=label):
+                with self.assertLogs(mqtt_mod.logger, level="ERROR") as caught:
+                    mqtt_mod.on_message(self.client, None, msg)
+                messages = [r.getMessage() for r in caught.records]
+                self.assertTrue(any(expected in m for m in messages), messages)
+                self.assertFalse(
+                    any("UNEXPECTED" in m for m in messages),
+                    f"the {label!r} case fell through to the catch-all, so the "
+                    f"named arm no longer covers it and the log no longer says "
+                    f"what happened: {messages}")
+
+    def test_the_three_payload_arms_report_three_DIFFERENT_causes(self):
+        """What stops the catch-all being written as one `except Exception`.
+
+        `gardyn.log` is the only thing an incident on this host is
+        reconstructed from, and the three causes send a reader to three
+        different places: undecodable bytes to the broker or a device, a
+        missing `.decode` to the library having moved, and anything else to a
+        fault this module has no model for. Merging any pair still CATCHES the
+        fault, so a test asserting only "nothing escaped" cannot see it -
+        which is why the mutants for the merges exist.
+        """
+        class _Exploding:
+            def decode(self, *_a, **_k):
+                raise ValueError("neither of the two named causes")
+
+        cases = {
+            "undecodable bytes": (b"\xff\xfe", "Likely binary"),
+            "no .decode at all": (None, "PAYLOAD has no usable bytes"),
+            "something else entirely": (_Exploding(), "UNEXPECTED"),
+        }
+        seen = {}
+        for label, (payload, expected) in cases.items():
+            with self.subTest(cause=label):
+                msg = self._PahoShapedMessage(LIGHT_COMMAND.encode(), payload)
+                with self.assertLogs(mqtt_mod.logger, level="ERROR") as caught:
+                    mqtt_mod.on_message(self.client, None, msg)
+                messages = [r.getMessage() for r in caught.records]
+                self.assertTrue(any(expected in m for m in messages), messages)
+                seen[label] = messages
+        # And the other two markers must be ABSENT from each, or "different
+        # cause" is satisfied by a line that says all three things at once.
+        for label, messages in seen.items():
+            others = [e for lbl, (_p, e) in cases.items()
+                      if lbl != label for e in (e,)]
+            for other in others:
+                self.assertFalse(
+                    any(other in m for m in messages),
+                    f"the {label!r} arm also reported {other!r}, so the three "
+                    f"arms do not tell a reader three different things: "
+                    f"{messages}")
+
+    def test_the_payload_TYPE_name_is_escaped_like_every_other_sink(self):
+        """The operand the payload-sink scanner structurally cannot see.
+
+        F5 of the bfef37f review, and it corrects a MECHANISM rather than an
+        outcome. That commit said the scanner caught its first `%r` spelling
+        of this log line because the line interpolates a payload-derived
+        operand. It does not: `_TAINT_SEEDS` matches a Name or Attribute
+        called `payload`/`topic`, and `getattr(msg, "payload", None)` passes
+        "payload" as a STRING CONSTANT, which seeds nothing. Measured -
+        `_tainted_names(on_message)` returns {'payload','topic','topic_suffix'}
+        with no `payload_type` in it, and un-escaping `{payload_type!r}`
+        SURVIVES the battery while un-escaping `{topic!r}` on the same
+        physical line is killed. The line is scanned only because of `topic`.
+
+        So the escaping of `payload_type` has no static reader, and this is
+        its behavioural one. Not a live forgery path today - the value is
+        `type(...).__name__` - but "not reachable through today's library" is
+        the exact argument this ticket has spent four rounds declining to
+        accept as safety, and the topic guard's equivalent invisible operand
+        at least has a control-character fixture. This is that fixture.
+        """
+        exotic = type("Broken\nAug 12 03:00:00 mqtt - INFO - forged\x1b[31m",
+                      (), {})
+        msg = self._PahoShapedMessage(LIGHT_COMMAND.encode(), exotic())
+        # Control: the name really does carry the characters, so a green
+        # result is the escaping working rather than the fixture being tame.
+        self.assertIn("\n", type(msg.payload).__name__)
+        with self.assertLogs(mqtt_mod.logger, level="ERROR") as caught:
+            mqtt_mod.on_message(self.client, None, msg)
+        messages = [r.getMessage() for r in caught.records]
+        self.assertEqual(
+            [], [m for m in messages if "\n" in m or "\x1b" in m],
+            f"a payload's TYPE NAME wrote a raw newline or escape into "
+            f"gardyn.log, which forges a log line exactly as a raw payload "
+            f"would: {messages!r}")
+        self.assertTrue(any("\\n" in m for m in messages), messages)
 
     def test_the_payload_drop_is_reported_as_a_LIBRARY_fault_not_a_broker_one(self):
         """The two arms are kept separate on purpose, and this is what makes
@@ -2130,9 +2381,14 @@ class TheImportHelperTellsAbsentApartFromBroken(unittest.TestCase):
     """
 
     @staticmethod
-    def _paho_on_disk(client_body):
+    def _paho_on_disk(client_body, package_init=""):
         """A real `paho.mqtt.client` package on sys.path, with `client_body`
-        as client.py.
+        as client.py and `package_init` as paho/__init__.py.
+
+        `package_init` exists because the parent's body is what `find_spec`
+        executes, and that is where the 094eac0 review found the helper
+        misclassifying a broken install as an absent one. A default of "" is
+        the healthy case every other user of this fixture wants.
 
         Every cached `paho*` module comes out of sys.modules for the duration
         and goes back afterwards: this suite plants a MagicMock at
@@ -2155,10 +2411,10 @@ class TheImportHelperTellsAbsentApartFromBroken(unittest.TestCase):
             try:
                 pkg = os.path.join(tmp, "paho", "mqtt")
                 os.makedirs(pkg)
-                for init in (os.path.join(tmp, "paho", "__init__.py"),
-                             os.path.join(pkg, "__init__.py")):
-                    with open(init, "w"):
-                        pass
+                with open(os.path.join(tmp, "paho", "__init__.py"), "w") as h:
+                    h.write(package_init)
+                with open(os.path.join(pkg, "__init__.py"), "w"):
+                    pass
                 with open(os.path.join(pkg, "client.py"), "w") as handle:
                     handle.write(client_body)
                 for name in saved_modules:
@@ -2197,6 +2453,63 @@ class TheImportHelperTellsAbsentApartFromBroken(unittest.TestCase):
         # paho broke - the point of the distinction is actionability.
         self.assertIn(tmp, str(caught.exception))
         self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+    def test_a_paho_whose_own_PARENT_fails_to_import_RAISES_too(self):
+        """The branch the fix for the branch missed.
+
+        `find_spec("paho.mqtt.client")` IMPORTS `paho` and `paho.mqtt` before
+        it looks for `client`, so paho's `__init__` runs one guard EARLIER
+        than the `exec_module` arm the 094eac0 commit hardened. Every failure
+        below therefore reached the blanket `except (ImportError, ValueError,
+        AttributeError): return None` and was reported to the caller as "paho
+        is not installed here" - the identical false absence, one branch up,
+        inside the fix for it. Found by the review of that commit; the three
+        shapes were then measured rather than reasoned about, because they do
+        NOT all raise the same class.
+        """
+        cases = {
+            # ModuleNotFoundError, but naming a module that is not paho.
+            "__init__ imports an absent module":
+                "import definitely_absent_xyz\n",
+            # Plain ImportError - NOT a ModuleNotFoundError, so a fix that
+            # only special-cases MNFE still reports this one as an absence.
+            "__init__ from-imports a missing name":
+                "from os import definitely_absent_name\n",
+            # Not an ImportError at all. This one was not caught by the old
+            # handler either, and surfaced as a raw traceback naming nothing.
+            "__init__ raises something else":
+                "raise RuntimeError('this paho is installed and broken')\n",
+        }
+        for label, init_body in cases.items():
+            with self.subTest(shape=label):
+                with self._paho_on_disk("X = 1\n", package_init=init_body):
+                    with self.assertRaises(PahoIsInstalledButUnusable) as caught:
+                        _import_real_paho_client()
+                # The words matter as much as the class: this string is what
+                # stops a reader concluding the machine has no paho.
+                self.assertIn("NOT the same as paho being absent",
+                              str(caught.exception))
+
+    def test_a_paho_that_is_absent_is_still_told_apart_from_one_that_is_broken(self):
+        """The pair for the test above, and the reason the split is on
+        `exc.name` rather than on the exception class.
+
+        Absence and a broken dependency BOTH arrive as ModuleNotFoundError -
+        measured, not assumed - so the class cannot separate them and the
+        missing NAME is the only signal. Getting this wrong in the other
+        direction would fail the suite on every machine without paho, which is
+        a false finding about the environment rather than about mqtt.py, and
+        this development machine is one of them.
+        """
+        with self._paho_on_disk("X = 1\n",
+                                package_init="import definitely_absent_xyz\n"):
+            with self.assertRaises(ModuleNotFoundError) as raw:
+                import importlib.util
+                importlib.util.find_spec("paho.mqtt.client")
+            self.assertEqual(raw.exception.name, "definitely_absent_xyz",
+                             "CONTROL: if this is not the missing dependency's "
+                             "own name, the split below is reading the wrong "
+                             "field and proves nothing")
 
     def test_the_skip_branch_still_reports_a_genuine_absence_as_None(self):
         """The other half. Widening the raise until it swallows the absent
@@ -2240,19 +2553,77 @@ def _import_real_paho_client():
 
     try:
         spec = importlib.util.find_spec("paho.mqtt.client")
-    except (ImportError, ValueError, AttributeError):
+    except ModuleNotFoundError as exc:
+        # THE SPLIT IS ONE BRANCH LOWER THAN IT LOOKS, and the comment below
+        # said otherwise until 2026-08-12 ("everything above this point is
+        # about LOCATING paho"). `find_spec` IMPORTS the parent packages, so
+        # paho's own `__init__` RUNS here - before the `exec_module` guard
+        # further down ever sees it. A missing dependency OF paho therefore
+        # landed in the old blanket `except (ImportError, ...)` below and was
+        # reported as "paho is not installed here", which is the identical
+        # false absence that guard exists to stop, one branch up. Found by the
+        # review of 094eac0.
+        #
+        # Measured on this machine, 2026-08-12, which is what the split is
+        # built from rather than reasoning about import machinery:
+        #
+        #   paho absent entirely         ModuleNotFoundError(name='paho')
+        #   __init__ imports absent mod  ModuleNotFoundError(name='<that mod>')
+        #   __init__ from-imports a
+        #     missing NAME               ImportError(name='os')  <- not MNFE
+        #   __init__ raises RuntimeError RuntimeError            <- uncaught
+        #   paho present, no client.py   spec is None
+        #
+        # Only the first row is an absence. The name is the whole signal: a
+        # missing name that IS paho (or under it) means paho is not there; a
+        # missing name that is anything else means paho IS there and cannot
+        # run.
+        if exc.name is not None and (exc.name == "paho"
+                                     or exc.name.startswith("paho.")):
+            return None
+        raise PahoIsInstalledButUnusable(
+            f"paho is installed and one of its own imports failed "
+            f"({exc.name!r} is missing), so this suite cannot pin anything "
+            f"against it. This is NOT the same as paho being absent: "
+            f"{exc!r}") from exc
+    except ValueError:
+        # `__spec__` is None, or the name is not importable as a package.
+        # Genuinely nothing to run against.
         return None
+    except Exception as exc:
+        # Rows three and four above. A bare `ImportError` from a `from ...
+        # import <missing name>` in paho's `__init__` used to return None here
+        # - the same false absence by a different exception class - and a
+        # RuntimeError from that `__init__` was not caught at all and left as
+        # a raw traceback with no explanation of which library broke.
+        #
+        # AttributeError lands here too, and deliberately: it means something
+        # called `paho` is on sys.path and is not a package, which is an
+        # unusable installation rather than a missing one. There is no absence
+        # path that produces it - absence is ModuleNotFoundError, measured
+        # above.
+        raise PahoIsInstalledButUnusable(
+            f"paho was found on sys.path and failed while being located, so "
+            f"this suite cannot pin anything against it. This is NOT the same "
+            f"as paho being absent: {exc!r}") from exc
     if spec is None or spec.origin is None or not spec.origin.endswith(".py"):
         return None
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
     except Exception as exc:
-        # RAISE, do not return None. Everything above this point is about
-        # LOCATING paho, where "not found" and "found a stub" are both
-        # honestly reported as absence and the caller's skip is true. This is
-        # different: a real .py file was found on disk and it failed to RUN.
-        # That is a broken installation, not a missing one.
+        # RAISE, do not return None. This is the EXECUTION half: a real .py
+        # file was found on disk and failed to run. That is a broken
+        # installation, not a missing one.
+        #
+        # ~~"Everything above this point is about LOCATING paho, where 'not
+        # found' and 'found a stub' are both honestly reported as absence and
+        # the caller's skip is true."~~ False, and the review of 094eac0
+        # measured it: `find_spec` imports the parent packages, so paho's own
+        # `__init__` runs up there and can fail in three ways that are all
+        # brokenness rather than absence. The classification now happens at
+        # BOTH points - see the comment on the `find_spec` call above - and
+        # this arm covers only `paho.mqtt.client` itself failing to exec.
         #
         # `except Exception: return None` here made those two states
         # indistinguishable, and the caller then skips with the words "paho is
