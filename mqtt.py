@@ -1222,7 +1222,17 @@ def on_message(client, userdata, msg):
         # `gardyn/humidity/get` left COMMAND_SUBSCRIPTIONS at 3ed7081, which is
         # a descendant of 9e00c2f, so a durable session still carries them.
         #
-        # All ten are literal, ASCII and derived from local config. So under a
+        # All ten are literal and LOCALLY DERIVED. That is the whole load-
+        # bearing property, and it is the only one asserted here on purpose:
+        # this sentence said "literal, ASCII and derived from local config"
+        # until 2026-08-12, and ASCII was an assumption about a file nobody
+        # reading this repo can see. Nine of the ten are ASCII literals in
+        # this module, but every one is prefixed with BASE_TOPIC, which is
+        # `os.getenv("MQTT_BASETOPIC", "gardyn")` (config.py) read from a
+        # GITIGNORED .env - so `MQTT_BASETOPIC=gardyn-café` makes the claim
+        # false and changes nothing about the conclusion. Locally derived is
+        # what matters: whatever those bytes are, WE chose them, not a peer.
+        # So under a
         # CONFORMING broker a topic arriving here is never remotely chosen, and
         # the reachable forgery case is a broker that does not conform, or one
         # an attacker controls - which is the same threat model that justifies
@@ -1248,6 +1258,41 @@ def on_message(client, userdata, msg):
         logger.info(f"Decoded payload on {topic!r}: {payload!r}")
     except UnicodeDecodeError:
         logger.error(f"Failed to decode message on topic {topic!r}. Likely binary.")
+        return
+    except AttributeError as exc:
+        # THE SAME PROCESS-EXIT ROUTE AS THE TOPIC GUARD ABOVE, one exception
+        # class over. `msg.payload` is wire bytes from paho, so `.decode` is
+        # there - but a payload that is None, a str, or absent raises
+        # AttributeError here, and nothing catches it: out of on_message, out
+        # of loop_forever(), out of the process, into a ten-second
+        # Restart=always loop with the grow light off on a host with no
+        # physical recovery path.
+        #
+        # Reachability is nil under the pinned paho 2.0.0, whose
+        # _handle_publish always hands over bytes - which is EXACTLY the
+        # reachability the topic guard's own AttributeError arm was given when
+        # review added it. Closing one and leaving the other was an asymmetry
+        # rather than a judgement, and the sentence written at that guard
+        # applies verbatim: a guard presented as closing a class should close
+        # it. T-527.29.
+        #
+        # A SEPARATE ARM, not `except (UnicodeDecodeError, AttributeError)`,
+        # because the two mean different things and this log line is the only
+        # thing an incident gets reconstructed from. Undecodable bytes point
+        # at the broker or a device; a payload with no `.decode` points at the
+        # library having moved underneath us, which sends the reader somewhere
+        # completely different. Deliberately NOT `except Exception`: this runs
+        # before dispatch and has no business swallowing handler faults.
+        #
+        # getattr, NOT msg.payload, to name the type. Reading the attribute
+        # that just raised, inside the handler for that raise, is the precise
+        # shape of the process-killer T-527.12 found at the topic guard - and
+        # `msg` here may have no `payload` at all.
+        payload_type = type(getattr(msg, "payload", None)).__name__
+        logger.error(
+            f"Dropped an inbound message on topic {topic!r} whose PAYLOAD has "
+            f"no usable bytes (type {payload_type!r}). This is a library "
+            f"shape change rather than a bad message: {exc!r}")
         return
 
     topic_suffix = topic.replace(BASE_TOPIC + "/", "")

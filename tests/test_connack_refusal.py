@@ -1989,6 +1989,94 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
                          "gardyn.log, which is the forgery this ticket closes")
         self.assertIn("\\n", messages[0])
 
+    def test_a_payload_with_no_decode_does_not_escape_on_message_either(self):
+        """T-527.29. The SIBLING of the topic guard, one statement below it,
+        which kept `except UnicodeDecodeError` alone when the topic guard was
+        widened.
+
+        `payload = msg.payload.decode("utf-8")` takes the identical route out
+        of the process when `.decode` is missing, and the asymmetry was the
+        whole finding: the topic arm was added for a shape "nothing in the
+        library does today", and this one was left for a shape with exactly
+        the same reachability.
+
+        Three shapes, because they fail at different places and a single case
+        would not distinguish them: a None payload, a payload that is already
+        a str (the shape a well-meaning double produces), and a message with
+        no `payload` attribute at all - which is also the case that would make
+        a naive handler re-raise while trying to report itself.
+        """
+        for label, msg in (
+            ("payload=None",
+             self._PahoShapedMessage(LIGHT_COMMAND.encode(), None)),
+            ("payload is already str",
+             self._PahoShapedMessage(LIGHT_COMMAND.encode(), "ON")),
+        ):
+            with self.subTest(shape=label):
+                # Fixture control: the payload really has no `.decode`, so a
+                # green result is the guard working rather than the input
+                # being harmless.
+                with self.assertRaises(AttributeError):
+                    msg.payload.decode("utf-8")
+                try:
+                    with self.assertLogs(mqtt_mod.logger, level="ERROR"):
+                        mqtt_mod.on_message(self.client, None, msg)
+                except AttributeError as exc:
+                    self.fail(
+                        f"on_message let an AttributeError escape for "
+                        f"{label} ({exc}). paho does not catch it, so it "
+                        f"leaves loop_forever() and the process exits into a "
+                        f"ten-second Restart=always loop with the light off")
+
+        # The third shape gets its own block: `msg` has no `payload` at all,
+        # so the HANDLER must not read it either. This is the case that would
+        # reproduce T-527.12's process-killer inside the fix for it.
+        no_payload = self._PahoShapedMessage(LIGHT_COMMAND.encode(), b"ON")
+        del no_payload.payload
+        with self.subTest(shape="no payload attribute"):
+            try:
+                with self.assertLogs(mqtt_mod.logger, level="ERROR") as caught:
+                    mqtt_mod.on_message(self.client, None, no_payload)
+            except AttributeError as exc:
+                self.fail(
+                    f"the handler re-read the attribute that raised, so the "
+                    f"guard itself exits the process ({exc}) - the exact "
+                    f"shape T-527.12 found at the topic guard")
+            self.assertTrue(
+                any("PAYLOAD has no usable bytes" in r.getMessage()
+                    for r in caught.records),
+                [r.getMessage() for r in caught.records])
+
+    def test_the_payload_drop_is_reported_as_a_LIBRARY_fault_not_a_broker_one(self):
+        """The two arms are kept separate on purpose, and this is what makes
+        that separation checkable.
+
+        An incident on this host is reconstructed from `gardyn.log` and
+        nothing else, so a drop that says "likely binary" sends the reader to
+        the broker and a device, while a payload with no `.decode` means the
+        library moved underneath us. Merging the arms into
+        `except (UnicodeDecodeError, AttributeError)` would still catch the
+        fault and would silently give it the wrong cause - the wrong-cause
+        notification being a defect this ticket has now hit seven times.
+        """
+        binary = self._PahoShapedMessage(LIGHT_COMMAND.encode(), b"\xff\xfe")
+        with self.assertLogs(mqtt_mod.logger, level="ERROR") as captured:
+            mqtt_mod.on_message(self.client, None, binary)
+        self.assertTrue(
+            any("Likely binary" in r.getMessage() for r in captured.records),
+            [r.getMessage() for r in captured.records])
+
+        broken = self._PahoShapedMessage(LIGHT_COMMAND.encode(), None)
+        with self.assertLogs(mqtt_mod.logger, level="ERROR") as captured:
+            mqtt_mod.on_message(self.client, None, broken)
+        messages = [r.getMessage() for r in captured.records]
+        self.assertTrue(
+            any("PAYLOAD has no usable bytes" in m for m in messages), messages)
+        self.assertFalse(
+            any("Likely binary" in m for m in messages),
+            f"a library shape change was reported as a binary payload, which "
+            f"points the reader at the broker: {messages}")
+
     def test_the_private_attribute_the_guard_reads_is_pinned_against_paho(self):
         """`getattr(msg, "_topic", None)` degrades SILENTLY, and this suite is
         structurally unable to notice - the fixture above sets `_topic`

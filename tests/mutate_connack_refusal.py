@@ -352,6 +352,31 @@ MUTANTS = [
      '                logger.error(f"Invalid water low cm value: {payload!r}")',
      '                logger.error(f"Invalid water low cm value: {payload!s}")'),
 
+    # --- T-527.29: the PAYLOAD guard, the topic guard's sibling -------------
+    # The production change of T-527.29 is one arm, and the lesson from F8 of
+    # the T-527.12 review is that a production change with no mutant anywhere
+    # leaves a green battery silent about the only thing the commit did. These
+    # three are the three ways it can regress, and they are deliberately not
+    # the same mutation: one removes the guard, one narrows it back the way a
+    # maintainer tidying up actually would, and one re-introduces the
+    # read-the-attribute-that-raised shape inside the handler - which is the
+    # T-527.12 process-killer relocated one statement down.
+    ("delete the payload guard's AttributeError arm - the pre-fix state",
+     "    except AttributeError as exc:",
+     "    except RuntimeError as exc:"),
+
+    # MERGING is the plausible tidy-up, and it still CATCHES the fault - so a
+    # test asserting only "nothing escaped" cannot see this. What it destroys
+    # is the cause reported in gardyn.log, which on this host is the only
+    # thing an incident gets reconstructed from.
+    ("merge the two payload arms - the fault is caught with the wrong cause",
+     '    except UnicodeDecodeError:\n        logger.error(f"Failed to decode message on topic {topic!r}. Likely binary.")',
+     '    except (UnicodeDecodeError, AttributeError):\n        logger.error(f"Failed to decode message on topic {topic!r}. Likely binary.")'),
+
+    ("the payload handler reads msg.payload again - the re-raise, relocated",
+     '        payload_type = type(getattr(msg, "payload", None)).__name__',
+     '        payload_type = type(msg.payload).__name__'),
+
     # --- 24-25: the invariant the fix RELIES on, in both directions ---------
     # Neither line is in the diff. The fix's whole argument is that the flag is
     # per-process and once-only; if it were neither, burning it would cost
