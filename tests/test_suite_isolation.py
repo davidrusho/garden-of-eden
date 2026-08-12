@@ -494,7 +494,23 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         for harness in sorted(self.SANDBOXED):
             with self.subTest(harness=harness):
                 text = read_text(os.path.join(REPO, "tests", harness))
-                self.assertIn("shutil.copytree(REPO", text)
+                # STRIP COMMENTS FIRST. A COMMENT QUOTING THIS LITERAL
+                # SATISFIES THE CHECK, which permanently disarms it. Found
+                # 2026-08-11 by review: c9a6a8d fixed a wrapped copytree call
+                # in mutate_payload_scanner.py and, in the same commit, added
+                # `# \`shutil.copytree(REPO\` stays on ONE line deliberately:`
+                # six lines above it — so the file held TWO occurrences and
+                # re-wrapping the call left this assertion green on the
+                # strength of the comment explaining why it must not be
+                # wrapped. Proven by a four-way control: call wrapped with the
+                # comment present passed; with the comment removed it failed.
+                #
+                # Splitting on `#` also truncates a `#` inside a string, which
+                # is fine here: it can only REMOVE text, so it can make this
+                # assertion fail spuriously but never pass spuriously, and a
+                # spurious failure is loud.
+                code = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+                self.assertIn("shutil.copytree(REPO", code)
 
     def test_every_mutation_harness_is_covered(self):
         """A new harness must be listed above, or it is untested by default -

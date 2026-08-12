@@ -290,12 +290,20 @@ def main():
     sandbox = tempfile.mkdtemp(prefix="mutate-payload-scanner-")
     root = os.path.join(sandbox, "repo")
     try:
-        # `shutil.copytree(REPO` stays on ONE line deliberately:
-        # test_suite_isolation.py's test_a_sandboxed_harness_still_works_on_a_copy
-        # asserts that literal, and it is the sole evidence entitling this
-        # harness to sit in SANDBOXED rather than IN_PLACE. Wrapped across two
-        # lines the assertion fails, and the harness keeps its exemption from
-        # the interrupted-battery check while the test earning it is red.
+        # THE CALL BELOW STAYS ON ONE LINE. test_suite_isolation.py's
+        # test_a_sandboxed_harness_still_works_on_a_copy greps for the opening
+        # of that call as a source literal, and it is the sole evidence
+        # entitling this harness to sit in SANDBOXED rather than IN_PLACE.
+        # Wrapped across two lines the assertion fails, and the harness keeps
+        # its exemption from the interrupted-battery check while the test
+        # earning it is red.
+        #
+        # This comment deliberately does NOT reproduce the literal. It did
+        # until 2026-08-11, which put two copies in the file and meant a
+        # re-wrapped call stayed green on the comment alone. The assertion now
+        # strips comments before matching, so both halves of that are fixed —
+        # but a comment that restates the string it guards is the defect, not
+        # merely the thing that exposed one.
         shutil.copytree(REPO, root,
                         ignore=shutil.ignore_patterns(
                             ".git", "__pycache__", "venv", "*.pyc"))
