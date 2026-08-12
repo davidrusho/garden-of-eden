@@ -333,12 +333,20 @@ MUTANTS = [
     # The guard returns early on an undecodable topic, so that line can never
     # see one, and a mutant there would survive honestly.
     ("delete the decode-once guard - an undecodable topic kills the process",
-     "    try:\n        topic = msg.topic\n    except UnicodeDecodeError:",
+     "    try:\n        topic = msg.topic\n    except (UnicodeDecodeError, AttributeError):",
      "    topic = msg.topic\n    if False:"),
 
+    # Narrowing, not deleting - the mutation a maintainer plausibly makes.
+    # AttributeError was added to the guard on review: the property is
+    # `self._topic.decode(...)`, so a `_topic` holding anything but bytes
+    # raises there and exits the process by the same route.
+    ("narrow the guard back to UnicodeDecodeError - AttributeError exits again",
+     "    except (UnicodeDecodeError, AttributeError):",
+     "    except UnicodeDecodeError:"),
+
     ("the guard's own handler reads msg.topic again - the original re-raise",
-     '                     "UTF-8: %r", getattr(msg, "_topic", None))',
-     '                     "UTF-8: %r", msg.topic)'),
+     '                     "decoded: %r", getattr(msg, "_topic", None))',
+     '                     "decoded: %r", msg.topic)'),
 
     ("escape it with !s instead - reads right, escapes nothing",
      '                logger.error(f"Invalid water low cm value: {payload!r}")',

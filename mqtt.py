@@ -1,14 +1,22 @@
 # mqtt.py
 #
-# Reviewed: 2026-08-12 against 251992a (T-527.12) - eight findings. The two that
-#           mattered were a comment I had just written asserting the wrong
-#           threat model (a subscription list is the client's INTENT, not the
-#           broker's state - a durable session still holds the pre-9e00c2f
-#           `gardyn/#` wildcard) and a pre-existing process-killer: on_message
-#           read `msg.topic` inside its own UnicodeDecodeError handler, so a
-#           topic that is not valid UTF-8 re-raised out of loop_forever().
-#           THE REMEDIATION FOR ALL EIGHT POSTDATES THIS SHA and is itself
-#           unreviewed - it is the commit after 251992a.
+# Reviewed: 2026-08-12 against 6de8a77 (T-527.12, second round) - eight more.
+#           The first round's own headline finding was REFUTED here: it said a
+#           durable session still holds the pre-9e00c2f `gardyn/#` wildcard, and
+#           9e00c2f is the commit that INTRODUCED the durable session, in the
+#           same change that removed the wildcard. No unit ever had both. I had
+#           already written that mechanism into two comments, a commit message
+#           and this header. A review finding is a claim; I verified the defect
+#           and not the mechanism.
+# Reviewed: 2026-08-12 against 251992a (T-527.12) - eight findings. The one that
+#           mattered was a pre-existing process-killer: on_message read
+#           `msg.topic` inside its own UnicodeDecodeError handler, and the
+#           attribute re-decodes on every access, so a topic that is not valid
+#           UTF-8 re-raised out of loop_forever() into a Restart=always loop
+#           with the light off. Six of the eight were comments, two of which
+#           went false in the commit that wrote them.
+#           BOTH REMEDIATIONS POSTDATE THEIR REVIEW; the second round's is the
+#           commit after 6de8a77 and is itself unreviewed.
 # Reviewed: 2026-08-07 against c1549f8 (T-527.1) - three rounds; each found a
 #           confident comment that was wrong, and the third found one in the
 #           fix for the second. The code was never the weak part.
@@ -1163,9 +1171,16 @@ def on_message(client, userdata, msg):
     # on the same rule as everything else here.
     try:
         topic = msg.topic
-    except UnicodeDecodeError:
-        logger.error("Dropped an inbound message whose TOPIC is not valid "
-                     "UTF-8: %r", getattr(msg, "_topic", None))
+    except (UnicodeDecodeError, AttributeError):
+        # AttributeError too, from review. The property is
+        # `self._topic.decode(...)`, so a `_topic` holding anything but bytes
+        # raises there instead - the same process-exit shape, one exception
+        # class over, and a guard presented as closing a class should close it.
+        # Deliberately NOT `except Exception`: this runs before any dispatch,
+        # so a blanket catch here would swallow faults that belong to the
+        # handler chain below and has no business being that wide.
+        logger.error("Dropped an inbound message whose TOPIC could not be "
+                     "decoded: %r", getattr(msg, "_topic", None))
         return
 
     try:
@@ -1194,28 +1209,42 @@ def on_message(client, userdata, msg):
         # raw while the payload beside it was escaped read as a considered
         # scope and was an oversight.
         #
-        # ~~Say what the exposure IS rather than inflating it:
-        # COMMAND_SUBSCRIPTIONS and LIFECYCLE_SUBSCRIPTIONS carry no wildcards,
-        # so a CONFORMING broker can only ever deliver the eight literal topics
-        # they name. The reachable case is a broker that does not conform.~~
-        # WRONG, and struck through rather than deleted so it is not re-derived.
-        # Caught by review the same day it was written.
+        # WHAT THE EXPOSURE IS. Third version of this paragraph; the first two
+        # are struck through below because each was wrong in a different way
+        # and the sequence is more useful than the answer.
         #
-        # A SUBSCRIPTION LIST IS THE CLIENT'S INTENT, NOT THE BROKER'S STATE -
-        # which the comment on COMMAND_SUBSCRIPTIONS above already says, and
-        # which the collision guard below exists because of. This client runs
+        # A SUBSCRIPTION LIST IS THE CLIENT'S INTENT, NOT THE BROKER'S STATE.
         # `clean_session=False` with a stable client_id, `subscribe()` only ever
-        # adds, and nothing calls `unsubscribe()`. So the broker still holds
-        # every subscription any earlier connect asked for - and before 9e00c2f
-        # that included `BASE_TOPIC + "/#"`. On a unit whose durable session
-        # predates it, `gardyn/light/command\n<forged line>` matches that stale
-        # wildcard, contains no wildcard character of its own, and is a legal
-        # Topic Name. An ordinary mosquitto delivers it to anyone with publish
-        # rights on the subtree.
+        # adds, nothing calls `unsubscribe()` - so the broker holds every
+        # subscription any earlier connect asked for, and the two lists below
+        # are a floor rather than a ceiling. Measured, that floor is TEN topics
+        # rather than the eight the lists name: `gardyn/temperature/get` and
+        # `gardyn/humidity/get` left COMMAND_SUBSCRIPTIONS at 3ed7081, which is
+        # a descendant of 9e00c2f, so a durable session still carries them.
         #
-        # So the reachable case is an ORDINARY broker plus a stale session, not
-        # a hostile one. The eight-literal-topics count describes what this
-        # client asks for, and says nothing about what arrives.
+        # All ten are literal, ASCII and derived from local config. So under a
+        # CONFORMING broker a topic arriving here is never remotely chosen, and
+        # the reachable forgery case is a broker that does not conform, or one
+        # an attacker controls - which is the same threat model that justifies
+        # escaping the payload, since a broker able to invent a topic chooses
+        # the bytes under it too.
+        #
+        # ~~(1) ...so a CONFORMING broker can only ever deliver the EIGHT
+        # literal topics they name.~~ Right conclusion, wrong count: it read
+        # the list as the broker's state, which is the error the collision
+        # guard below exists because of.
+        #
+        # ~~(2) ...the broker still holds `BASE_TOPIC + "/#"` from before
+        # 9e00c2f, so an ORDINARY broker plus a stale session delivers a forged
+        # topic.~~ Wrong, and worse than (1) because it overstated the risk in
+        # a comment justifying a fix. That set is empty by construction:
+        # 9e00c2f is the commit that INTRODUCED `clean_session` and `client_id`,
+        # in the same change that removed the wildcard. Before it,
+        # `mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)` took a random id and
+        # clean_session defaulted True, so no session survived to hold anything.
+        # No commit in this repo's history carries both a live `/#` subscribe
+        # and a durable session. Reviewed twice: the first review supplied this
+        # mechanism, the second refuted it with `git log -S`.
         logger.info(f"Decoded payload on {topic!r}: {payload!r}")
     except UnicodeDecodeError:
         logger.error(f"Failed to decode message on topic {topic!r}. Likely binary.")
@@ -1496,9 +1525,16 @@ def on_message(client, userdata, msg):
         # .isdigit() is not what saves it, and {e!r} buys nothing THERE.
         #
         # THIS IS DEFENSIVE, NOT A FIX FOR A LIVE PATH, and saying so is the
-        # point: no exception reachable from this try today has a verbatim
-        # str(). ValueError("bad\n...") raised by hand would - measured - so
-        # the escaping is what stops the next raise from reopening it.
+        # point: no exception reachable from this try carries a
+        # REMOTE-CONTROLLED operand verbatim. Narrowed from "has a verbatim
+        # str()", which was loose - app/sensors/distance/distance.py:102 raises
+        # MeasurementError(f"Measurement failed: {e}"), embedding another
+        # exception's str() with no escaping at all. It never reaches here only
+        # because safe_distance_measure()'s `except MeasurementError` contains
+        # it, and the earlier wording did not mention the containment its own
+        # truth depended on. ValueError("bad\n...") raised by hand would carry
+        # one - measured - so the escaping is what stops the next raise from
+        # reopening it.
         #
         # WHAT THIS DOES NOT CLOSE, said plainly because a half-fix described
         # as a fix is what stops the next reader looking: logger.exception()

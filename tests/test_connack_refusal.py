@@ -372,18 +372,16 @@ def _log_it(value):
 # the other was never a decision; it was the T-527.11 ask being written for
 # payloads and the sibling going unasked.
 #
-# ~~NOT a claim that a topic is as REACHABLE as a payload. COMMAND_SUBSCRIPTIONS
-# and LIFECYCLE_SUBSCRIPTIONS hold no wildcards, so a conforming broker can
-# deliver only the eight literal topics they name. The reachable case is a
-# broker that does not conform.~~ WRONG, and struck rather than deleted.
+# NOT a claim that a topic is as REACHABLE as a payload, and the reachability
+# argument took three attempts. The current one, and both wrong versions, live
+# at mqtt.py's decode site so there is one copy to correct; the short form is
+# that a subscription list is the CLIENT'S INTENT rather than the broker's
+# state, that the durable session's real floor is ten literal topics rather
+# than the eight the lists name, and that all ten are ASCII and locally
+# derived - so a remotely-chosen topic needs a broker that does not conform.
 #
-# A subscription list is the CLIENT'S INTENT, not the broker's state. mqtt.py
-# runs `clean_session=False` with a stable client_id, `subscribe()` only adds,
-# nothing calls `unsubscribe()`, and before 9e00c2f the list contained
-# `BASE_TOPIC + "/#"`. A unit whose durable session predates that commit still
-# has the wildcard registered at the broker, so an ORDINARY broker delivers
-# `gardyn/light/command\n<forged line>` to it. The topic is as reachable as the
-# payload on any such unit; see the same correction at mqtt.py's decode site.
+# The seed is here anyway. The scanner's job is to make a class of sink
+# impossible to write, not to rank today's inputs by likelihood.
 _TAINT_SEEDS = frozenset({"payload", "topic"})
 
 
@@ -391,29 +389,33 @@ def _is_taint_seed(node):
     """The places untrusted bytes ENTER, independent of what they get called.
 
     `msg.payload` and `msg.topic` are the real ones - paho hands the callback
-    an object and both are attributes of it. The bare names are kept because
-    on_message binds BOTH as locals in its first two statements - `topic =
-    msg.topic` since T-527.12, which decodes it once so the error handler
-    cannot re-raise - and several tests below hand one straight in as a
-    parameter.
+    an object and both are attributes of it.
 
     Seeding on the SOURCE rather than on the spelling is the whole T-527.17
     H2 fix: `body = msg.payload.decode()` is tainted because of where it came
-    from, so a rename cannot disarm the rule. The same now holds for
+    from, so a rename cannot disarm the rule. The same holds for
     `topic_suffix = topic.replace(...)`, which nothing logs today - the
     propagation is what keeps that true if anything ever does.
 
-    WHAT THE BARE-NAME HALF COSTS, since it is pure widening and a rule that
-    accuses correct code is a rule someone deletes. Any local called `topic`
-    or `payload` is treated as remote input wherever the scanner is pointed,
-    and mqtt.py already has two outbound functions that would qualify -
-    `publish_config(topic, payload)` and `_capture_and_publish(..., topic,
-    ...)`, both entirely local. Neither is accused today, but only because
-    this scanner is pointed at `on_message` and nothing else. Widening its
-    scope to the module means reading those two first. Found by review
-    2026-08-12; recorded rather than fixed, because over-reporting is the safe
-    direction here and the narrowing that would fix it (attribute-only seeding
-    for `topic`) also removes the propagation from the local on_message binds.
+    THE BARE-NAME HALF BUYS NOTHING FOR SHIPPING CODE, and this docstring said
+    the opposite until review measured it. It claimed the names were kept
+    because on_message binds both as locals. It does - and narrowing this
+    predicate to the Attribute branch alone leaves EVERY on_message assertion
+    green, because _tainted_names()'s fixpoint already taints a local bound
+    from `msg.topic` or `msg.payload`. That is what the propagation is for.
+    The one test that goes red takes `payload` as a PARAMETER, where there is
+    no assignment for the fixpoint to follow, and it fails on a form count
+    rather than on safety.
+
+    So: kept for the fixture parameters and for symmetry between the two
+    seeds, NOT because shipping code needs it - and the distinction matters
+    because the cost is real while the benefit is not. Any local called
+    `topic` or `payload` is treated as remote input wherever this scanner is
+    pointed, and mqtt.py already has two outbound functions that would
+    qualify: `publish_config(topic, payload)` and `_capture_and_publish(...,
+    topic, ...)`. Neither is accused today only because the scanner is pointed
+    at `on_message` and nothing else, so widening its scope to the module
+    means reading those two first.
     """
     return ((isinstance(node, ast.Name) and node.id in _TAINT_SEEDS)
             or (isinstance(node, ast.Attribute) and node.attr in _TAINT_SEEDS))
@@ -1851,9 +1853,20 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
     permanent ten-second restart loop with the grow light off, on a host with
     no physical recovery path.
 
-    Reachable on any unit whose durable session still holds the pre-9e00c2f
-    `gardyn/#` wildcard - see the note on _TAINT_SEEDS. Pre-existing; found
-    reviewing the escaping change to those same two lines.
+    ~~Reachable on any unit whose durable session still holds the pre-9e00c2f
+    `gardyn/#` wildcard.~~ WRONG, struck rather than deleted: 9e00c2f is the
+    commit that INTRODUCED the durable session, in the same change that
+    removed the wildcard, so no unit ever had both.
+
+    So this is DEFENCE IN DEPTH, not the closure of a live path - the same
+    distinction the `{e!r}` comment in mqtt.py had to be corrected to make.
+    Under a conforming broker this client only ever receives the ten literal
+    ASCII topics its session has subscribed to. It is still worth having:
+    paho hands over whatever arrived without validating it, the failure mode
+    is the process exiting on a host with no recovery path, and the guard
+    costs four lines.
+
+    Pre-existing; found reviewing the escaping change to those same two lines.
     """
 
     class _PahoShapedMessage:
@@ -1875,11 +1888,19 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
     def setUp(self):
         self.client = MagicMock()
 
-    def test_a_conforming_topic_still_reaches_a_handler(self):
+    def test_a_conforming_topic_reaches_the_decode_line(self):
         """POSITIVE CONTROL for the two tests below, which assert an absence.
 
-        Without it, a fixture that on_message rejects for some unrelated
-        reason would make both of them pass while measuring nothing.
+        Without it, a fixture that on_message rejects outright would make both
+        of them pass while measuring nothing.
+
+        NAMED FOR WHERE IT ACTUALLY REACHES, after review. It was
+        `..._still_reaches_a_handler`, which is more than it shows: the decode
+        line is emitted BEFORE dispatch, and under this suite's stubs
+        `light_scheduler is None`, so the light command is refused and
+        `client.publish` is never called. As a control against "the fixture is
+        rejected at the door" it is sound; it cannot catch a fixture that bails
+        after the decode line, and the name should not imply otherwise.
         """
         msg = self._PahoShapedMessage(LIGHT_COMMAND.encode(), b"ON")
         with self.assertLogs(mqtt_mod.logger, level="INFO") as captured:
@@ -1905,18 +1926,125 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
                 f"process exits into a ten-second Restart=always loop with "
                 f"the light off")
 
+    def test_a_topic_property_raising_AttributeError_does_not_escape_either(self):
+        """The second arm of the guard, which shipped UNPINNED - the battery
+        caught it surviving, and the reviewer who asked for the arm predicted
+        it would.
+
+        paho's property is `self._topic.decode("utf-8")`, so a `_topic` holding
+        anything without `.decode` raises AttributeError there instead. Same
+        process-exit route, one exception class over, and a guard presented as
+        closing a class has to close it.
+
+        Lower reachability than the UnicodeDecodeError arm, and deliberately
+        not described as equal: it needs paho to hand over a non-bytes
+        `_topic`, which nothing in the library does today.
+        """
+        class _BadTopicMessage:
+            payload, qos, retain = b"ON", 1, False
+            _topic = None
+
+            @property
+            def topic(self):
+                return self._topic.decode("utf-8")
+
+        msg = _BadTopicMessage()
+        # Fixture control: the property really does raise, so a green result
+        # below is the guard working rather than the input being harmless.
+        with self.assertRaises(AttributeError):
+            msg.topic
+
+        try:
+            mqtt_mod.on_message(self.client, None, msg)
+        except AttributeError as exc:
+            self.fail(
+                f"on_message let an AttributeError escape ({exc}). paho does "
+                f"not catch it, so it leaves loop_forever() and the process "
+                f"exits into a ten-second Restart=always loop with the light "
+                f"off - the same outcome as the UnicodeDecodeError arm")
+
     def test_the_drop_is_recorded_with_the_raw_bytes_escaped(self):
         """Dropping it silently would be its own defect: this is the one
-        record that a hostile or misconfigured broker reached this device."""
-        msg = self._PahoShapedMessage(b"gardyn/x\xff\nFORGED", b"ON")
+        record that a hostile or misconfigured broker reached this device.
+
+        AND IT IS THE ONLY THING COVERING THIS SINK. The scanner does not see
+        this line - `_topic` reaches it as a string literal inside `getattr`,
+        which is not a taint seed - so neither the raw-interpolation rule nor
+        the canonical-`!r` rule reaches it, and every other sink in
+        `on_message` is machine-checked. Hence all three control characters
+        here rather than the newline alone: for this line the fixture IS the
+        rule. Found by review 2026-08-12.
+        """
+        msg = self._PahoShapedMessage(
+            b"gardyn/x\xff\nFORGED\rCR\x1b[2Jcleared", b"ON")
         with self.assertLogs(mqtt_mod.logger, level="ERROR") as captured:
             mqtt_mod.on_message(self.client, None, msg)
         messages = [r.getMessage() for r in captured.records]
         self.assertEqual(1, len(messages), messages)
+        for raw, escaped in (("\r", "\\r"), ("\x1b", "\\x1b")):
+            self.assertNotIn(raw, messages[0])
+            self.assertIn(escaped, messages[0])
         self.assertNotIn("\n", messages[0],
                          "the dropped topic's raw bytes put a line break into "
                          "gardyn.log, which is the forgery this ticket closes")
         self.assertIn("\\n", messages[0])
+
+    def test_the_private_attribute_the_guard_reads_is_pinned_against_paho(self):
+        """`getattr(msg, "_topic", None)` degrades SILENTLY, and this suite is
+        structurally unable to notice - the fixture above sets `_topic`
+        because the production code reads it, so both sides agree by
+        construction. That is the shared-blind-spot case: a double written
+        from the same belief as the code, where every mutant dies honestly.
+
+        `_topic` is paho-private, so it can be renamed in a minor release with
+        nothing in this repo objecting. The drop would then log
+        `... could not be decoded: None`, which is exactly the incident record
+        the comment at the guard calls "the only useful thing" - and the guard
+        would still work, so nothing else would go red either.
+
+        SKIPPED rather than FAILED where paho is absent (it is not installed on
+        the development machine, and the whole suite stubs it out), because a
+        failure there would be a false finding about the environment rather
+        than about the code. A skip that is counted is the honest state; see
+        the same reasoning in tests/test_suite_isolation.py.
+        """
+        real_paho = _import_real_paho_client()
+        if real_paho is None:
+            self.skipTest("paho is not installed here; nothing to pin against")
+        message = real_paho.MQTTMessage(topic=b"gardyn/light/command")
+        self.assertTrue(
+            hasattr(message, "_topic"),
+            "paho's MQTTMessage no longer carries `_topic`, so mqtt.py's "
+            "guard now logs None instead of the bytes that arrived - see "
+            "AnUndecodableTopicIsDroppedNotFatalTests")
+        self.assertIsInstance(
+            message._topic, bytes,
+            "`_topic` is no longer bytes, so %r of it is not the escaped "
+            "byte record the guard's comment promises")
+
+
+def _import_real_paho_client():
+    """The REAL paho, not this suite's stub - or None if it is not installed.
+
+    sys.modules holds a MagicMock for `paho.mqtt.client` for the length of
+    mqtt.py's import, and a MagicMock satisfies `hasattr` for every name, so
+    reading it here would make the assertions above true for free. This goes
+    to the filesystem instead and refuses to answer from anything mocked.
+    """
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("paho.mqtt.client")
+    except (ImportError, ValueError, AttributeError):
+        return None
+    if spec is None or spec.origin is None or not spec.origin.endswith(".py"):
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    return module
 
 
 if __name__ == "__main__":
