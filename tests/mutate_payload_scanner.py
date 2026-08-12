@@ -56,10 +56,25 @@ SUITES = ["tests.test_connack_refusal"]
 # (label, anchor, replacement, the test that must notice)
 MUTANTS = [
     ("seed narrowed back to the bare name - msg.payload stops being a source",
-     '    return ((isinstance(node, ast.Name) and node.id == "payload")\n'
-     '            or (isinstance(node, ast.Attribute) and node.attr == "payload"))',
-     '    return (isinstance(node, ast.Name) and node.id == "payload")',
+     "    return ((isinstance(node, ast.Name) and node.id in _TAINT_SEEDS)\n"
+     "            or (isinstance(node, ast.Attribute) and node.attr in _TAINT_SEEDS))",
+     "    return (isinstance(node, ast.Name) and node.id in _TAINT_SEEDS)",
      "reports_the_shapes_that_defeated_the_old_one"),
+
+    # T-527.12. Per NAME, for the same reason the sink-method mutants below are
+    # per name: the defect this guards is a seed going MISSING from the set,
+    # which is a one-word edit, not the set being emptied.
+    #
+    # The expected killer is the POSITIVE CONTROL, deliberately, not
+    # test_the_seed_set_is_pinned_per_name - that one also goes red and would
+    # be a circular kill, since it asserts the very constant this mutates.
+    # `expect` is matched against unittest's `FAIL: <method>` names, which stop
+    # at the first space and therefore never contain the class, so it has to be
+    # a method-name fragment rather than the suite's name.
+    ("the topic seed dropped - msg.topic stops being a source again",
+     '_TAINT_SEEDS = frozenset({"payload", "topic"})',
+     '_TAINT_SEEDS = frozenset({"payload"})',
+     "a_raw_topic_is_reported"),
 
     ("taint propagation removed - H1, a bound intermediate, escapes again",
      "    names = set()\n    changed = True",

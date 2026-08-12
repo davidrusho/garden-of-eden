@@ -1150,9 +1150,24 @@ def on_message(client, userdata, msg):
         # \x1b. Nothing in this repo rotates gardyn.log - no logrotate unit, and
         # basicConfig() above uses a plain FileHandler - so a forged line stays
         # there for as long as anyone will be reading it.
-        logger.info(f"Decoded payload on {msg.topic}: {payload!r}")
+        #
+        # THE TOPIC IS ESCAPED ON THE SAME RULE (T-527.12), and it was not
+        # until now. An MQTT topic name is UTF-8 with only `+`, `#` and NUL
+        # excluded, so it can carry \n, \r and \x1b exactly as a payload can -
+        # the forgery argument above does not distinguish the two. Leaving it
+        # raw while the payload beside it was escaped read as a considered
+        # scope and was an oversight.
+        #
+        # Say what the exposure IS rather than inflating it: COMMAND_SUBSCRIPTIONS
+        # and LIFECYCLE_SUBSCRIPTIONS carry no wildcards, so a CONFORMING broker
+        # can only ever deliver the eight literal topics they name, all built
+        # from local config. The reachable case is a broker that does not
+        # conform, or one an attacker controls - which is the same threat model
+        # that justifies escaping the payload, since a broker able to invent a
+        # topic is able to choose the bytes under it.
+        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")
     except UnicodeDecodeError:
-        logger.error(f"Failed to decode message on topic {msg.topic}. Likely binary.")
+        logger.error(f"Failed to decode message on topic {msg.topic!r}. Likely binary.")
         return
 
     topic_suffix = msg.topic.replace(BASE_TOPIC + "/", "")
@@ -1417,7 +1432,23 @@ def on_message(client, userdata, msg):
         # AttributeError into the catch-all below.
 
     except Exception as e:
-        logger.exception(f"Error handling message on topic {msg.topic}: {e}")
+        # {e!r}, not {e} (T-527.12). An exception's str() can quote its operand
+        # verbatim - int("\N{SUPERSCRIPT TWO}") is the live example, since
+        # .isdigit() lets it through - so this line is a payload sink by
+        # inheritance. repr() of an exception repr()s its args, which escapes
+        # the control characters str() would have written straight out.
+        #
+        # WHAT THIS DOES NOT CLOSE, said plainly because a half-fix described
+        # as a fix is what stops the next reader looking: logger.exception()
+        # also renders exc_info, and the traceback's final line is str(e), not
+        # repr(e). A raw control character in an exception message still
+        # reaches gardyn.log by that route, and no escaping at this call site
+        # can reach it - it is formatted by the logging module, not here.
+        # Closing it needs a Formatter, which is a wider change than this step.
+        # The scanner in tests/test_connack_refusal.py cannot see either half:
+        # `except ... as e` is outside the taint propagation on purpose, so
+        # this line is pinned by a source assertion instead.
+        logger.exception(f"Error handling message on topic {msg.topic!r}: {e!r}")
 
 def publish_pcb_temperature(client):
     while True:

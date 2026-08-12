@@ -264,19 +264,19 @@ MUTANTS = [
 
     # --- 18-23: the payload sinks -------------------------------------------
     ("restore the raw interpolation - the second defect, exactly as it was",
-     '        logger.info(f"Decoded payload on {msg.topic}: {payload!r}")',
-     "        logger.info(f\"Decoded payload on {msg.topic}: '{payload}'\")"),
+     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")',
+     "        logger.info(f\"Decoded payload on {msg.topic!r}: '{payload}'\")"),
 
     ("interpolate raw and unquoted",
-     '        logger.info(f"Decoded payload on {msg.topic}: {payload!r}")',
-     '        logger.info(f"Decoded payload on {msg.topic}: {payload}")'),
+     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")',
+     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload}")'),
 
     ("!r -> !s - str() escapes nothing",
-     '        logger.info(f"Decoded payload on {msg.topic}: {payload!r}")',
-     '        logger.info(f"Decoded payload on {msg.topic}: {payload!s}")'),
+     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")',
+     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!s}")'),
 
     ("delete the decode line - no record of what arrived at all",
-     '        logger.info(f"Decoded payload on {msg.topic}: {payload!r}")\n',
+     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")\n',
      ""),
 
     ("un-escape the water threshold rejection - the sink review found raw",

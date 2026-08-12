@@ -362,20 +362,41 @@ def _log_it(value):
     raise AssertionError("fixture helper is parsed, never run")
 
 
-def _is_taint_seed(node):
-    """The two places untrusted bytes ENTER, independent of what they get called.
+# THE ATTRIBUTES OF `msg` A REMOTE PARTY CHOOSES. Per name rather than as one
+# predicate, so dropping either is a one-word mutation a maintainer would
+# plausibly make - which is what the battery perturbs.
+#
+# `topic` joined `payload` in T-527.12. An MQTT topic name is UTF-8 excluding
+# only `+`, `#` and NUL, so it carries \n, \r and \x1b as freely as a payload
+# does and forges a log line by the identical mechanism. Escaping one and not
+# the other was never a decision; it was the T-527.11 ask being written for
+# payloads and the sibling going unasked.
+#
+# NOT a claim that a topic is as REACHABLE as a payload. COMMAND_SUBSCRIPTIONS
+# and LIFECYCLE_SUBSCRIPTIONS hold no wildcards, so a conforming broker can
+# deliver only the eight literal topics they name. The reachable case is a
+# broker that does not conform - and such a broker chooses the payload too, so
+# the two share a threat model rather than competing for one.
+_TAINT_SEEDS = frozenset({"payload", "topic"})
 
-    `msg.payload` is the real one - paho hands the callback an object and the
-    bytes are an attribute of it. A bare name `payload` is kept because
-    mqtt.py binds it at on_message's first statement and several tests below
-    hand one straight in as a parameter.
+
+def _is_taint_seed(node):
+    """The places untrusted bytes ENTER, independent of what they get called.
+
+    `msg.payload` and `msg.topic` are the real ones - paho hands the callback
+    an object and both are attributes of it. The bare names are kept because
+    mqtt.py binds `payload` at on_message's first statement and several tests
+    below hand one straight in as a parameter.
 
     Seeding on the SOURCE rather than on the spelling is the whole T-527.17
     H2 fix: `body = msg.payload.decode()` is tainted because of where it came
-    from, so a rename cannot disarm the rule.
+    from, so a rename cannot disarm the rule. The same now holds for
+    `topic_suffix = msg.topic.replace(...)`, which on_message binds and which
+    nothing logs today - the propagation is what keeps that true if anything
+    ever does.
     """
-    return ((isinstance(node, ast.Name) and node.id == "payload")
-            or (isinstance(node, ast.Attribute) and node.attr == "payload"))
+    return ((isinstance(node, ast.Name) and node.id in _TAINT_SEEDS)
+            or (isinstance(node, ast.Attribute) and node.attr in _TAINT_SEEDS))
 
 
 def _is_payload_reference(node, names=frozenset()):
@@ -564,8 +585,16 @@ def _payload_sinks(func):
         next reader does not restore it: every int()/
         float() over the payload is either gated on `.isdigit()` or caught
         locally and logged with `!r` - but that is a property of today's
-        branches, not of the guard. The blanket fix is `{e!r}`, and it is
-        filed against T-527.12, which already touches this file.
+        branches, not of the guard.
+
+        THE BLANKET FIX `{e!r}` IS NOW APPLIED at that line (T-527.12), so the
+        shape is still invisible here and the instance is no longer live. It is
+        pinned by test_the_catch_all_handler_reprs_its_exception below, which
+        reads the source, because that is the only instrument that can. Note
+        what `{e!r}` does NOT close and what the source assertion therefore
+        does not promise: logger.exception() renders exc_info as well, and the
+        traceback's last line is str(e). That route is formatted by the logging
+        module and no call-site escaping reaches it.
       * A format string that is not a literal, `%`-formatting with a mapping
         key or a `*` width, and `.format()` with keyword fields or a splat.
         Each of those bails to RAW rather than guessing, so they are loud.
@@ -1636,9 +1665,128 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
     def test_an_ordinary_payload_still_reads_naturally(self):
         """repr() of a plain string is the quoted form the line already had, so
         the fix does not change what an operator reads for normal traffic - and
-        the sibling suites that match on that shape stay valid."""
+        the sibling suites that match on that shape stay valid.
+
+        The topic is quoted too as of T-527.12. That is a real change to what
+        an operator reads, so it is asserted here rather than left for someone
+        to discover from a grep that stopped matching."""
         message = self._decode_record(LIGHT_COMMAND, b"ON")
-        self.assertEqual(f"Decoded payload on {LIGHT_COMMAND}: 'ON'", message)
+        self.assertEqual(f"Decoded payload on '{LIGHT_COMMAND}': 'ON'", message)
+
+    def test_a_topic_carrying_a_newline_cannot_forge_a_line(self):
+        """END TO END, not source-level: the point of escaping the topic is
+        what lands in the record, and every other test in this pair reads the
+        source instead.
+
+        A topic is where the forgery goes when the payload stops accepting it.
+        paho does not validate an inbound topic against the filters it
+        subscribed to - it hands over whatever the broker sent - so a
+        non-conforming broker delivering `gardyn/light/command\\nFORGED` gets
+        that newline into gardyn.log verbatim unless this line escapes it.
+        """
+        forged_topic = (LIGHT_COMMAND
+                        + "\n2026-01-01 00:00:00,000 - mqtt - ERROR - forged")
+        # The fixture control, same as its payload sibling above: the topic
+        # really does carry a raw newline, so a green result below is the
+        # escaping working rather than the input being harmless.
+        self.assertIn("\n", forged_topic)
+
+        message = self._decode_record(forged_topic, b"ON")
+        self.assertNotIn("\n", message,
+                         "a topic put a line break into gardyn.log")
+        self.assertIn("\\n", message)
+
+    def test_the_catch_all_handler_reprs_its_exception(self):
+        """SOURCE-LEVEL, and that is a limitation rather than a preference.
+
+        The scanner cannot reach this line: `except ... as e` is outside
+        _bindings() on purpose, and whether a given exception's str() quotes
+        its operand is a runtime property of that exception class rather than
+        anything an AST can decide. See the EXCEPTION bullet on
+        _payload_sinks(), which names this line.
+
+        So this asserts the spelling, and the spelling is all it asserts. It
+        does NOT assert that no control character can reach gardyn.log from
+        this call - logger.exception() also renders exc_info, whose final line
+        is str(e), and nothing at this call site formats that.
+        """
+        import inspect
+
+        source = inspect.getsource(mqtt_mod)
+        self.assertIn(
+            'logger.exception(f"Error handling message on topic '
+            '{msg.topic!r}: {e!r}")',
+            source,
+            "the catch-all handler interpolates its exception without repr(), "
+            "so an exception whose message quotes a payload can forge a log "
+            "line - see the EXCEPTION bullet on _payload_sinks()",
+        )
+
+
+class TopicIsATaintSeedTests(unittest.TestCase):
+    """T-527.12. The scanner's widening from payload-only to payload-and-topic.
+
+    Separate from the shipping-code assertions above because these test the
+    RULE, and a rule that has no case which makes it fire is indistinguishable
+    from an absent one. Every fixture here is a shape mqtt.py does not contain;
+    that is the point - the shipping code is clean, so only a synthetic case
+    can prove the widening fires at all.
+    """
+
+    def test_a_raw_topic_is_reported(self):
+        """The positive control. Before T-527.12 every one of these scanned
+        clean, which is exactly what made the gap invisible."""
+        def raw_topic_in_an_fstring(msg, sink):
+            sink.info(f"arrived on {msg.topic}")
+
+        def raw_topic_through_a_bound_local(msg, sink):
+            where = msg.topic
+            sink.error(f"arrived on {where}")
+
+        def raw_topic_in_lazy_logging(msg, sink):
+            sink.error("arrived on %s", msg.topic)
+
+        def raw_topic_via_a_derived_suffix(msg, sink):
+            suffix = msg.topic.replace("gardyn/", "")
+            sink.warning(f"suffix {suffix}")
+
+        for shape in (raw_topic_in_an_fstring, raw_topic_through_a_bound_local,
+                      raw_topic_in_lazy_logging, raw_topic_via_a_derived_suffix):
+            with self.subTest(shape=shape.__name__):
+                self.assertEqual(
+                    ["RAW"], [f for _, f, _ in _payload_sinks(shape)],
+                    f"{shape.__name__} puts a broker-chosen topic into the "
+                    f"record unescaped and the scanner did not say so")
+
+    def test_an_escaped_topic_is_not_reported_as_raw(self):
+        """The negative control, and the direction that gets a check deleted:
+        a rule that accuses correct code is a rule someone removes."""
+        def escaped_topic(msg, sink):
+            sink.info(f"arrived on {msg.topic!r}")
+
+        def escaped_topic_lazily(msg, sink):
+            sink.error("arrived on %r", msg.topic)
+
+        for shape in (escaped_topic, escaped_topic_lazily):
+            with self.subTest(shape=shape.__name__):
+                forms = [f for _, f, _ in _payload_sinks(shape)]
+                self.assertNotIn("RAW", forms)
+                self.assertEqual(1, len(forms), forms)
+
+    def test_the_seed_set_is_pinned_per_name(self):
+        """_TAINT_SEEDS is the whole rule, and dropping one member is a
+        one-word edit. Asserted AS A SET rather than by membership, so an
+        addition has to be deliberate too - a seed that is wrong in the
+        widening direction accuses correct code."""
+        self.assertEqual({"payload", "topic"}, set(_TAINT_SEEDS))
+
+    def test_the_topic_seed_reaches_the_attribute_not_only_the_bare_name(self):
+        """mqtt.py never binds a local called `topic` - it reads `msg.topic`
+        every time - so if only the bare name were seeded the whole widening
+        would be dead on the shipping code while every fixture above still
+        passed on its parameter name."""
+        tree = ast.parse("sink.info(f'on {msg.topic}')")
+        self.assertTrue(any(_is_taint_seed(n) for n in ast.walk(tree)))
 
 
 if __name__ == "__main__":

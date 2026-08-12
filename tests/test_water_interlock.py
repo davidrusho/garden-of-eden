@@ -753,11 +753,19 @@ class LoggingPolicyTestCase(unittest.TestCase):
     def test_inbound_decode_is_recorded(self):
         """on_message's decode is the ONLY record of what arrived on the wire.
         At debug it is invisible, and a replayed queued command then looks
-        identical to a fresh one."""
+        identical to a fresh one.
+
+        This asserts the LEVEL, which is the property the test is named for.
+        The `{msg.topic!r}` in the literal is incidental to that - it is here
+        because matching the source needs the current spelling, not because
+        this test has an opinion about escaping. T-527.12 changed it from
+        `{msg.topic}` and the escaping itself is pinned in
+        tests/test_connack_refusal.py, which is where a failure should be read
+        from."""
         import inspect
 
         source = inspect.getsource(mqtt_mod)
-        self.assertIn('logger.info(f"Decoded payload on {msg.topic}', source)
+        self.assertIn('logger.info(f"Decoded payload on {msg.topic!r}', source)
 
     def test_logging_is_not_globally_disabled(self):
         """logging.disable() is a module-wide threshold that no logger or

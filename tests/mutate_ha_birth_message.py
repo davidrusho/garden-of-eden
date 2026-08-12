@@ -176,9 +176,21 @@ MUTANTS = [
      '    client.publish(STATUS_TOPIC, "online", qos=1, retain=True)\n',
      ""),
 
+    # ANCHORED ON THE COMMENT ABOVE THE CALL, not the line below it. The old
+    # anchor was `publish_light_state(client)\n    # The single writer`, which
+    # went stale at b95e263 (T-527.6) when the light-source publish was
+    # inserted between the two - and stayed stale, matching 0 times, so this
+    # mutant scored NOT APPLIED and nothing was testing the republish. Found
+    # 2026-08-12 during T-527.12, by reading the battery's rc rather than its
+    # kill count: 38 killed of 39 still prints as a wall of green.
+    #
+    # The comment is the safer half to anchor on: `publish_light_state(client)`
+    # appears at two call sites, so an anchor made of the call alone is either
+    # ambiguous or has to reach for a neighbour that can move again.
     ("drop the light-state republish - HA rebuilds the entity at `unknown`",
-     "    publish_light_state(client)\n    # The single writer",
-     "    # The single writer"),
+     "    # immediately on subscribe instead of sitting at `unknown`.\n"
+     "    publish_light_state(client)\n",
+     "    # immediately on subscribe instead of sitting at `unknown`.\n"),
 
     ("drop the retired-entity clear from the announce",
      "    clear_retired_entities(client)\n",
@@ -283,8 +295,8 @@ MUTANTS = [
      "    return False"),
 
     ("logger.exception -> logger.error, losing the traceback",
-     "        logger.exception(f\"Error handling message on topic {msg.topic}: {e}\")",
-     "        logger.error(f\"Error handling message on topic {msg.topic}: {e}\")"),
+     "        logger.exception(f\"Error handling message on topic {msg.topic!r}: {e!r}\")",
+     "        logger.error(f\"Error handling message on topic {msg.topic!r}: {e!r}\")"),
 
     ("drop the handler-side collision guard - the echo loop comes back",
      "        if msg.topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:",
