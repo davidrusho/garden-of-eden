@@ -144,9 +144,13 @@ MQTT = os.path.join(REPO, "mqtt.py")
 #
 # MEASURED, because the reason it was added overstated what it does: of mutants
 # 18-21 it catches only 21, the one that DELETES the decode line. Its assertion
-# matches the source up to `{msg.topic}` and stops, so every mutant that changes
-# only the CONVERSION (18, 19, 20) leaves it green, as does 22 and the new
-# multi-line sink mutants. It therefore adds no kill this battery did not
+# matches the source up to `{topic!r}` and stops, so every mutant that changes
+# only the PAYLOAD's conversion (18, 19, 20) leaves it green, as does 22 and the
+# multi-line sink mutants. (Since T-527.12 the literal it matches includes the
+# topic's own `!r`, so it does now catch a topic un-escaping at that line - a
+# side effect of the spelling rather than a coverage decision, and the mutants
+# below are what cover topics on purpose.) It therefore adds no kill this
+# battery did not
 # already have. What it adds is an independent pin on the decode line's
 # existence, held by a suite with different stubs and a different reason to
 # exist - which is worth one extra subprocess per mutant and is not worth
@@ -264,24 +268,77 @@ MUTANTS = [
 
     # --- 18-23: the payload sinks -------------------------------------------
     ("restore the raw interpolation - the second defect, exactly as it was",
-     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")',
-     "        logger.info(f\"Decoded payload on {msg.topic!r}: '{payload}'\")"),
+     '        logger.info(f"Decoded payload on {topic!r}: {payload!r}")',
+     "        logger.info(f\"Decoded payload on {topic!r}: '{payload}'\")"),
 
     ("interpolate raw and unquoted",
-     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")',
-     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload}")'),
+     '        logger.info(f"Decoded payload on {topic!r}: {payload!r}")',
+     '        logger.info(f"Decoded payload on {topic!r}: {payload}")'),
 
     ("!r -> !s - str() escapes nothing",
-     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")',
-     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!s}")'),
+     '        logger.info(f"Decoded payload on {topic!r}: {payload!r}")',
+     '        logger.info(f"Decoded payload on {topic!r}: {payload!s}")'),
 
     ("delete the decode line - no record of what arrived at all",
-     '        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")\n',
+     '        logger.info(f"Decoded payload on {topic!r}: {payload!r}")\n',
      ""),
 
     ("un-escape the water threshold rejection - the sink review found raw",
      '                logger.error(f"Invalid water low cm value: {payload!r}")',
      '                logger.error(f"Invalid water low cm value: {payload}")'),
+
+    # --- the TOPIC sinks (T-527.12) -----------------------------------------
+    #
+    # Added after review. The T-527.12 commit escaped three topic sinks in
+    # mqtt.py and re-anchored six existing mutants onto the new spelling -
+    # which left the production change with **no mutant of its own in any
+    # battery**. All four batteries scored 100% and none of them was asking the
+    # question the commit had just answered. A re-anchored mutant scores an
+    # unchanged question; only these three perturb the change itself.
+    #
+    # One per sink rather than one for the set, because each is a separate line
+    # a maintainer could un-escape independently, and because the third is the
+    # only one reachable from the handler path.
+    ("un-escape the topic on the decode line - the T-527.12 defect, restored",
+     '        logger.info(f"Decoded payload on {topic!r}: {payload!r}")',
+     '        logger.info(f"Decoded payload on {topic}: {payload!r}")'),
+
+    ("un-escape the topic on the undecodable-payload line",
+     '        logger.error(f"Failed to decode message on topic {topic!r}. '
+     'Likely binary.")',
+     '        logger.error(f"Failed to decode message on topic {topic}. '
+     'Likely binary.")'),
+
+    ("un-escape the topic on the catch-all handler",
+     '        logger.exception(f"Error handling message on topic {topic!r}: '
+     '{e!r}")',
+     '        logger.exception(f"Error handling message on topic {topic}: '
+     '{e!r}")'),
+
+    # --- the undecodable-topic guard (T-527.12, from review) -----------------
+    #
+    # The defect this restores killed the process: `msg.topic` re-decodes on
+    # every access, so reading it inside the handler for its own
+    # UnicodeDecodeError raised out of on_message, out of loop_forever(), into
+    # a permanent ten-second Restart=always loop with the light off.
+    #
+    # Both directions, and the second is the one that matters. Deleting a guard
+    # is the mutation no maintainer makes; re-reading `msg.topic` inside the
+    # guard's OWN handler is the shape somebody writes back while tidying (it
+    # reads as "log the topic that failed"), and it reintroduces the crash
+    # exactly.
+    #
+    # Note what is NOT here and why, so the absence is not read as coverage:
+    # putting `msg.topic` back in the PAYLOAD handler below is harmless now.
+    # The guard returns early on an undecodable topic, so that line can never
+    # see one, and a mutant there would survive honestly.
+    ("delete the decode-once guard - an undecodable topic kills the process",
+     "    try:\n        topic = msg.topic\n    except UnicodeDecodeError:",
+     "    topic = msg.topic\n    if False:"),
+
+    ("the guard's own handler reads msg.topic again - the original re-raise",
+     '                     "UTF-8: %r", getattr(msg, "_topic", None))',
+     '                     "UTF-8: %r", msg.topic)'),
 
     ("escape it with !s instead - reads right, escapes nothing",
      '                logger.error(f"Invalid water low cm value: {payload!r}")',

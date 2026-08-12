@@ -134,12 +134,12 @@ MUTANTS = [
 
     # --- 9-11: the new branch's placement in on_message ----------------------
     ("delete the birth branch entirely - falls through, nothing announced",
-     "        elif msg.topic == HA_STATUS_TOPIC:",
+     "        elif topic == HA_STATUS_TOPIC:",
      "        elif False:"),
 
     ("match by SUBSTRING - any topic ending in the right characters triggers",
-     "        elif msg.topic == HA_STATUS_TOPIC:",
-     "        elif HA_STATUS_TOPIC in msg.topic:"),
+     "        elif topic == HA_STATUS_TOPIC:",
+     "        elif HA_STATUS_TOPIC in topic:"),
 
     ("announce on EVERY message, not only the birth topic",
      "    try:\n        # === Home Assistant lifecycle ===",
@@ -213,7 +213,7 @@ MUTANTS = [
     # being fixed.
     ("move the birth branch OUTSIDE the catch-all",
      "    try:\n        # === Home Assistant lifecycle ===",
-     "    if msg.topic == HA_STATUS_TOPIC and payload.lower() == HA_BIRTH_PAYLOAD:\n"
+     "    if topic == HA_STATUS_TOPIC and payload.lower() == HA_BIRTH_PAYLOAD:\n"
      "        announce_to_home_assistant(client)\n"
      "        return\n\n"
      "    try:\n        # === Home Assistant lifecycle ==="),
@@ -244,8 +244,8 @@ MUTANTS = [
      "            f\"NOT subscribing to {HA_STATUS_TOPIC}: BASE_TOPIC is \""),
 
     ("INVERT the handler collision guard - healthy deploys stop self-healing",
-     "        if msg.topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:",
-     "        if msg.topic == HA_STATUS_TOPIC and STATUS_TOPIC != HA_STATUS_TOPIC:"),
+     "        if topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:",
+     "        if topic == HA_STATUS_TOPIC and STATUS_TOPIC != HA_STATUS_TOPIC:"),
 
     # --- 26: an assumption the changed line rests on ------------------------
     ("drop .strip() - a padded payload silently stops being a birth message",
@@ -295,11 +295,11 @@ MUTANTS = [
      "    return False"),
 
     ("logger.exception -> logger.error, losing the traceback",
-     "        logger.exception(f\"Error handling message on topic {msg.topic!r}: {e!r}\")",
-     "        logger.error(f\"Error handling message on topic {msg.topic!r}: {e!r}\")"),
+     "        logger.exception(f\"Error handling message on topic {topic!r}: {e!r}\")",
+     "        logger.error(f\"Error handling message on topic {topic!r}: {e!r}\")"),
 
     ("drop the handler-side collision guard - the echo loop comes back",
-     "        if msg.topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:",
+     "        if topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:",
      "        if False:"),
 
     ("stop stamping the clock on announce - the retained birth doubles up",

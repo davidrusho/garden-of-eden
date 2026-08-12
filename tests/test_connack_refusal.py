@@ -372,11 +372,18 @@ def _log_it(value):
 # the other was never a decision; it was the T-527.11 ask being written for
 # payloads and the sibling going unasked.
 #
-# NOT a claim that a topic is as REACHABLE as a payload. COMMAND_SUBSCRIPTIONS
+# ~~NOT a claim that a topic is as REACHABLE as a payload. COMMAND_SUBSCRIPTIONS
 # and LIFECYCLE_SUBSCRIPTIONS hold no wildcards, so a conforming broker can
 # deliver only the eight literal topics they name. The reachable case is a
-# broker that does not conform - and such a broker chooses the payload too, so
-# the two share a threat model rather than competing for one.
+# broker that does not conform.~~ WRONG, and struck rather than deleted.
+#
+# A subscription list is the CLIENT'S INTENT, not the broker's state. mqtt.py
+# runs `clean_session=False` with a stable client_id, `subscribe()` only adds,
+# nothing calls `unsubscribe()`, and before 9e00c2f the list contained
+# `BASE_TOPIC + "/#"`. A unit whose durable session predates that commit still
+# has the wildcard registered at the broker, so an ORDINARY broker delivers
+# `gardyn/light/command\n<forged line>` to it. The topic is as reachable as the
+# payload on any such unit; see the same correction at mqtt.py's decode site.
 _TAINT_SEEDS = frozenset({"payload", "topic"})
 
 
@@ -385,15 +392,28 @@ def _is_taint_seed(node):
 
     `msg.payload` and `msg.topic` are the real ones - paho hands the callback
     an object and both are attributes of it. The bare names are kept because
-    mqtt.py binds `payload` at on_message's first statement and several tests
-    below hand one straight in as a parameter.
+    on_message binds BOTH as locals in its first two statements - `topic =
+    msg.topic` since T-527.12, which decodes it once so the error handler
+    cannot re-raise - and several tests below hand one straight in as a
+    parameter.
 
     Seeding on the SOURCE rather than on the spelling is the whole T-527.17
     H2 fix: `body = msg.payload.decode()` is tainted because of where it came
     from, so a rename cannot disarm the rule. The same now holds for
-    `topic_suffix = msg.topic.replace(...)`, which on_message binds and which
-    nothing logs today - the propagation is what keeps that true if anything
-    ever does.
+    `topic_suffix = topic.replace(...)`, which nothing logs today - the
+    propagation is what keeps that true if anything ever does.
+
+    WHAT THE BARE-NAME HALF COSTS, since it is pure widening and a rule that
+    accuses correct code is a rule someone deletes. Any local called `topic`
+    or `payload` is treated as remote input wherever the scanner is pointed,
+    and mqtt.py already has two outbound functions that would qualify -
+    `publish_config(topic, payload)` and `_capture_and_publish(..., topic,
+    ...)`, both entirely local. Neither is accused today, but only because
+    this scanner is pointed at `on_message` and nothing else. Widening its
+    scope to the module means reading those two first. Found by review
+    2026-08-12; recorded rather than fixed, because over-reporting is the safe
+    direction here and the narrowing that would fix it (attribute-only seeding
+    for `topic`) also removes the propagation from the local on_message binds.
     """
     return ((isinstance(node, ast.Name) and node.id in _TAINT_SEEDS)
             or (isinstance(node, ast.Attribute) and node.attr in _TAINT_SEEDS))
@@ -1699,24 +1719,44 @@ class TestTheDecodeLineCannotBeForged(unittest.TestCase):
     def test_the_catch_all_handler_reprs_its_exception(self):
         """SOURCE-LEVEL, and that is a limitation rather than a preference.
 
-        The scanner cannot reach this line: `except ... as e` is outside
-        _bindings() on purpose, and whether a given exception's str() quotes
-        its operand is a runtime property of that exception class rather than
-        anything an AST can decide. See the EXCEPTION bullet on
+        The scanner cannot reach the `e` half of this line: `except ... as e`
+        is outside _bindings() on purpose, and whether a given exception's
+        str() quotes its operand is a runtime property of that exception class
+        rather than anything an AST can decide. See the EXCEPTION bullet on
         _payload_sinks(), which names this line.
 
-        So this asserts the spelling, and the spelling is all it asserts. It
-        does NOT assert that no control character can reach gardyn.log from
-        this call - logger.exception() also renders exc_info, whose final line
-        is str(e), and nothing at this call site formats that.
+        IT DOES REACH THE TOPIC HALF, as of T-527.12 - that half is
+        machine-checked by test_no_log_line_in_on_message_interpolates_a_
+        payload_raw and needs nothing from here. An earlier version of this
+        docstring said the scanner could see neither, which stopped being true
+        in the commit that widened the seed.
+
+        So this asserts ONE conversion, on `e`, deliberately - matching the
+        substring rather than the whole line, so that a change to the topic's
+        spelling fails the scanner-driven tests (which describe it correctly)
+        instead of failing here under a message about exceptions. That
+        misdirection is the defect this repo already fixed once, in
+        tests/test_water_interlock.py.
+
+        And the spelling is all it asserts. It does NOT assert that no control
+        character can reach gardyn.log from this call - logger.exception() also
+        renders exc_info, whose final line is str(e), and nothing at this call
+        site formats that.
         """
         import inspect
 
         source = inspect.getsource(mqtt_mod)
+        handler = [line for line in source.splitlines()
+                   if 'logger.exception(f"Error handling message on topic'
+                   in line]
+        # Locating the line is a separate failure from what it contains, and
+        # they mean different things: one says the handler moved, the other
+        # says it stopped escaping.
+        self.assertEqual(
+            1, len(handler),
+            f"expected exactly one catch-all handler line, got {handler!r}")
         self.assertIn(
-            'logger.exception(f"Error handling message on topic '
-            '{msg.topic!r}: {e!r}")',
-            source,
+            "{e!r}", handler[0],
             "the catch-all handler interpolates its exception without repr(), "
             "so an exception whose message quotes a payload can forge a log "
             "line - see the EXCEPTION bullet on _payload_sinks()",
@@ -1781,12 +1821,102 @@ class TopicIsATaintSeedTests(unittest.TestCase):
         self.assertEqual({"payload", "topic"}, set(_TAINT_SEEDS))
 
     def test_the_topic_seed_reaches_the_attribute_not_only_the_bare_name(self):
-        """mqtt.py never binds a local called `topic` - it reads `msg.topic`
-        every time - so if only the bare name were seeded the whole widening
-        would be dead on the shipping code while every fixture above still
-        passed on its parameter name."""
+        """A UNIT test of the predicate, and REDUNDANT with the control above -
+        said here rather than left for the next reader to discover.
+
+        Its first docstring justified it by claiming the fixtures above would
+        stay green under an attribute-only narrowing "on their parameter
+        name". False: all four take `(msg, sink)` and reference `msg.topic`,
+        so narrowing _is_taint_seed to the Name branch reddens
+        test_a_raw_topic_is_reported directly. Review caught it.
+
+        Kept anyway, at one line, because it tests the predicate WITHOUT the
+        scanner pipeline in between - so when both go red the pair says which
+        layer moved. That is a smaller claim than the one it replaced.
+        """
         tree = ast.parse("sink.info(f'on {msg.topic}')")
         self.assertTrue(any(_is_taint_seed(n) for n in ast.walk(tree)))
+
+
+class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
+    """T-527.12, from review. A topic whose bytes are not valid UTF-8 used to
+    kill the process, and the mechanism is worth stating because nothing about
+    it is visible at the call site.
+
+    `msg.topic` is a paho PROPERTY that decodes on every access, and paho does
+    not validate the bytes. on_message read it inside a `try` AND again inside
+    that try's own `except UnicodeDecodeError` handler - so the handler raised
+    the exception it was catching, out of on_message, out of loop_forever(),
+    out of the process. `Restart=always` with `RestartSec=10` then gives a
+    permanent ten-second restart loop with the grow light off, on a host with
+    no physical recovery path.
+
+    Reachable on any unit whose durable session still holds the pre-9e00c2f
+    `gardyn/#` wildcard - see the note on _TAINT_SEEDS. Pre-existing; found
+    reviewing the escaping change to those same two lines.
+    """
+
+    class _PahoShapedMessage:
+        """Decodes LAZILY, in the property, exactly as paho 2.0.0 does.
+
+        A fixture holding an already-decoded string could not exhibit this at
+        all - the whole defect is that the access is what raises, and that it
+        raises every time.
+        """
+
+        def __init__(self, raw_topic, payload):
+            self._topic, self.payload = raw_topic, payload
+            self.qos, self.retain = 1, False
+
+        @property
+        def topic(self):
+            return self._topic.decode("utf-8")
+
+    def setUp(self):
+        self.client = MagicMock()
+
+    def test_a_conforming_topic_still_reaches_a_handler(self):
+        """POSITIVE CONTROL for the two tests below, which assert an absence.
+
+        Without it, a fixture that on_message rejects for some unrelated
+        reason would make both of them pass while measuring nothing.
+        """
+        msg = self._PahoShapedMessage(LIGHT_COMMAND.encode(), b"ON")
+        with self.assertLogs(mqtt_mod.logger, level="INFO") as captured:
+            mqtt_mod.on_message(self.client, None, msg)
+        self.assertTrue(
+            any(r.getMessage().startswith("Decoded payload on ")
+                for r in captured.records),
+            [r.getMessage() for r in captured.records])
+
+    def test_an_undecodable_topic_does_not_escape_on_message(self):
+        msg = self._PahoShapedMessage(b"gardyn/light/\xff", b"ON")
+        # The fixture control: the bytes really are undecodable, so a green
+        # result is the guard working rather than the input being harmless.
+        with self.assertRaises(UnicodeDecodeError):
+            msg.topic
+
+        try:
+            mqtt_mod.on_message(self.client, None, msg)
+        except UnicodeDecodeError as exc:
+            self.fail(
+                f"on_message let a UnicodeDecodeError escape ({exc}). paho "
+                f"does not catch it, so it leaves loop_forever() and the "
+                f"process exits into a ten-second Restart=always loop with "
+                f"the light off")
+
+    def test_the_drop_is_recorded_with_the_raw_bytes_escaped(self):
+        """Dropping it silently would be its own defect: this is the one
+        record that a hostile or misconfigured broker reached this device."""
+        msg = self._PahoShapedMessage(b"gardyn/x\xff\nFORGED", b"ON")
+        with self.assertLogs(mqtt_mod.logger, level="ERROR") as captured:
+            mqtt_mod.on_message(self.client, None, msg)
+        messages = [r.getMessage() for r in captured.records]
+        self.assertEqual(1, len(messages), messages)
+        self.assertNotIn("\n", messages[0],
+                         "the dropped topic's raw bytes put a line break into "
+                         "gardyn.log, which is the forgery this ticket closes")
+        self.assertIn("\\n", messages[0])
 
 
 if __name__ == "__main__":

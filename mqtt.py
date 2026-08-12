@@ -1,5 +1,14 @@
 # mqtt.py
 #
+# Reviewed: 2026-08-12 against 251992a (T-527.12) - eight findings. The two that
+#           mattered were a comment I had just written asserting the wrong
+#           threat model (a subscription list is the client's INTENT, not the
+#           broker's state - a durable session still holds the pre-9e00c2f
+#           `gardyn/#` wildcard) and a pre-existing process-killer: on_message
+#           read `msg.topic` inside its own UnicodeDecodeError handler, so a
+#           topic that is not valid UTF-8 re-raised out of loop_forever().
+#           THE REMEDIATION FOR ALL EIGHT POSTDATES THIS SHA and is itself
+#           unreviewed - it is the commit after 251992a.
 # Reviewed: 2026-08-07 against c1549f8 (T-527.1) - three rounds; each found a
 #           confident comment that was wrong, and the third found one in the
 #           fix for the second. The code was never the weak part.
@@ -1132,6 +1141,33 @@ def on_connect(client, userdata, flags, rc, properties=None):
 def on_message(client, userdata, msg):
     global brightness, speed, WATER_LOW_CM, _last_birth_announce
 
+    # DECODE THE TOPIC ONCE, AND BEFORE ANYTHING ELSE. `msg.topic` is a paho
+    # PROPERTY - `self._topic.decode("utf-8")`, client.py:618 at the pinned
+    # 2.0.0 - so it re-decodes on every access and raises UnicodeDecodeError on
+    # every access when the bytes are not valid UTF-8. paho does not validate
+    # them: _handle_publish stores whatever arrived, and _handle_on_message
+    # calls this callback regardless.
+    #
+    # Until T-527.12 this was a process-killer, and a quiet one. The block
+    # below read `msg.topic` in the try AND again in its own
+    # `except UnicodeDecodeError` handler, so a bad topic raised, was caught,
+    # and raised again from inside the handler - out of on_message, out of
+    # loop_forever(), out of the process. With Restart=always and
+    # RestartSec=10 that is a permanent ten-second restart loop with the grow
+    # light off, on a host with no physical recovery path. Same shape as the
+    # CONNACK case documented above, reached by a different input.
+    #
+    # Reported without the decoded value, because the value is what could not
+    # be produced. `_topic` is paho-private, hence the getattr - the bytes are
+    # the only useful thing to put in an incident record, and %r escapes them
+    # on the same rule as everything else here.
+    try:
+        topic = msg.topic
+    except UnicodeDecodeError:
+        logger.error("Dropped an inbound message whose TOPIC is not valid "
+                     "UTF-8: %r", getattr(msg, "_topic", None))
+        return
+
     try:
         payload = msg.payload.decode("utf-8").strip()
         # !r, not '{payload}'. THE RULE, because this line is not special and an
@@ -1158,25 +1194,41 @@ def on_message(client, userdata, msg):
         # raw while the payload beside it was escaped read as a considered
         # scope and was an oversight.
         #
-        # Say what the exposure IS rather than inflating it: COMMAND_SUBSCRIPTIONS
-        # and LIFECYCLE_SUBSCRIPTIONS carry no wildcards, so a CONFORMING broker
-        # can only ever deliver the eight literal topics they name, all built
-        # from local config. The reachable case is a broker that does not
-        # conform, or one an attacker controls - which is the same threat model
-        # that justifies escaping the payload, since a broker able to invent a
-        # topic is able to choose the bytes under it.
-        logger.info(f"Decoded payload on {msg.topic!r}: {payload!r}")
+        # ~~Say what the exposure IS rather than inflating it:
+        # COMMAND_SUBSCRIPTIONS and LIFECYCLE_SUBSCRIPTIONS carry no wildcards,
+        # so a CONFORMING broker can only ever deliver the eight literal topics
+        # they name. The reachable case is a broker that does not conform.~~
+        # WRONG, and struck through rather than deleted so it is not re-derived.
+        # Caught by review the same day it was written.
+        #
+        # A SUBSCRIPTION LIST IS THE CLIENT'S INTENT, NOT THE BROKER'S STATE -
+        # which the comment on COMMAND_SUBSCRIPTIONS above already says, and
+        # which the collision guard below exists because of. This client runs
+        # `clean_session=False` with a stable client_id, `subscribe()` only ever
+        # adds, and nothing calls `unsubscribe()`. So the broker still holds
+        # every subscription any earlier connect asked for - and before 9e00c2f
+        # that included `BASE_TOPIC + "/#"`. On a unit whose durable session
+        # predates it, `gardyn/light/command\n<forged line>` matches that stale
+        # wildcard, contains no wildcard character of its own, and is a legal
+        # Topic Name. An ordinary mosquitto delivers it to anyone with publish
+        # rights on the subtree.
+        #
+        # So the reachable case is an ORDINARY broker plus a stale session, not
+        # a hostile one. The eight-literal-topics count describes what this
+        # client asks for, and says nothing about what arrives.
+        logger.info(f"Decoded payload on {topic!r}: {payload!r}")
     except UnicodeDecodeError:
-        logger.error(f"Failed to decode message on topic {msg.topic!r}. Likely binary.")
+        logger.error(f"Failed to decode message on topic {topic!r}. Likely binary.")
         return
 
-    topic_suffix = msg.topic.replace(BASE_TOPIC + "/", "")
+    topic_suffix = topic.replace(BASE_TOPIC + "/", "")
 
     try:
         # === Home Assistant lifecycle ===
         #
-        # Matched on msg.topic, NOT topic_suffix. The suffix is produced by
-        # stripping a BASE_TOPIC prefix this topic does not have, so it would
+        # Matched on the decoded `topic`, NOT topic_suffix. The suffix is
+        # produced by stripping a BASE_TOPIC prefix this topic does not have,
+        # so it would
         # arrive here as the full "homeassistant/status" and match nothing —
         # which is exactly how this went unnoticed: an unhandled topic falls
         # through the chain silently and looks identical to a topic nobody
@@ -1184,7 +1236,7 @@ def on_message(client, userdata, msg):
         #
         # First in the chain so the reason it exists is the first thing read,
         # and so no future BASE_TOPIC branch can shadow it.
-        if msg.topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:
+        if topic == HA_STATUS_TOPIC and STATUS_TOPIC == HA_STATUS_TOPIC:
             # THE COLLISION GUARD THAT ACTUALLY WORKS. Its twin at the subscribe
             # site in on_connect refuses to ASK for this topic; it cannot refuse
             # to RECEIVE it, and that distinction is the whole finding.
@@ -1220,7 +1272,7 @@ def on_message(client, userdata, msg):
                 f"set to something other than {HA_STATUS_TOPIC.split('/')[0]!r}."
             )
 
-        elif msg.topic == HA_STATUS_TOPIC:
+        elif topic == HA_STATUS_TOPIC:
             if payload.lower() == HA_BIRTH_PAYLOAD:
                 # The whole point of T-527.1. HA has just come up and has no
                 # idea this device exists: retained discovery is delivered once
@@ -1433,22 +1485,38 @@ def on_message(client, userdata, msg):
 
     except Exception as e:
         # {e!r}, not {e} (T-527.12). An exception's str() can quote its operand
-        # verbatim - int("\N{SUPERSCRIPT TWO}") is the live example, since
-        # .isdigit() lets it through - so this line is a payload sink by
-        # inheritance. repr() of an exception repr()s its args, which escapes
+        # verbatim, and repr() of an exception repr()s its args, which escapes
         # the control characters str() would have written straight out.
+        #
+        # ~~int("\N{SUPERSCRIPT TWO}") is the live example, since .isdigit()
+        # lets it through.~~ WRONG, struck rather than deleted. Measured:
+        # `str(int('a\nb'))` is "invalid literal for int() with base 10:
+        # 'a\\nb'" - CPython already repr()s the operand into that message, and
+        # float() does the same. So the int() path was never a forgery path,
+        # .isdigit() is not what saves it, and {e!r} buys nothing THERE.
+        #
+        # THIS IS DEFENSIVE, NOT A FIX FOR A LIVE PATH, and saying so is the
+        # point: no exception reachable from this try today has a verbatim
+        # str(). ValueError("bad\n...") raised by hand would - measured - so
+        # the escaping is what stops the next raise from reopening it.
         #
         # WHAT THIS DOES NOT CLOSE, said plainly because a half-fix described
         # as a fix is what stops the next reader looking: logger.exception()
         # also renders exc_info, and the traceback's final line is str(e), not
-        # repr(e). A raw control character in an exception message still
-        # reaches gardyn.log by that route, and no escaping at this call site
-        # can reach it - it is formatted by the logging module, not here.
-        # Closing it needs a Formatter, which is a wider change than this step.
-        # The scanner in tests/test_connack_refusal.py cannot see either half:
-        # `except ... as e` is outside the taint propagation on purpose, so
-        # this line is pinned by a source assertion instead.
-        logger.exception(f"Error handling message on topic {msg.topic!r}: {e!r}")
+        # repr(e). Measured - the forged text lands at column 0, formatted
+        # exactly like a real record. No escaping at this call site can reach
+        # it; it is rendered by the logging module. Closing it needs a
+        # Formatter, which is wider than this step, and nothing in the suite
+        # reads a FORMATTED record for on_message, so nothing pins it either
+        # way.
+        #
+        # The scanner in tests/test_connack_refusal.py sees the topic half of
+        # this line and NOT the `e` half - `except ... as e` is outside its
+        # taint propagation on purpose. So the topic is machine-checked and
+        # `e` is pinned by a source assertion. An earlier version of this
+        # comment said the scanner could see neither, which stopped being true
+        # in the same commit that widened its seed to topics.
+        logger.exception(f"Error handling message on topic {topic!r}: {e!r}")
 
 def publish_pcb_temperature(client):
     while True:
