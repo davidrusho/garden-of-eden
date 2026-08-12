@@ -848,13 +848,36 @@ class DstTableIsDerivedFromTheTzdb(unittest.TestCase):
         doc = ls.next_boundary_after.__doc__
         self.assertIsNotNone(doc, "the table lives in the docstring; -OO would remove it")
 
+        # EVERY COLUMN IS CAPTURED AND ASSERTED. The pattern here read
+        #     r".*?(\d{2}):00-(\d{2}):59\s+"
+        # until 2026-08-12, and that `.*?` swallowed the whole offset column —
+        # `01:00 MST -> 03:00 MDT` — which was therefore compared against
+        # nothing. The T-527.27 review measured the consequence: with two
+        # positive controls red first, SIX wrong-table edits stayed green,
+        # including `-> 03:00 MST` and `-> 02:00 MDT`. A field this test does
+        # not read is a field the table can lie in, and the table is the whole
+        # evidence for naive local time being safe in this module.
         matches = re.findall(
             r"^\s*(spring forward|fall back)\s+"
             r"(\d{4}-\d{2}-\d{2})\s+"
-            r".*?(\d{2}):00-(\d{2}):59\s+"
+            r"(\d{2}):00\s+([A-Z]{2,5})\s*->\s*(\d{2}):00\s+([A-Z]{2,5})\s+"
+            r"(\d{2}):00-(\d{2}):59\s+"
             r"(SKIPPED|REPEATED)\s*$",
             doc,
             re.M,
+        )
+
+        # REFUSE DUPLICATES BEFORE BUILDING THE DICT. `rows = {label: rest ...}`
+        # keeps the LAST row per label and drops the rest in silence, so a
+        # wrong row inserted ABOVE the correct one parsed, was discarded, and
+        # the test passed — which is precisely the historical error this test
+        # exists to prevent (an earlier docstring named one hour for both
+        # transitions), re-admitted by the reader meant to catch it.
+        labels = [m[0] for m in matches]
+        self.assertEqual(
+            len(labels), len(set(labels)),
+            f"the docstring table has more than one row per transition "
+            f"({labels}); one of them is being silently discarded",
         )
         rows = {label: rest for label, *rest in matches}
         self.assertEqual(
@@ -863,8 +886,10 @@ class DstTableIsDerivedFromTheTzdb(unittest.TestCase):
             "this test is the only reader of it",
         )
 
-        spring_date, s_from, s_to, s_kind = rows["spring forward"]
-        fall_date, f_from, f_to, f_kind = rows["fall back"]
+        (spring_date, s_wall_from, s_abbr_from, s_wall_to, s_abbr_to,
+         s_from, s_to, s_kind) = rows["spring forward"]
+        (fall_date, f_wall_from, f_abbr_from, f_wall_to, f_abbr_to,
+         f_from, f_to, f_kind) = rows["fall back"]
 
         # The docstring says which hour, and which KIND each transition is.
         self.assertEqual((s_kind, f_kind), ("SKIPPED", "REPEATED"))
@@ -884,6 +909,49 @@ class DstTableIsDerivedFromTheTzdb(unittest.TestCase):
                                        int(f_from), 30)),
             f"the docstring calls {f_from}:00 repeated; the tzdb disagrees",
         )
+
+        # THE OFFSET COLUMN, derived rather than restated — the half `.*?` used
+        # to skip. Each abbreviation is read back off zoneinfo on the date the
+        # table itself names, so a wrong one is red without anything here
+        # hardcoding "MST" or "MDT".
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(_DENVER)
+
+        def abbr(day, hour, fold=0):
+            return datetime(2026, day.month, day.day, hour, 30,
+                            fold=fold, tzinfo=tz).tzname()
+
+        # Spring: the two sides sit on either side of the gap, so ordinary
+        # lookups reach them.
+        self.assertEqual(abbr(derived_spring, int(s_wall_from)), s_abbr_from)
+        self.assertEqual(abbr(derived_spring, int(s_wall_to)), s_abbr_to)
+        self.assertEqual(
+            int(s_wall_to) - int(s_wall_from), 2,
+            f"spring forward skips an hour, so the wall clock steps 01:00 -> "
+            f"03:00; the table says {s_wall_from}:00 -> {s_wall_to}:00",
+        )
+
+        # Fall: BOTH sides are the same wall-clock hour — that is what makes
+        # it ambiguous rather than skipped — so `fold` is the only thing that
+        # separates them, and reading them any other way conflates the two
+        # transitions, which is the conflation this whole class exists to stop.
+        self.assertEqual(abbr(derived_fall, int(f_wall_from), fold=0),
+                         f_abbr_from)
+        self.assertEqual(abbr(derived_fall, int(f_wall_to), fold=1),
+                         f_abbr_to)
+        self.assertEqual(
+            int(f_wall_to), int(f_wall_from),
+            f"fall back REPEATS an hour, so both sides read the same wall "
+            f"clock; the table says {f_wall_from}:00 -> {f_wall_to}:00, which "
+            f"describes a skip",
+        )
+
+        for label, before, after in (("spring forward", s_abbr_from, s_abbr_to),
+                                     ("fall back", f_abbr_from, f_abbr_to)):
+            self.assertNotEqual(
+                before, after,
+                f"the {label} row shows the same abbreviation on both sides, "
+                f"so it does not describe a transition at all")
 
     def test_each_transition_day_has_exactly_one_anomalous_hour(self):
         # Guards the derivation itself rather than the table: if a future tzdb
@@ -911,10 +979,26 @@ class DstTableIsDerivedFromTheTzdb(unittest.TestCase):
 class DecideSelfCorrectsAcrossARealTransition(unittest.TestCase):
     """Drives decide() over the wall-clock sequence a real transition produces.
 
-    THE TEST THIS REPLACES ASSERTED A LOOKUP. It called phase_at at hand-picked
-    times and called that "self-correction", which restates the claim rather
-    than demonstrating it — nothing in it crossed a transition, and its
-    "repeated hour" half duplicated the ordinary wrap case.
+    NOTHING WAS REPLACED, and this paragraph said otherwise until 2026-08-12.
+    It opened "THE TEST THIS REPLACES ASSERTED A LOOKUP", and the commit
+    message said the same — but
+    ShippedDefaultTests.test_a_boundary_in_the_dst_skipped_hour_is_accepted_and_self_corrects
+    is still in this file, still running, and `git show 0396564 --numstat` on
+    this file is `320 1`, the single deletion being an import line. So two
+    tests each carried a comment claiming it had superseded a wrong
+    predecessor, and a reader chasing the older one would have gone looking
+    for something that was never removed.
+
+    Worth naming plainly because of where it landed: this class exists to stop
+    prose asserting coverage no test provides, and that is the defect its own
+    docstring shipped with. The repo has now been bitten by it five times.
+
+    WHAT IS ACTUALLY TRUE about the older test: it asserts a phase_at LOOKUP at
+    hand-picked times, which restates the claim rather than demonstrating it —
+    nothing in it crosses a transition. It is kept deliberately: it pins the
+    shipped default schedule's behaviour at a boundary, which is a narrower and
+    cheaper question than the one below, and it needs no tzdb so it still runs
+    where these tests skip.
 
     What makes the naive arithmetic safe is that decide() asks what phase it is
     NOW instead of reacting to boundary edges. That is a claim about a sequence

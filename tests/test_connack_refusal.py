@@ -2023,6 +2023,123 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
             "byte record the guard's comment promises")
 
 
+class TheImportHelperTellsAbsentApartFromBroken(unittest.TestCase):
+    """`_import_real_paho_client` returning None means "paho is not installed",
+    and its only caller turns that straight into
+    `skipTest("paho is not installed here")`.
+
+    So a None for a paho that IS installed makes this suite state something
+    false about the machine, in precisely the case where a human needed to
+    know - and it does it by SKIPPING, which reads as green. That is the
+    dead-instrument-reports-an-absence shape the rest of this file exists to
+    guard against, sitting in the file's own helper.
+
+    The class is written as a pair on purpose. The broken case alone proves
+    nothing: an exception could be coming from the fixture rather than from
+    the helper. The healthy case is the control that says the fixture can
+    produce a real, importable paho, so the difference between the two rows is
+    the helper's own behaviour and nothing else.
+    """
+
+    @staticmethod
+    def _paho_on_disk(client_body):
+        """A real `paho.mqtt.client` package on sys.path, with `client_body`
+        as client.py.
+
+        Every cached `paho*` module comes out of sys.modules for the duration
+        and goes back afterwards: this suite plants a MagicMock at
+        `paho.mqtt.client` for the length of mqtt.py's import, and
+        `find_spec` answers from sys.modules before it ever reaches the disk.
+        Without the eviction this fixture would measure the mock.
+        """
+        import contextlib
+        import os
+        import shutil
+        import sys
+        import tempfile
+
+        @contextlib.contextmanager
+        def _cm():
+            saved_modules = {k: v for k, v in sys.modules.items()
+                             if k == "paho" or k.startswith("paho.")}
+            saved_path = list(sys.path)
+            tmp = tempfile.mkdtemp(prefix="t527-paho-")
+            try:
+                pkg = os.path.join(tmp, "paho", "mqtt")
+                os.makedirs(pkg)
+                for init in (os.path.join(tmp, "paho", "__init__.py"),
+                             os.path.join(pkg, "__init__.py")):
+                    with open(init, "w"):
+                        pass
+                with open(os.path.join(pkg, "client.py"), "w") as handle:
+                    handle.write(client_body)
+                for name in saved_modules:
+                    del sys.modules[name]
+                sys.path.insert(0, tmp)
+                yield tmp
+            finally:
+                sys.path[:] = saved_path
+                for name in [k for k in list(sys.modules)
+                             if k == "paho" or k.startswith("paho.")]:
+                    del sys.modules[name]
+                sys.modules.update(saved_modules)
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        return _cm()
+
+    def test_a_paho_that_imports_cleanly_is_returned(self):
+        """CONTROL. Without this the test below cannot tell "the helper
+        raised" from "the fixture cannot build an importable package at
+        all"."""
+        with self._paho_on_disk("MARKER = 'this is the fixture paho'\n"):
+            module = _import_real_paho_client()
+        self.assertIsNotNone(
+            module, "the fixture failed to produce an importable paho, so the "
+                    "broken-paho case below proves nothing")
+        self.assertEqual(module.MARKER, "this is the fixture paho")
+
+    def test_a_paho_that_is_present_and_fails_to_import_RAISES(self):
+        """The finding. This returned None before the fix, and the caller then
+        skipped with "paho is not installed here" - which was false."""
+        body = "raise RuntimeError('this paho is installed and broken')\n"
+        with self._paho_on_disk(body) as tmp:
+            with self.assertRaises(PahoIsInstalledButUnusable) as caught:
+                _import_real_paho_client()
+        # The message has to carry the path, or the reader cannot tell WHICH
+        # paho broke - the point of the distinction is actionability.
+        self.assertIn(tmp, str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+    def test_the_skip_branch_still_reports_a_genuine_absence_as_None(self):
+        """The other half. Widening the raise until it swallows the absent
+        case would be the same defect pointing the other way: the development
+        machine has no paho, and a FAIL there is a false finding about the
+        environment rather than about mqtt.py."""
+        import sys
+
+        # A package with no `client` submodule at all - present parent,
+        # absent target, which is the shape of a genuine absence.
+        with self._paho_on_disk("") as tmp:
+            import os
+            os.remove(os.path.join(tmp, "paho", "mqtt", "client.py"))
+            for name in [k for k in list(sys.modules)
+                         if k == "paho" or k.startswith("paho.")]:
+                del sys.modules[name]
+            self.assertIsNone(_import_real_paho_client())
+
+
+class PahoIsInstalledButUnusable(Exception):
+    """paho is on disk and did not import.
+
+    A distinct state from "paho is absent", and deliberately an exception
+    rather than a return value: the caller's only two options for a None are
+    to skip or to fail, and both are wrong here. Skipping says the environment
+    lacks paho, which is false; failing says mqtt.py is broken, which is also
+    false. Raising says what is true - the instrument cannot run - and stops
+    the suite reporting a green it has not earned.
+    """
+
+
 def _import_real_paho_client():
     """The REAL paho, not this suite's stub - or None if it is not installed.
 
@@ -2042,8 +2159,27 @@ def _import_real_paho_client():
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-    except Exception:
-        return None
+    except Exception as exc:
+        # RAISE, do not return None. Everything above this point is about
+        # LOCATING paho, where "not found" and "found a stub" are both
+        # honestly reported as absence and the caller's skip is true. This is
+        # different: a real .py file was found on disk and it failed to RUN.
+        # That is a broken installation, not a missing one.
+        #
+        # `except Exception: return None` here made those two states
+        # indistinguishable, and the caller then skips with the words "paho is
+        # not installed here" - a false statement about the environment in
+        # exactly the case where something is wrong. A dead instrument must
+        # not report an absence; that is the whole premise this suite is built
+        # on. Found by the T-527.27 review round, which probed it: healthy
+        # paho PASS, `_topic` renamed FAIL, `_topic` as str FAIL, planted
+        # MagicMock SKIP (correctly refused) - and import-raises SKIP, which
+        # is this line.
+        raise PahoIsInstalledButUnusable(
+            f"paho was found at {spec.origin} and failed to import, so this "
+            f"suite cannot pin anything against it. This is NOT the same as "
+            f"paho being absent, and must not be skipped as though it were: "
+            f"{exc!r}") from exc
     return module
 
 

@@ -488,29 +488,105 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                                 f"{harness} did not restore a deleted file's "
                                 f"content and mode")
 
+    @staticmethod
+    def _sandbox_copy_calls(harness):
+        """Every real `copytree(REPO, ...)` CALL in a harness, as AST nodes.
+
+        PARSE, do not grep. This assertion is what entitles a harness to sit
+        in SANDBOXED, and SANDBOXED membership is what exempts it from
+        test_an_interrupted_battery_leaves_no_mutant_behind - so a false pass
+        here silently removes the only check that would catch a stranded
+        mutant in a shipping file.
+
+        It has now been fooled twice by text that is not code, each time by a
+        different construct, which is the argument for stopping at the level
+        of text entirely:
+
+          1. A COMMENT quoting the literal (c9a6a8d, found 2026-08-11). Fixed
+             in c536b3b by stripping `#` comments before matching.
+          2. A module DOCSTRING quoting the literal (found 2026-08-12 by the
+             T-527.27 review of that very fix). A docstring is not a comment,
+             so stripping comments does not touch it - and BOTH
+             mutate_deploy_verify.py and mutate_light_scheduler.py described
+             their own sandboxing in their opening docstring. Each therefore
+             held two occurrences, which is exactly the state (1) produced.
+             Confirmed by converting both harnesses to mutate the live tree
+             (`root = REPO`) on copies, docstrings untouched: this test stayed
+             GREEN for both, with mutate_netwatch.py as the red control.
+
+        A third spelling would have defeated a docstring-stripping fix too, so
+        the fix is not to enumerate the places text can hide. An `ast` walk
+        cannot see comments, docstrings, string literals or `#` inside
+        strings, and is indifferent to wrapping and whitespace - which also
+        retires the nine-line comment mutate_payload_scanner.py carried
+        begging future editors not to reformat one line.
+
+        Accepts both `shutil.copytree(REPO, ...)` and a bare
+        `copytree(REPO, ...)` after `from shutil import copytree`; the grep
+        this replaces silently rejected the second, so its only realistic
+        failure was spurious.
+        """
+        import ast
+
+        tree = ast.parse(read_text(os.path.join(REPO, "tests", harness)))
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                name = func.attr
+            elif isinstance(func, ast.Name):
+                name = func.id
+            else:
+                continue
+            first = node.args[0]
+            if name == "copytree" and isinstance(first, ast.Name) \
+                    and first.id == "REPO":
+                found.append(node)
+        return found
+
     def test_a_sandboxed_harness_still_works_on_a_copy(self):
         """Its exemption from the check above rests on this one fact, so state
-        it. A harness converted to in-place editing has to move lists."""
+        it.
+
+        NOT "a harness converted to in-place editing has to move lists" -
+        that sentence stood here until 2026-08-12 and was false. Two of these
+        harnesses were converted to in-place on copies, moved no lists, and
+        this test stayed green, because their docstrings carried the literal
+        it was matching. What is true is narrower and is what the AST walk
+        now checks: a harness that does not CALL copytree(REPO, ...) fails
+        here, whatever its prose says about itself.
+        """
         for harness in sorted(self.SANDBOXED):
             with self.subTest(harness=harness):
-                text = read_text(os.path.join(REPO, "tests", harness))
-                # STRIP COMMENTS FIRST. A COMMENT QUOTING THIS LITERAL
-                # SATISFIES THE CHECK, which permanently disarms it. Found
-                # 2026-08-11 by review: c9a6a8d fixed a wrapped copytree call
-                # in mutate_payload_scanner.py and, in the same commit, added
-                # `# \`shutil.copytree(REPO\` stays on ONE line deliberately:`
-                # six lines above it — so the file held TWO occurrences and
-                # re-wrapping the call left this assertion green on the
-                # strength of the comment explaining why it must not be
-                # wrapped. Proven by a four-way control: call wrapped with the
-                # comment present passed; with the comment removed it failed.
-                #
-                # Splitting on `#` also truncates a `#` inside a string, which
-                # is fine here: it can only REMOVE text, so it can make this
-                # assertion fail spuriously but never pass spuriously, and a
-                # spurious failure is loud.
-                code = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
-                self.assertIn("shutil.copytree(REPO", code)
+                calls = self._sandbox_copy_calls(harness)
+                self.assertTrue(
+                    calls,
+                    f"{harness} is listed SANDBOXED - which exempts it from "
+                    f"the interrupted-battery restore check - but contains no "
+                    f"copytree(REPO, ...) call. Prose about sandboxing is not "
+                    f"evidence of it.")
+
+    def test_an_in_place_harness_does_not_claim_a_sandbox(self):
+        """The reverse direction, which nothing asserted before 2026-08-12.
+
+        The test above can only catch a sandboxed harness that stopped
+        sandboxing. This catches the other way round: a harness that gained a
+        `copytree(REPO, ...)` and was never moved out of IN_PLACE is being
+        held to a restore check it no longer needs, and - more to the point -
+        the two lists have silently stopped describing the tree. Neither
+        direction is deducible from the other, and a membership table nobody
+        checks in both directions drifts.
+        """
+        for harness in sorted(self.IN_PLACE):
+            with self.subTest(harness=harness):
+                calls = self._sandbox_copy_calls(harness)
+                self.assertFalse(
+                    calls,
+                    f"{harness} calls copytree(REPO, ...) but is listed "
+                    f"IN_PLACE. If it now sandboxes, move it to SANDBOXED; "
+                    f"the lists are the thing this file trusts.")
 
     def test_every_mutation_harness_is_covered(self):
         """A new harness must be listed above, or it is untested by default -
