@@ -289,13 +289,106 @@ MUTANTS = [
      '            target=self.run_forever, name="light-schedule", daemon=True',
      '            target=self.run_forever, name="light-schedule", daemon=False'),
 
+    # -------------------------------------------------------- the heartbeat
+    #
+    # T-527.22. The family to over-represent here is "the heartbeat still
+    # publishes but no longer means what it says", because a heartbeat that
+    # stops is loud — the HA staleness check fires — while one that keeps
+    # beating for the wrong reason is a permanent false all-clear on the ONLY
+    # check covering a dead scheduler thread under a live broker connection.
+    # GATES the existing call rather than adding a second one. The first
+    # version of this mutant inserted an extra _heartbeat_locked() inside the
+    # dedupe branch and left the unconditional one in place; it survived,
+    # correctly, because the interval gate makes the extra call a no-op and the
+    # real one still ran. An additive "mutant" tests nothing.
+    ("the heartbeat is folded INTO the dedupe, so a healthy unchanging "
+     "scheduler goes silent - the exact fault this ticket exists to fix", SRC,
+     "        self._heartbeat_locked()\n        return decision",
+     "        if pair != self._last_published or not applied:\n"
+     "            self._heartbeat_locked()\n        return decision"),
+    ("the heartbeat fires BEFORE the decision, so it reports a tick that was "
+     "merely attempted rather than one that completed", SRC,
+     "    def _tick_locked(self):\n"
+     '        """One pass, with self._lock already held. See __init__ on the lock."""\n'
+     "        schedule, note = load_schedule(self._config_path)",
+     "    def _tick_locked(self):\n"
+     '        """One pass, with self._lock already held. See __init__ on the lock."""\n'
+     "        self._heartbeat_locked()\n"
+     "        schedule, note = load_schedule(self._config_path)"),
+    ("the first tick after a restart waits out a whole interval, so a fresh "
+     "process is indistinguishable from a dead one", SRC,
+     "        self._last_heartbeat = None",
+     "        self._last_heartbeat = 0.0"),
+    ("the cadence boundary is exclusive, so the interval is one tick longer "
+     "than the constant says", SRC,
+     "            and stamp - self._last_heartbeat < self._heartbeat_seconds",
+     "            and stamp - self._last_heartbeat <= self._heartbeat_seconds"),
+    ("a failed heartbeat publish stamps the clock anyway, so a broker blip "
+     "swallows a whole interval instead of retrying next tick", SRC,
+     '            logger.exception("Schedule could not publish its heartbeat")\n            return',
+     '            logger.exception("Schedule could not publish its heartbeat")\n            self._last_heartbeat = stamp\n            return'),
+    # Sets the counter in the FAILURE branch. The first version reordered the
+    # two success-path assignments and added `+ 0`, which is a no-op the
+    # `except` arm returns before ever reaching — it survived because it was
+    # not a mutation of anything.
+    ("a failed heartbeat publish advances the counter, so the next successful "
+     "beat skips a number and the sink's record disagrees with the scheduler's",
+     SRC,
+     '            logger.exception("Schedule could not publish its heartbeat")\n            return',
+     '            logger.exception("Schedule could not publish its heartbeat")\n            self._heartbeat_count = count\n            return'),
+    ("a broker that refuses the heartbeat takes the whole tick down - the "
+     "observability feature killing the photoperiod it observes", SRC,
+     "        try:\n            self._publish_heartbeat(count)\n        except Exception:",
+     "        try:\n            self._publish_heartbeat(count)\n        except KeyError:"),
+    ("the heartbeat shares the never-synced hold's clock, which tests inject "
+     "finite iterators into", SRC,
+     "        stamp = self._heartbeat_clock()",
+     "        stamp = self._monotonic()"),
+    ("publish_now() refreshes the heartbeat, so paho's live network thread "
+     "reports liveness on behalf of the dead scheduler thread", SRC,
+     "            self._record_published_locked(decision, self._publish(decision))\n\n    # ----------------------------------------------------------------- tick",
+     "            self._record_published_locked(decision, self._publish(decision))\n            self._heartbeat_locked()\n\n    # ----------------------------------------------------------------- tick"),
+    ("the heartbeat is published UNRETAINED, so Home Assistant sits at "
+     "`unknown` after every restart", MQTT,
+     '    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count), retain=True)',
+     '    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count))'),
+    ("the heartbeat is published onto the SOURCE topic, destroying the one "
+     "property that makes that topic readable", MQTT,
+     'LIGHT_HEARTBEAT_TOPIC = BASE_TOPIC + "/light/schedule/heartbeat"',
+     'LIGHT_HEARTBEAT_TOPIC = LIGHT_SOURCE_TOPIC'),
+    ("the heartbeat sensor is never announced, so Home Assistant has no "
+     "entity to measure staleness on", MQTT,
+     "    publish_config(HEARTBEAT_CONFIG_TOPIC, {",
+     "    _unpublished_heartbeat_config = ({"),
+    ("the heartbeat sink is never wired in, so the whole feature is inert "
+     "with every unit test still green", MQTT,
+     "        publish_heartbeat=lambda count: publish_light_heartbeat(client, count),\n",
+     ""),
+
     # ----------------------------------------------------------- the wiring
     ("mqtt.py never starts the scheduler", MQTT,
      "    light_scheduler.start()",
      "    pass"),
     ("the scheduler starts AFTER loop_forever(), which never returns", MQTT,
-     "    light_scheduler = LightScheduler(\n        light, lambda decision: publish_light_decision(client, decision)\n    )\n    light_scheduler.start()\n\n    client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)",
-     "    client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)\n    light_scheduler = LightScheduler(\n        light, lambda decision: publish_light_decision(client, decision)\n    )"),
+     # MOVED PAST loop_forever(), not merely past connect_async(). An earlier
+     # rewrite of this anchor put start() after connect_async and SURVIVED,
+     # correctly: connect_async does not block, so the scheduler still starts
+     # before the loop and nothing about the guarantee changed. The mutation
+     # has to cross the call that never returns.
+     #
+     # It also has to KEEP the start() call. The version this replaced deleted
+     # it, so the kill it scored belonged to
+     # test_mqtt_constructs_and_starts_the_scheduler — a different guarantee
+     # from the one the label names.
+     "    light_scheduler.start()\n\n    client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)\n\n"
+     "    # The periodic publishers are started from on_connect, not here — see\n"
+     "    # start_publisher_threads().\n"
+     "    client.loop_forever(retry_first_connection=True)",
+     "    client.connect_async(BROKER, PORT, KEEP_ALIVE_INTERVAL)\n\n"
+     "    # The periodic publishers are started from on_connect, not here — see\n"
+     "    # start_publisher_threads().\n"
+     "    client.loop_forever(retry_first_connection=True)\n"
+     "    light_scheduler.start()"),
     ("the scheduler is started from on_connect, reintroducing the broker "
      "dependency this whole ticket removes", MQTT,
      "    start_publisher_threads(client)",

@@ -119,6 +119,31 @@ CLOCK_UNKNOWN = "unknown"
 # shifted photoperiod is something plants tolerate; no photoperiod is not.
 NEVER_SYNCED_HOLD_SECONDS = 2 * 60 * 60
 
+# Seconds between heartbeat publishes (T-527.22).
+#
+# WHY THIS EXISTS AT ALL, since the state topics are already published. Those
+# are DEDUPED — _tick_locked publishes only when (brightness, source) changes
+# or a drive failed — and that dedupe is deliberate (T-527.20) and is not to be
+# touched. The consequence is that Home Assistant receives nothing from a
+# healthy, unchanging scheduler, so it cannot tell "nothing has changed" from
+# "nothing is deciding". Measured 2026-08-11: sensor.gardyn_light_schedule_source
+# had written 5 states in its entire life and its last_reported was 22.2 h old
+# against the ping sensor's 24 s in the same render. A scheduler thread that
+# dies while mqtt.service keeps its broker connection therefore latches the
+# retained override forever, no LWT fires, and both notify-only checks suppress.
+#
+# So this topic is the one thing in the file that is published UNCONDITIONALLY,
+# and its only contract is that it moves while ticks are completing.
+#
+# NOT every tick. At TICK_SECONDS=30 that is 2,880 publishes a day and 2,880
+# recorder rows in Home Assistant, for a signal that only has to beat the
+# staleness threshold. Two minutes is 720 a day and still catches a wedged
+# thread well inside any threshold worth setting. It is its own constant rather
+# than a multiple of TICK_SECONDS so that changing the tick cadence — which is
+# tuned against `timedatectl` cost — does not silently change what Home
+# Assistant is watching.
+HEARTBEAT_SECONDS = 120
+
 # proc(5): the first field is seconds since boot. Read rather than derived from
 # monotonic() because the anchor has to survive a RESTART — mqtt.service carries
 # Restart=always with RestartSec=10, so a crash loop on a networkless boot would
@@ -377,21 +402,33 @@ class LightScheduler:
         light,
         publish_state=None,
         *,
+        publish_heartbeat=None,
         config_path=CONFIG_PATH,
         state_path=None,
         tick_seconds=TICK_SECONDS,
+        heartbeat_seconds=HEARTBEAT_SECONDS,
         now=datetime.now,
         clock_probe=read_clock_state,
         uptime=seconds_since_boot,
         never_synced_hold_seconds=NEVER_SYNCED_HOLD_SECONDS,
         monotonic_clock=monotonic,
+        heartbeat_clock=monotonic,
         sleeper=sleep,
     ):
         self._light = light
         self._publish_state = publish_state
+        self._publish_heartbeat = publish_heartbeat
         self._config_path = config_path
         self._state_path = state_path if state_path is not None else default_state_path()
         self._tick_seconds = tick_seconds
+        self._heartbeat_seconds = heartbeat_seconds
+        # SEPARATE FROM self._monotonic ON PURPOSE, for the same reason
+        # run_forever uses the module-level monotonic(). self._monotonic exists
+        # for exactly one job — the never-synced hold's fallback anchor — and
+        # tests inject FINITE iterators into it. Driving the heartbeat cadence
+        # from the same callable would exhaust them, turning a heartbeat test
+        # into a StopIteration in an unrelated branch.
+        self._heartbeat_clock = heartbeat_clock
         self._now = now
         self._clock_probe = clock_probe
         self._uptime = uptime
@@ -462,6 +499,14 @@ class LightScheduler:
         # Notes already reported, keyed by category, so a config file that is
         # missing for a week produces one ERROR rather than 20,160 of them.
         self._reported = {}
+        # How many heartbeats this process has sent, and when the last one went.
+        # None, not 0, so the FIRST completed tick always publishes one: a
+        # restart is exactly when Home Assistant most needs to be told the
+        # scheduler is deciding again, and waiting HEARTBEAT_SECONDS for that
+        # would leave a window in which a fresh process is indistinguishable
+        # from a dead one.
+        self._heartbeat_count = 0
+        self._last_heartbeat = None
 
     # ------------------------------------------------------------- override
 
@@ -685,7 +730,65 @@ class LightScheduler:
         pair = (decision.brightness, decision.source)
         if pair != self._last_published or not applied:
             self._record_published_locked(decision, self._publish(decision))
+        # LAST, AND OUTSIDE THE DEDUPE (T-527.22). Everything above can decline
+        # to publish; this cannot, because its whole job is to be the one topic
+        # whose silence means something. It sits at the END so that what it
+        # asserts is true: a heartbeat means a tick RAN TO COMPLETION, not that
+        # one was attempted. A tick that raises before here — load_schedule and
+        # decide are the only calls that can, everything else returns notes —
+        # is caught by run_forever and correctly leaves no heartbeat behind.
+        self._heartbeat_locked()
         return decision
+
+    def _heartbeat_locked(self):
+        """Publish the liveness counter if HEARTBEAT_SECONDS have elapsed.
+
+        THE PAYLOAD IS A COUNTER AND NOT A TIMESTAMP, and that choice is the
+        whole safety argument. A timestamp would be read on the Home Assistant
+        side as `now() - as_datetime(state)`, which makes the check depend on
+        THIS host's clock — the one thing T-527.19 established cannot be
+        trusted, since a Pi with no RTC and no network restores a time-of-day
+        from /var/lib/systemd/timesync/clock that can be days out. A clock
+        running AHEAD would then report the heartbeat as permanently fresh,
+        which is a false all-clear on the exact check that exists to catch a
+        silent failure. A counter carries no time at all, so the age is measured
+        by Home Assistant's own clock via last_changed, and a wrong clock here
+        cannot manufacture freshness there.
+
+        It only has to CHANGE, which is why it is a counter rather than a
+        constant: HA's `last_changed` moves on a new state string, and relying
+        on `last_reported` instead would pin the check to an HA version whose
+        semantics this repo has no way to assert.
+
+        NOT REPUBLISHED BY publish_now(), and that omission is deliberate.
+        publish_now() exists to refresh Home Assistant's retained copy when the
+        SUBSCRIBER changed — a reconnect, a birth message — and it is called
+        from paho's network thread, which is alive precisely in the failure this
+        heartbeat detects: broker connected, scheduler thread dead. Refreshing
+        the heartbeat there would report liveness for the thread that stopped,
+        using the thread that did not. The heartbeat has exactly one writer.
+
+        Best-effort like every other publish here. The broker being down is the
+        premise of T-527 and must never stop the photoperiod, so a raise is
+        logged and swallowed — and the clock is NOT advanced on failure, so the
+        next tick retries immediately rather than waiting out the interval.
+        """
+        if self._publish_heartbeat is None:
+            return
+        stamp = self._heartbeat_clock()
+        if (
+            self._last_heartbeat is not None
+            and stamp - self._last_heartbeat < self._heartbeat_seconds
+        ):
+            return
+        count = self._heartbeat_count + 1
+        try:
+            self._publish_heartbeat(count)
+        except Exception:
+            logger.exception("Schedule could not publish its heartbeat")
+            return
+        self._heartbeat_count = count
+        self._last_heartbeat = stamp
 
     def _record_published_locked(self, decision, published_ok):
         """Remember what was published, and ONLY if it really was.

@@ -65,6 +65,11 @@ SURVIVING_DISCOVERY = [
     f"homeassistant/image/gardyn/{ID}_upper_camera/config",
     f"homeassistant/image/gardyn/{ID}_lower_camera/config",
     f"homeassistant/sensor/gardyn/{ID}_light_source/config",
+    # T-527.22, the scheduler's liveness counter. Added here because this list
+    # is the gate that made me: the assertion went red the moment the discovery
+    # block landed, which is exactly the design — a new entity is meant to cost
+    # a deliberate edit rather than appearing in Home Assistant unremarked.
+    f"homeassistant/sensor/gardyn/{ID}_light_heartbeat/config",
 ]
 
 # Every state topic the retired entities were fed from that was published with

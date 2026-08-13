@@ -80,6 +80,19 @@ STATUS_TOPIC = BASE_TOPIC + "/status"
 # publish_light_decision().
 LIGHT_SOURCE_TOPIC = BASE_TOPIC + "/light/source"
 
+# The scheduler's liveness counter (T-527.22). A SEPARATE topic rather than a
+# periodic republish of LIGHT_SOURCE_TOPIC, and the separation is the design:
+# that topic is deduped on purpose (T-527.20) so Home Assistant's retained copy
+# only ever changes when the answer changes, and republishing it on a timer to
+# prove liveness would destroy the one property that makes it readable — that a
+# change on it means somebody took the lamp.
+#
+# So liveness gets its own topic, whose payload is meaningless and whose only
+# contract is that it moves while the scheduler is deciding. See
+# light_scheduler.LightScheduler._heartbeat_locked for why it is a counter and
+# not a timestamp, and why nothing but a completed tick may write it.
+LIGHT_HEARTBEAT_TOPIC = BASE_TOPIC + "/light/schedule/heartbeat"
+
 # Home Assistant's OWN lifecycle topic — the opposite direction to STATUS_TOPIC
 # above. That one is this device telling HA it is alive; this one is HA telling
 # the world that HA is alive, and it is the trigger for re-announcing discovery.
@@ -360,6 +373,32 @@ def publish_light_decision(client, decision):
     """
     publish_light_state(client)
     client.publish(LIGHT_SOURCE_TOPIC, decision.source, retain=True)
+
+
+def publish_light_heartbeat(client, count):
+    """Publish the scheduler's liveness counter (T-527.22).
+
+    RETAINED, and that has one consequence worth stating rather than
+    discovering. A retained heartbeat means Home Assistant has a value the
+    moment it subscribes instead of sitting at `unknown` — which the staleness
+    check needs, since `unknown` is not a state you can subtract a time from.
+    The cost is that an HA RESTART re-delivers the retained copy and stamps
+    `last_changed` at the restart, so a scheduler that died an hour ago reads as
+    fresh again for one threshold's worth of time.
+
+    That hole is bounded and self-correcting: if the scheduler really is dead
+    the counter stops moving and the staleness re-accrues from the restart, so
+    the check fires one threshold late rather than never. It is the cheaper of
+    the two mistakes here — the alternative, an unretained topic, makes the
+    sensor unavailable across every HA restart and turns the ordinary case into
+    the one needing special handling in the automation.
+
+    It is emphatically NOT fixed by having the reconnect path republish this.
+    See _heartbeat_locked: the failure this detects is a dead scheduler thread
+    under a live broker connection, and the reconnect path runs on the thread
+    that is still alive.
+    """
+    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count), retain=True)
 
 
 def clear_retired_entities(client):
@@ -765,6 +804,28 @@ def send_discovery_messages(client):
         "unique_id": IDENTIFIER + "_light_source",
         "state_topic": LIGHT_SOURCE_TOPIC,
         "icon": "mdi:account-clock",
+        "entity_category": "diagnostic",
+        "device": device_info,
+    })
+
+    # Config for the scheduler's heartbeat (T-527.22). Diagnostic, like the
+    # source sensor beside it, and for the same reason: it is not something to
+    # look at, it is something for an automation to condition on.
+    #
+    # NO device_class AND NO state_class, both deliberate. device_class
+    # "timestamp" would require an ISO datetime payload, which is the design
+    # this deliberately rejects (see _heartbeat_locked — the payload must carry
+    # no time, or the check inherits this Pi's untrustworthy clock).
+    # state_class would enrol an ever-increasing counter in long-term
+    # statistics, which nothing wants: the VALUE is meaningless and only its
+    # movement is read.
+    HEARTBEAT_CONFIG_TOPIC = ("homeassistant/sensor/gardyn/" + IDENTIFIER
+                              + "_light_heartbeat/config")
+    publish_config(HEARTBEAT_CONFIG_TOPIC, {
+        "name": "Light Schedule Heartbeat",
+        "unique_id": IDENTIFIER + "_light_heartbeat",
+        "state_topic": LIGHT_HEARTBEAT_TOPIC,
+        "icon": "mdi:heart-pulse",
         "entity_category": "diagnostic",
         "device": device_info,
     })
@@ -1960,8 +2021,15 @@ if __name__ == "__main__":
     # or its OWNER changes. A publish on a client that has not connected yet
     # returns an error code rather than raising, and the reconnect path
     # republishes both through announce_to_home_assistant() anyway.
+    # The heartbeat (T-527.22) is wired here rather than folded into
+    # publish_light_decision, because the two answer different questions and
+    # must be able to fail independently: the decision publish is deduped and
+    # may legitimately not happen for hours, while the heartbeat's silence is
+    # itself the alarm.
     light_scheduler = LightScheduler(
-        light, lambda decision: publish_light_decision(client, decision)
+        light,
+        lambda decision: publish_light_decision(client, decision),
+        publish_heartbeat=lambda count: publish_light_heartbeat(client, count),
     )
     light_scheduler.start()
 

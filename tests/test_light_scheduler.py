@@ -22,6 +22,7 @@ its garden goes dark cannot be demonstrated on it:
 
 Every one of them is a fake here and a lived incident there.
 """
+import inspect
 import io
 import json
 import logging
@@ -1412,6 +1413,200 @@ class SerialisationTests(SchedulerHarness):
         self.assertEqual(before + 1, len(self.published))
 
 
+class HeartbeatTests(SchedulerHarness):
+    """The liveness counter (T-527.22).
+
+    WHAT THIS IS FOR, restated because every assertion below is only meaningful
+    against it: the state publish is DEDUPED, so a healthy scheduler that keeps
+    reaching the same decision sends Home Assistant nothing for hours. HA
+    therefore cannot distinguish "nothing has changed" from "nothing is
+    deciding" — and a scheduler THREAD that dies under a live broker connection
+    produces no LWT, leaves the retained override latched, and silences both
+    notify-only checks at once. The heartbeat is the only topic whose silence
+    is itself the signal, so the property under test throughout is that it
+    publishes where everything else declines to.
+
+    THE FIRING PAIR each test is built around: a tick that changes nothing
+    (deduped, no state publish) must still emit a heartbeat, and a tick inside
+    the interval must not. Those two differ only in elapsed time, which is the
+    thing under test.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # The counter values handed to the sink, in order. Recording the VALUE
+        # and not merely the call count is what lets the "does it advance on a
+        # failed publish" tests below say something.
+        self.beats = []
+        self.beat_clock = 0.0
+        self.beat_fails_with = None
+
+    def _sink(self, count):
+        if self.beat_fails_with is not None:
+            raise self.beat_fails_with
+        self.beats.append(count)
+
+    def build(self, **kwargs):
+        kwargs.setdefault("publish_heartbeat", self._sink)
+        kwargs.setdefault("heartbeat_clock", lambda: self.beat_clock)
+        return super().build(**kwargs)
+
+    # ------------------------------------------------------------- cadence
+
+    def test_the_first_completed_tick_publishes_a_heartbeat(self):
+        """A restart is exactly when HA most needs telling the scheduler is
+        deciding again. Waiting out the interval would leave a window in which
+        a fresh process is indistinguishable from a dead one."""
+        self.build().tick()
+        self.assertEqual([1], self.beats)
+
+    def test_a_second_tick_inside_the_interval_does_not_publish(self):
+        scheduler = self.build(heartbeat_seconds=120)
+        scheduler.tick()
+        self.beat_clock = 119.0
+        scheduler.tick()
+        self.assertEqual([1], self.beats)
+
+    def test_a_tick_past_the_interval_publishes_and_the_counter_advances(self):
+        scheduler = self.build(heartbeat_seconds=120)
+        scheduler.tick()
+        self.beat_clock = 120.0
+        scheduler.tick()
+        self.beat_clock = 240.0
+        scheduler.tick()
+        self.assertEqual([1, 2, 3], self.beats)
+
+    def test_the_boundary_is_inclusive(self):
+        """At exactly heartbeat_seconds it publishes. Named because `>` and
+        `>=` are the mutation a maintainer actually makes here, and one tick of
+        difference is invisible in every other test."""
+        scheduler = self.build(heartbeat_seconds=120)
+        scheduler.tick()
+        self.beat_clock = 120.0
+        scheduler.tick()
+        self.assertEqual([1, 2], self.beats)
+
+    # ---------------------------------------------------- the whole point
+
+    def test_a_DEDUPED_tick_still_publishes_a_heartbeat(self):
+        """THE property. The second tick reaches the identical decision, so the
+        state publish is suppressed — and that suppression is the T-527.20
+        behaviour that must not be touched. The heartbeat has to survive it or
+        this ticket has shipped nothing."""
+        scheduler = self.build(heartbeat_seconds=120)
+        scheduler.tick()
+        published_after_first = len(self.published)
+        self.beat_clock = 300.0
+        scheduler.tick()
+        self.assertEqual(
+            published_after_first, len(self.published),
+            "the state publish was NOT deduped, so this test is not exercising "
+            "the case it was written for")
+        self.assertEqual([1, 2], self.beats)
+
+    def test_a_failed_drive_still_publishes_a_heartbeat(self):
+        """A pigpio drop means the lamp is wrong; it does not mean the
+        scheduler stopped deciding, and reporting it as dead would point the
+        alarm at the wrong subsystem."""
+        scheduler = self.build(heartbeat_seconds=120)
+        scheduler.tick()
+        self.light.fail_on_set = RuntimeError("pigpio connection lost")
+        self.light.fail_on_get = RuntimeError("pigpio connection lost")
+        self.beat_clock = 300.0
+        scheduler.tick()
+        self.assertEqual([1, 2], self.beats)
+
+    def test_an_override_tick_publishes_a_heartbeat_too(self):
+        """override_now() routes through _tick_locked, so it is a completed
+        tick by every measure this file uses."""
+        scheduler = self.build(heartbeat_seconds=120)
+        scheduler.tick()
+        self.beat_clock = 300.0
+        scheduler.override_now(25)
+        self.assertEqual([1, 2], self.beats)
+
+    # ------------------------------------------------------------ failure
+
+    def test_a_raising_sink_does_not_escape_the_tick(self):
+        """The broker being down is the PREMISE of T-527. A heartbeat that
+        could kill the tick would make the observability feature able to stop
+        the photoperiod it observes."""
+        scheduler = self.build()
+        self.beat_fails_with = RuntimeError("broker unreachable")
+        with self.assertLogs("light_scheduler", level="ERROR"):
+            decision = scheduler.tick()
+        self.assertEqual(100, decision.brightness)
+        self.assertEqual([100], self.light.commands)
+
+    def test_a_failed_publish_does_not_advance_the_counter_or_the_clock(self):
+        """Both halves matter and they fail in opposite directions. Advancing
+        the COUNTER would mean the next successful beat skips a number, which
+        is harmless — but advancing the CLOCK would make a broker outage
+        shorter than the interval swallow a whole beat, so the retry would wait
+        out a fresh interval instead of trying again on the next tick."""
+        scheduler = self.build(heartbeat_seconds=120)
+        self.beat_fails_with = RuntimeError("broker unreachable")
+        with self.assertLogs("light_scheduler", level="ERROR"):
+            scheduler.tick()
+        self.assertEqual([], self.beats)
+        self.beat_fails_with = None
+        # No clock movement at all: if the failure had stamped the clock, this
+        # tick would be inside the interval and publish nothing.
+        scheduler.tick()
+        self.assertEqual([1], self.beats)
+
+    def test_no_sink_configured_is_not_an_error(self):
+        """The scheduler is constructible without a broker — that is what makes
+        every test in this file runnable off the Pi."""
+        scheduler = self.build(publish_heartbeat=None)
+        self.assertEqual(100, scheduler.tick().brightness)
+
+    # ------------------------------------------------------ who may write it
+
+    def test_publish_now_does_NOT_emit_a_heartbeat(self):
+        """publish_now() runs on paho's network thread, which is alive in
+        precisely the failure this heartbeat detects: broker connected,
+        scheduler thread dead. A heartbeat from there would report liveness for
+        the thread that stopped, using the thread that did not — the check
+        would then never fire, and it is the only check for that fault."""
+        scheduler = self.build(heartbeat_seconds=120)
+        scheduler.tick()
+        self.beat_clock = 9000.0
+        scheduler.publish_now()
+        scheduler.publish_now()
+        self.assertEqual([1], self.beats)
+
+    def test_a_tick_that_raises_leaves_no_heartbeat(self):
+        """The heartbeat sits LAST in _tick_locked so that it means a tick RAN
+        TO COMPLETION. A tick killed part-way through must not claim one — that
+        is the difference between "the scheduler is deciding" and "the
+        scheduler is being called"."""
+        def explode():
+            raise RuntimeError("the wall clock read blew up")
+
+        # Injected rather than patched: `now` is read inside _tick_locked
+        # AFTER the config and clock reads and BEFORE decide(), so this kills
+        # the tick in the middle, which is the shape being tested.
+        scheduler = self.build(now=explode)
+        with self.assertRaises(RuntimeError):
+            scheduler.tick()
+        self.assertEqual([], self.beats)
+
+    def test_the_heartbeat_clock_is_not_the_never_synced_anchor(self):
+        """Separate injectables on purpose. `monotonic_clock` exists only for
+        the never-synced hold's fallback anchor and tests feed it FINITE
+        iterators; if the heartbeat shared it, a heartbeat test would die of
+        StopIteration inside an unrelated branch. Pinning it here so a
+        'simplification' that collapses the two is caught by a named test
+        rather than by a confusing failure somewhere else."""
+        exhausted = iter([0.0])
+        scheduler = self.build(monotonic_clock=lambda: next(exhausted))
+        # The one value is consumed by __init__'s _started_monotonic. If the
+        # heartbeat also drew from it, this tick would raise StopIteration.
+        scheduler.tick()
+        self.assertEqual([1], self.beats)
+
+
 class ModuleDefaultTests(unittest.TestCase):
     """The constructor's defaults, which every other test overrides.
 
@@ -1437,6 +1632,27 @@ class ModuleDefaultTests(unittest.TestCase):
 
     def test_the_ntp_query_timeout_default_is_ten_seconds(self):
         self.assertEqual(10, lsr.NTP_QUERY_TIMEOUT_SECONDS)
+
+    def test_the_heartbeat_cadence_default_is_two_minutes(self):
+        """Pinned because the Home Assistant staleness threshold is chosen
+        against it and lives in a different system entirely — nothing in this
+        repo can see that automation, so a silent change here would widen the
+        detection window with no local signal at all."""
+        self.assertEqual(120, lsr.HEARTBEAT_SECONDS)
+
+    def test_the_heartbeat_cadence_is_not_derived_from_the_tick(self):
+        """They are tuned against different things — the tick against
+        `timedatectl` cost, the heartbeat against recorder rows and the
+        staleness threshold — so a future retune of one must not move the
+        other. Asserting they are independent constants, not that the numbers
+        differ, which they could coincidentally stop doing."""
+        source = inspect.getsource(lsr)
+        assignment = [
+            line for line in source.splitlines()
+            if line.startswith("HEARTBEAT_SECONDS")
+        ]
+        self.assertEqual(1, len(assignment))
+        self.assertNotIn("TICK_SECONDS", assignment[0])
 
     def test_a_scheduler_built_with_no_kwargs_takes_the_module_defaults(self):
         """The constants above are only worth pinning if the constructor still
@@ -1767,6 +1983,67 @@ class WiringTests(unittest.TestCase):
         self.assertRegex(body, r"publish_config\(\s*SOURCE_CONFIG_TOPIC\s*,")
         self.assertIn("LIGHT_SOURCE_TOPIC", body)
         self.assertIn("_light_source", body)
+
+    def test_the_heartbeat_gets_a_discovery_entity(self):
+        """Same shape as the owner sensor above, and the same two traps: match
+        the CALL rather than the constant, since a payload built into a local
+        and never published contains every name a laxer assertion looks for."""
+        body = self.source.split("def send_discovery_messages(")[1].split(
+            "\ndef ")[0]
+        self.assertRegex(body, r"publish_config\(\s*HEARTBEAT_CONFIG_TOPIC\s*,")
+        self.assertIn("LIGHT_HEARTBEAT_TOPIC", body)
+        self.assertIn("_light_heartbeat", body)
+
+    def test_the_heartbeat_is_wired_into_the_scheduler(self):
+        """A heartbeat nothing passes to the constructor is a heartbeat that
+        never publishes — the scheduler's sink defaults to None and returns
+        silently, so the whole feature would be inert with every unit test in
+        this file still green."""
+        self.assertRegex(
+            self.source,
+            r"publish_heartbeat\s*=\s*lambda\s+\w+\s*:\s*"
+            r"publish_light_heartbeat\(",
+            "the scheduler is constructed without a heartbeat sink",
+        )
+
+    def test_the_heartbeat_is_published_RETAINED(self):
+        """Without retain, Home Assistant sits at `unknown` after every restart
+        and the staleness check has no time to subtract from."""
+        body = self.source.split("def publish_light_heartbeat(")[1].split(
+            "\ndef ")[0]
+        self.assertRegex(
+            body,
+            # [^\n]* and NOT [^)]*: the payload argument is `str(count)`, whose
+            # own closing paren ends a [^)]* run before it can reach `retain`.
+            # That spelling failed on a correct file, which is the direction
+            # that reads as a real finding.
+            r"client\.publish\(\s*LIGHT_HEARTBEAT_TOPIC\s*,[^\n]*retain\s*=\s*True",
+        )
+
+    def test_the_heartbeat_topic_is_NOT_the_source_topic(self):
+        """The separation is the design. Republishing the source topic on a
+        timer to prove liveness would destroy the property that makes it
+        readable — that a change on it means somebody took the lamp — and the
+        dedupe behind it is T-527.20 behaviour that must not be touched."""
+        self.assertRegex(
+            self.source,
+            r'LIGHT_HEARTBEAT_TOPIC\s*=\s*BASE_TOPIC\s*\+\s*"[^"]+"',
+        )
+        heartbeat = self.source.split("LIGHT_HEARTBEAT_TOPIC = ")[1].split(
+            "\n")[0]
+        source_topic = self.source.split("LIGHT_SOURCE_TOPIC = ")[1].split(
+            "\n")[0]
+        self.assertNotEqual(source_topic, heartbeat)
+
+    def test_the_reconnect_path_does_NOT_refresh_the_heartbeat(self):
+        """announce_to_home_assistant() runs on paho's network thread, which is
+        alive in exactly the failure the heartbeat detects. A refresh from
+        there reports liveness for the thread that stopped, using the thread
+        that did not — and this is the only check for that fault."""
+        body = self.source.split("def announce_to_home_assistant(")[1].split(
+            "\ndef ")[0]
+        self.assertNotIn("publish_light_heartbeat(", body)
+        self.assertNotIn("LIGHT_HEARTBEAT_TOPIC", body)
 
     def test_the_scheduler_starts_OUTSIDE_on_connect(self):
         """The one property that makes this feature work. Starting it from
