@@ -876,7 +876,23 @@ class LightScheduler:
             # on the message text and announces the recovery, which is exactly
             # the shape this needs — so the text must stay CONSTANT for the
             # duration of the fault.
-            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")
+            #
+            # THE EXCEPTION'S CLASS, NOT ITS MESSAGE. An earlier version
+            # interpolated `{exc}`, whose text carries paho's return code — and
+            # that code MOVES within a single outage: measured against real paho
+            # 2.0.0, killing the socket under a connected client gives
+            # MQTT_ERR_CONN_LOST (7) on the first beat and MQTT_ERR_NO_CONN (4)
+            # thereafter. Two lines per clean outage, and driving the real
+            # scheduler through a flapping link (7,4,7,4,…) defeated the dedupe
+            # completely: 8 of 8 beats logged. That is the same shape as the
+            # `{elapsed/3600:.1f}` defect this module already paid for.
+            #
+            # The class name is constant per cause and still discriminates the
+            # thing worth discriminating — a RuntimeError from the return-code
+            # check versus, say, an AttributeError from a stubbed paho.
+            self._report(
+                "heartbeat",
+                f"cannot publish the schedule heartbeat ({type(exc).__name__})")
             return
         self._report("heartbeat", None)
         self._heartbeat_count = count

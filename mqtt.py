@@ -427,9 +427,19 @@ def publish_light_heartbeat(client, count):
     _heartbeat_locked would stamp its clock and charge the beat as sent — its
     docstring promising a retry that, for the one failure it names, never ran.
 
-    Raising here is what makes that promise true. It matters more since the
-    retain= was dropped: there is no broker-side copy to fall back on, so a
-    silently-dropped beat is simply a beat that never happened.
+    Raising here is what makes that promise true FOR THIS FAILURE, and the
+    qualifier is owed: rc answers "did the packet leave this process", not "did
+    the broker receive it". Two measured false successes remain - a publish
+    issued while paho holds its _in_callback_mutex returns rc=0 with the packet
+    still in _out_packet, and a silent network partition writes into the kernel
+    send buffer and returns rc=0. The second is this Pi's documented Wi-Fi-drop
+    mode, and expire_after is what covers it: no beat arrives, the sensor
+    expires. This check closes the no-socket case, which was the one being
+    charged as sent.
+
+    It matters more since the retain= was dropped: there is no broker-side copy
+    to fall back on, so a silently-dropped beat is simply a beat that never
+    happened.
 
     It also closes a startup race nobody had noticed. __main__ calls
     light_scheduler.start() BEFORE client.connect_async(), deliberately — the
@@ -440,9 +450,10 @@ def publish_light_heartbeat(client, count):
     """
     info = client.publish(LIGHT_HEARTBEAT_TOPIC, str(count))
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
-        # Constant text, no interpolated counter: _report dedupes on the
-        # message, so a value that moves defeats it and writes a line per beat
-        # into an unrotated log on an SD card.
+        # The rc IS interpolated here, and that is safe only because
+        # _heartbeat_locked reports the exception's CLASS rather than its
+        # message. An earlier comment here claimed this text was constant; it
+        # is not - a real outage returns rc=7 then rc=4. See _heartbeat_locked.
         raise RuntimeError(f"broker refused the heartbeat (rc={info.rc})")
 
 
@@ -865,12 +876,17 @@ def send_discovery_messages(client):
     # availability flap or by a crash loop's restart churn — see
     # publish_light_heartbeat for the measurement that ruled that approach out.
     #
-    # 600 s against a NOMINAL 120 s cadence, but the honest figure is 2.5x and
-    # not 5x. _last_heartbeat is stamped after the tick returns and tick
-    # duration varies by up to NTP_QUERY_TIMEOUT_SECONDS, so a slow beating tick
-    # followed by a fast one makes the 120 s gate miss and the beat slips a
-    # whole tick cycle. At most one slip per beat, so the worst case is ~240 s.
-    # Still comfortably inside 600 s; the margin is just smaller than it looks.
+    # 600 s against a NOMINAL 120 s cadence. The honest worst case is 160 s,
+    # so the real margin is 3.75x rather than the 5x it looks like.
+    # _last_heartbeat is stamped after the tick returns and tick duration varies
+    # by up to NTP_QUERY_TIMEOUT_SECONDS, so a slow beating tick followed by a
+    # fast one makes the 120 s gate miss and the beat slips one TICK cycle:
+    # HEARTBEAT_SECONDS + TICK_SECONDS + max(tick duration) = 120 + 30 + 10.
+    # Measured by driving the real scheduler over 4,000 random duration
+    # sequences - worst observed gap 159.999 s. An earlier version of this
+    # comment said ~240 s, having slipped a whole HEARTBEAT cycle where its own
+    # sentence said a tick cycle; wrong in the conservative direction, so the
+    # 3x test threshold and the 600 s choice are unaffected.
     #
     # The upper bound is the 15-minute dwell filter both obedience automations
     # already carry: 600 s < 900 s, so a wedged scheduler is detected before

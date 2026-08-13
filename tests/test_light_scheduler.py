@@ -1443,7 +1443,15 @@ class HeartbeatTests(SchedulerHarness):
         self.beat_fails_with = None
 
     def _sink(self, count):
-        if self.beat_fails_with is not None:
+        """The heartbeat sink. `beat_fails_with` takes an exception OR a LIST.
+
+        The list form exists because the dedupe test has to drive DISTINCT
+        exception messages - a single object raised repeatedly supplies the
+        constancy that test is meant to be asserting."""
+        if isinstance(self.beat_fails_with, list):
+            if self.beat_fails_with:
+                raise self.beat_fails_with.pop(0)
+        elif self.beat_fails_with is not None:
             raise self.beat_fails_with
         self.beats.append(count)
 
@@ -1624,21 +1632,36 @@ class HeartbeatTests(SchedulerHarness):
 
     def test_a_persistently_failing_heartbeat_is_logged_ONCE(self):
         """A broker outage lasts hours and the beat retries every interval, so
-        a traceback per beat would write hundreds of lines into an unrotated log
-        on an SD card - the cost this module's _report exists to avoid, and the
-        reason the failure path uses it rather than logger.exception. The
-        message text must therefore stay constant for the duration of the
-        fault."""
+        a line per beat would write hundreds into an unrotated log on an SD
+        card - the cost this module's _report exists to avoid, and the reason
+        the failure path uses it rather than logger.exception.
+
+        THE FIXTURE RAISES DISTINCT MESSAGES ON PURPOSE, and an earlier version
+        raised one object five times - which supplied the very constancy the
+        test claims to assert, so it could not fail for the reason it exists.
+        The sequence below is the MEASURED one: killing the socket under a
+        connected paho 2.0.0 client returns MQTT_ERR_CONN_LOST (7) on the first
+        publish and MQTT_ERR_NO_CONN (4) thereafter, so a real outage produces
+        at least two distinct exception messages. The last two model a flapping
+        link, which defeated the dedupe 8 times out of 8 before the fix."""
         scheduler = self.build(heartbeat_seconds=0)
-        self.beat_fails_with = RuntimeError("broker refused the heartbeat (rc=4)")
+        self.beat_fails_with = [
+            RuntimeError("broker refused the heartbeat (rc=7)"),
+            RuntimeError("broker refused the heartbeat (rc=4)"),
+            RuntimeError("broker refused the heartbeat (rc=4)"),
+            RuntimeError("broker refused the heartbeat (rc=7)"),
+            RuntimeError("broker refused the heartbeat (rc=4)"),
+        ]
         with self.assertLogs("light_scheduler", level="ERROR") as captured:
             for _ in range(5):
                 scheduler.tick()
+        self.assertEqual([], self.beat_fails_with, "the fixture was not drained")
         heartbeat_lines = [
             line for line in captured.output if "heartbeat" in line.lower()]
         self.assertEqual(
             1, len(heartbeat_lines),
-            f"five failed beats produced {len(heartbeat_lines)} log lines")
+            f"five failed beats, five distinct exception messages, produced "
+            f"{len(heartbeat_lines)} log lines: {heartbeat_lines}")
 
     def test_a_recovered_heartbeat_says_so(self):
         """The other half of _report's contract. Without the resolve line the
@@ -2044,8 +2067,31 @@ class WiringTests(unittest.TestCase):
                         f"mqtt.py does not contain {needle!r}. {why}")
 
     def test_mqtt_constructs_and_starts_the_scheduler(self):
-        self._assertInSource("LightScheduler(")
-        self._assertInSource("light_scheduler.start()")
+        """LINE-ANCHORED, because this guard went DEAD on 2026-08-13 and the
+        battery could not see it.
+
+        It used to be `_assertInSource("light_scheduler.start()")`, a bare
+        substring over the whole file. T-527.22's publish_light_heartbeat
+        docstring then explained the startup race and wrote that exact call into
+        prose — so deleting the real call at the bottom of __main__ left this
+        test GREEN. Proved by review: only the sibling ordering test, which was
+        already line-anchored, went red.
+
+        The battery concealed it. The mutant that deletes the call is killed by
+        that sibling, so 110/110 held while the guard named for this property
+        was guarding nothing.
+
+        This is the rule the class docstring already states — match a form only
+        the CODE can produce, never a bare name the prose also contains — and it
+        had been applied to the mutation harness's anchor for the same collision
+        and NOT to the test carrying the same needle."""
+        self.assertRegex(
+            self.source, r"(?m)^    light_scheduler = LightScheduler\($",
+            "mqtt.py does not construct the scheduler at module scope")
+        self.assertRegex(
+            self.source, r"(?m)^    light_scheduler\.start\(\)\s*$",
+            "mqtt.py does not start the scheduler; a mention in prose does not "
+            "count")
 
     def test_the_command_handlers_go_through_the_scheduler(self):
         """Two writers of one lamp differ in exactly the two things that stay
@@ -2188,9 +2234,11 @@ class WiringTests(unittest.TestCase):
 
         RENAMED from '..._is_a_multiple_of_...', which is not what it asserts.
         It checks a MARGIN of 3x, and 3x rather than the nominal 5x because the
-        real cadence is 120-240 s: the beat clock is stamped after the tick
-        returns, so a slow beating tick followed by a fast one slips a whole
-        tick cycle."""
+        real worst-case cadence is 160 s, not 120: the beat clock is stamped
+        after the tick returns, so a slow beating tick followed by a fast one
+        slips one TICK cycle. Closed form HEARTBEAT_SECONDS + TICK_SECONDS +
+        max(tick duration) = 120 + 30 + 10; measured worst gap 159.999 s over
+        4,000 random sequences."""
         payload = self._heartbeat_config_payload()
         expire = int(re.search(r'"expire_after"\s*:\s*(\d+)', payload).group(1))
         self.assertGreaterEqual(
@@ -2206,6 +2254,13 @@ class WiringTests(unittest.TestCase):
         body = self.source.split("def send_discovery_messages(")[1].split(
             "\ndef ")[0]
         after = body.split("publish_config(HEARTBEAT_CONFIG_TOPIC,")
+        # Distinguishes ABSENT from DUPLICATED. One message for both pointed
+        # the reader at the wrong problem when a reformat split the call across
+        # lines - the likelier of the two failures by far.
+        self.assertNotEqual(
+            1, len(after),
+            "the heartbeat discovery call was not found - has publish_config("
+            "HEARTBEAT_CONFIG_TOPIC, been reformatted across lines?")
         self.assertEqual(
             2, len(after), "the heartbeat discovery call is not unique")
         payload, sep, _rest = after[1].partition("})")

@@ -377,8 +377,8 @@ MUTANTS = [
      "            and stamp - self._last_heartbeat <= self._heartbeat_seconds"),
     ("a failed heartbeat publish stamps the clock anyway, so a broker blip "
      "swallows a whole interval instead of retrying next tick", SRC,
-     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")\n            return',
-     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")\n            self._last_heartbeat = stamp\n            return'),
+     '            self._report(\n                "heartbeat",\n                f"cannot publish the schedule heartbeat ({type(exc).__name__})")\n            return',
+     '            self._report(\n                "heartbeat",\n                f"cannot publish the schedule heartbeat ({type(exc).__name__})")\n            self._last_heartbeat = stamp\n            return'),
     # Sets the counter in the FAILURE branch. The first version reordered the
     # two success-path assignments and added `+ 0`, which is a no-op the
     # `except` arm returns before ever reaching — it survived because it was
@@ -386,8 +386,8 @@ MUTANTS = [
     ("a failed heartbeat publish advances the counter, so the next successful "
      "beat skips a number and the sink's record disagrees with the scheduler's",
      SRC,
-     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")\n            return',
-     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")\n            self._heartbeat_count = count\n            return'),
+     '            self._report(\n                "heartbeat",\n                f"cannot publish the schedule heartbeat ({type(exc).__name__})")\n            return',
+     '            self._report(\n                "heartbeat",\n                f"cannot publish the schedule heartbeat ({type(exc).__name__})")\n            self._heartbeat_count = count\n            return'),
     ("a broker that refuses the heartbeat takes the whole tick down - the "
      "observability feature killing the photoperiod it observes", SRC,
      "        try:\n            self._publish_heartbeat(count)\n        except Exception as exc:",
@@ -413,10 +413,19 @@ MUTANTS = [
      "broker is charged as sent - paho RETURNS rc=4, it does not raise", MQTT,
      "    if info.rc != mqtt.MQTT_ERR_SUCCESS:",
      "    if False:"),
+    # THE PROPERTY LIVES IN THE MESSAGE, not in the reporting call, so this is
+    # the mutant that actually guards it. Review measured paho returning rc=7
+    # then rc=4 across one outage, so interpolating the exception's MESSAGE
+    # (rather than its class) puts a moving value into a deduped string.
+    ("the deduped heartbeat message carries the exception's TEXT, whose paho "
+     "return code moves within one outage (7 then 4), so a flapping link logs "
+     "every beat", SRC,
+     '                f"cannot publish the schedule heartbeat ({type(exc).__name__})")',
+     '                f"cannot publish the schedule heartbeat ({exc})")'),
     ("a failed heartbeat writes a traceback per beat instead of one deduped "
      "line, burying an unrotated log on an SD card for the length of an outage",
      SRC,
-     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")',
+     '            self._report(\n                "heartbeat",\n                f"cannot publish the schedule heartbeat ({type(exc).__name__})")',
      '            logger.exception("Schedule could not publish its heartbeat: %s", exc)'),
     ("a recovered heartbeat never says so, so the journal's last word on it is "
      "the failure", SRC,
