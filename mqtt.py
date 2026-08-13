@@ -418,8 +418,32 @@ def publish_light_heartbeat(client, count):
     See _heartbeat_locked: the failure this detects is a dead scheduler thread
     under a live broker connection, and the reconnect path runs on the thread
     that is still alive.
+
+    THE RETURN CODE IS CHECKED, AND THAT IS NOT BOILERPLATE. paho's publish()
+    does NOT raise when the client is disconnected — it RETURNS, with
+    `rc=MQTT_ERR_NO_CONN`, and for QoS 0 it does not even queue the packet.
+    Measured against the pinned paho-mqtt 2.0.0: `rc=4`, `_out_packet=0`. So
+    the scheduler's `except Exception` could never see a broker outage, and
+    _heartbeat_locked would stamp its clock and charge the beat as sent — its
+    docstring promising a retry that, for the one failure it names, never ran.
+
+    Raising here is what makes that promise true. It matters more since the
+    retain= was dropped: there is no broker-side copy to fall back on, so a
+    silently-dropped beat is simply a beat that never happened.
+
+    It also closes a startup race nobody had noticed. __main__ calls
+    light_scheduler.start() BEFORE client.connect_async(), deliberately — the
+    photoperiod must not wait on a broker — so the very first beat can lose to
+    the CONNACK. Without this check that beat was charged as sent and the next
+    was a full interval away; with it, the clock does not advance and the next
+    tick retries 30 s later.
     """
-    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count))
+    info = client.publish(LIGHT_HEARTBEAT_TOPIC, str(count))
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        # Constant text, no interpolated counter: _report dedupes on the
+        # message, so a value that moves defeats it and writes a line per beat
+        # into an unrotated log on an SD card.
+        raise RuntimeError(f"broker refused the heartbeat (rc={info.rc})")
 
 
 def clear_retired_entities(client):
@@ -841,12 +865,23 @@ def send_discovery_messages(client):
     # availability flap or by a crash loop's restart churn — see
     # publish_light_heartbeat for the measurement that ruled that approach out.
     #
-    # 600 s is 5x light_scheduler.HEARTBEAT_SECONDS. Wide enough to ride out a
-    # broker blip and a netwatch reboot cycle, short enough that a wedged
-    # scheduler thread is caught inside the same 15-minute dwell window the
-    # obedience checks already measure. The two numbers are coupled and live in
-    # different repos, which is exactly why the Pi's constant is pinned by a
-    # named test.
+    # 600 s against a NOMINAL 120 s cadence, but the honest figure is 2.5x and
+    # not 5x. _last_heartbeat is stamped after the tick returns and tick
+    # duration varies by up to NTP_QUERY_TIMEOUT_SECONDS, so a slow beating tick
+    # followed by a fast one makes the 120 s gate miss and the beat slips a
+    # whole tick cycle. At most one slip per beat, so the worst case is ~240 s.
+    # Still comfortably inside 600 s; the margin is just smaller than it looks.
+    #
+    # The upper bound is the 15-minute dwell filter both obedience automations
+    # already carry: 600 s < 900 s, so a wedged scheduler is detected before
+    # those checks decide. The two numbers are coupled and live in different
+    # repos, which is why the Pi's constant is pinned by a named test.
+    #
+    # IT DOES NOT "RIDE OUT" A NETWATCH REBOOT, and an earlier version of this
+    # comment claimed it did. During a reboot the Pi is off the broker entirely,
+    # so the LWT has already made every gardyn entity unavailable — expire_after
+    # is not the mechanism in play, and netwatch's own timings put the cycle
+    # outside 600 s anyway.
     #
     # NO device_class AND NO state_class, both deliberate. device_class
     # "timestamp" would require an ISO datetime payload, which is the design

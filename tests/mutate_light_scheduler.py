@@ -338,12 +338,23 @@ MUTANTS = [
      "        if (\n            self._scheduler_ident is not None\n"
      "            and threading.get_ident() != self._scheduler_ident\n        ):\n            return",
      "        if False:\n            return"),
-    ("the guard is inverted into a hard check, so the REAL loop is refused and "
-     "the heartbeat never publishes at all", SRC,
+    # RELABELLED after review. This was called "the REAL loop is refused and the
+    # heartbeat never publishes at all", and it is not that: it perturbs the
+    # PRE-LOOP permissiveness, and the test that names a silent total failure
+    # (test_run_forever_claims_the_ident_on_the_thread_it_runs_on) passes under
+    # it. Probed in a sandbox to confirm which case each arm actually reddens.
+    # The direction the old label described had no mutant at all; it is the
+    # next entry.
+    ("the guard stops being inert before a loop runs, so a direct tick() is "
+     "refused and every test in this file loses its heartbeat", SRC,
      "            self._scheduler_ident is not None\n"
      "            and threading.get_ident() != self._scheduler_ident",
      "            self._scheduler_ident is None\n"
      "            or threading.get_ident() != self._scheduler_ident"),
+    ("the guard's comparison is flipped, so the REAL loop is refused and a "
+     "non-scheduler thread is the only caller that can beat", SRC,
+     "            and threading.get_ident() != self._scheduler_ident",
+     "            and threading.get_ident() == self._scheduler_ident"),
     ("run_forever never claims the ident, so the guard can never reject "
      "anything", SRC,
      "        self._scheduler_ident = threading.get_ident()\n        while not self._stop.is_set():",
@@ -366,8 +377,8 @@ MUTANTS = [
      "            and stamp - self._last_heartbeat <= self._heartbeat_seconds"),
     ("a failed heartbeat publish stamps the clock anyway, so a broker blip "
      "swallows a whole interval instead of retrying next tick", SRC,
-     '            logger.exception("Schedule could not publish its heartbeat")\n            return',
-     '            logger.exception("Schedule could not publish its heartbeat")\n            self._last_heartbeat = stamp\n            return'),
+     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")\n            return',
+     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")\n            self._last_heartbeat = stamp\n            return'),
     # Sets the counter in the FAILURE branch. The first version reordered the
     # two success-path assignments and added `+ 0`, which is a no-op the
     # `except` arm returns before ever reaching — it survived because it was
@@ -375,12 +386,12 @@ MUTANTS = [
     ("a failed heartbeat publish advances the counter, so the next successful "
      "beat skips a number and the sink's record disagrees with the scheduler's",
      SRC,
-     '            logger.exception("Schedule could not publish its heartbeat")\n            return',
-     '            logger.exception("Schedule could not publish its heartbeat")\n            self._heartbeat_count = count\n            return'),
+     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")\n            return',
+     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")\n            self._heartbeat_count = count\n            return'),
     ("a broker that refuses the heartbeat takes the whole tick down - the "
      "observability feature killing the photoperiod it observes", SRC,
-     "        try:\n            self._publish_heartbeat(count)\n        except Exception:",
-     "        try:\n            self._publish_heartbeat(count)\n        except KeyError:"),
+     "        try:\n            self._publish_heartbeat(count)\n        except Exception as exc:",
+     "        try:\n            self._publish_heartbeat(count)\n        except KeyError as exc:"),
     ("the heartbeat shares the never-synced hold's clock, which tests inject "
      "finite iterators into", SRC,
      "        stamp = self._heartbeat_clock()",
@@ -396,8 +407,21 @@ MUTANTS = [
     # available with an expired state.
     ("the heartbeat is RETAINED, so a replay makes the sensor available with "
      "an expired state and an availability flap resets the staleness", MQTT,
-     '    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count))',
-     '    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count), retain=True)'),
+     '    info = client.publish(LIGHT_HEARTBEAT_TOPIC, str(count))',
+     '    info = client.publish(LIGHT_HEARTBEAT_TOPIC, str(count), retain=True)'),
+    ("the publish return code is ignored, so a beat dropped by a disconnected "
+     "broker is charged as sent - paho RETURNS rc=4, it does not raise", MQTT,
+     "    if info.rc != mqtt.MQTT_ERR_SUCCESS:",
+     "    if False:"),
+    ("a failed heartbeat writes a traceback per beat instead of one deduped "
+     "line, burying an unrotated log on an SD card for the length of an outage",
+     SRC,
+     '            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")',
+     '            logger.exception("Schedule could not publish its heartbeat: %s", exc)'),
+    ("a recovered heartbeat never says so, so the journal's last word on it is "
+     "the failure", SRC,
+     '        self._report("heartbeat", None)\n        self._heartbeat_count = count',
+     '        self._heartbeat_count = count'),
     ("expire_after is dropped, so the sensor never goes unavailable and the "
      "staleness check has nothing to read", MQTT,
      '        "expire_after": 600,\n',
@@ -420,9 +444,14 @@ MUTANTS = [
      ""),
 
     # ----------------------------------------------------------- the wiring
+    # Anchored on the call PLUS the connect that follows it, because the bare
+    # call is no longer unique: publish_light_heartbeat's docstring now names
+    # `light_scheduler.start()` while explaining the startup race. That is this
+    # repo's recurring trap - a source anchor matching prose - and the harness
+    # caught it as NOT APPLIED rather than mis-applying it.
     ("mqtt.py never starts the scheduler", MQTT,
-     "    light_scheduler.start()",
-     "    pass"),
+     "    light_scheduler.start()\n\n    client.connect_async(",
+     "    pass\n\n    client.connect_async("),
     ("the scheduler starts AFTER loop_forever(), which never returns", MQTT,
      # MOVED PAST loop_forever(), not merely past connect_async(). An earlier
      # rewrite of this anchor put start() after connect_async and SURVIVED,

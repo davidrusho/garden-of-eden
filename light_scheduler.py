@@ -812,14 +812,25 @@ class LightScheduler:
         frozen and the lamp stayed dark — a permanent all-clear during a
         permanent outage, from the check built to catch silent failure.
 
-        `expire_after` is immune to that, because it counts RECEIVED MESSAGES
-        and nothing else. Home Assistant's MQTT sensor documentation is explicit
-        that the state payload should not be retained when using it — "it is not
-        recommended to retain the sensor's state payload at the MQTT broker" —
-        and that HA will "store and restore the sensor's state for you and
-        calculate the remaining time to retain the sensor's state before it
-        becomes unavailable". So HA does correctly, and for free, the thing the
-        retained design was approximating badly.
+        `expire_after`'s RUNTIME timer counts received messages and nothing
+        else, so the flap defect cannot reach it while HA stays up. Home
+        Assistant's MQTT sensor documentation is explicit that the state payload
+        should not be retained when using it — "it is not recommended to retain
+        the sensor's state payload at the MQTT broker" — and that HA will
+        "store and restore the sensor's state for you and calculate the
+        remaining time to retain the sensor's state before it becomes
+        unavailable".
+
+        ONE RESIDUE, NAMED BECAUSE AN EARLIER VERSION OF THIS PARAGRAPH SAID
+        "and nothing else" FLATLY AND THAT WAS FALSE. The restore path in HA's
+        own mqtt/sensor.py computes
+        `expiration_at = last_state.last_changed + timedelta(seconds=expire_after)`
+        — so it inherits the very field this design moved away from. A flap that
+        bumps `last_changed` before an HA restart extends the expiry by that
+        much. Bounded at one threshold (a flap AFTER expiry finds the state
+        already `unavailable` and the restore is skipped), and it needs a flap,
+        a dead scheduler and an HA restart to coincide. Recorded rather than
+        engineered around; the runtime path is the one that matters.
 
         The counter survives the change and still earns its place: it keeps the
         payload free of any clock, and a reset says the process restarted.
@@ -834,6 +845,16 @@ class LightScheduler:
         # Once run_forever is running, IT is the only caller entitled to speak
         # for the scheduler's liveness. Before then there is no loop to speak
         # for, so a direct tick() — which is every test in this file — may beat.
+        #
+        # THIS IS AN IDENTITY CHECK, NOT A LIVENESS CHECK, and the difference is
+        # real on this platform: CPython reuses thread idents aggressively —
+        # measured, 60 sequential short-lived threads produced ONE distinct
+        # ident. The button path arms a threading.Timer per press, which is
+        # exactly such a thread. So once the scheduler thread dies its ident is
+        # immediately available for reuse, and a future caller of tick() that
+        # inherited it would pass this guard. Latent today: tick() has no caller
+        # but run_forever. The structural exclusion in tick() is the load-bearing
+        # half; this is the backstop, and it is a partial one.
         if (
             self._scheduler_ident is not None
             and threading.get_ident() != self._scheduler_ident
@@ -848,9 +869,16 @@ class LightScheduler:
         count = self._heartbeat_count + 1
         try:
             self._publish_heartbeat(count)
-        except Exception:
-            logger.exception("Schedule could not publish its heartbeat")
+        except Exception as exc:
+            # _report, NOT logger.exception, and that is the difference between
+            # one line and a traceback every two minutes for the length of a
+            # broker outage, on an unrotated log on an SD card. _report dedupes
+            # on the message text and announces the recovery, which is exactly
+            # the shape this needs — so the text must stay CONSTANT for the
+            # duration of the fault.
+            self._report("heartbeat", f"cannot publish the schedule heartbeat ({exc})")
             return
+        self._report("heartbeat", None)
         self._heartbeat_count = count
         self._last_heartbeat = stamp
 

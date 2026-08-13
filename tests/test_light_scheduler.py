@@ -1622,6 +1622,40 @@ class HeartbeatTests(SchedulerHarness):
         scheduler.tick()
         self.assertEqual([1], self.beats)
 
+    def test_a_persistently_failing_heartbeat_is_logged_ONCE(self):
+        """A broker outage lasts hours and the beat retries every interval, so
+        a traceback per beat would write hundreds of lines into an unrotated log
+        on an SD card - the cost this module's _report exists to avoid, and the
+        reason the failure path uses it rather than logger.exception. The
+        message text must therefore stay constant for the duration of the
+        fault."""
+        scheduler = self.build(heartbeat_seconds=0)
+        self.beat_fails_with = RuntimeError("broker refused the heartbeat (rc=4)")
+        with self.assertLogs("light_scheduler", level="ERROR") as captured:
+            for _ in range(5):
+                scheduler.tick()
+        heartbeat_lines = [
+            line for line in captured.output if "heartbeat" in line.lower()]
+        self.assertEqual(
+            1, len(heartbeat_lines),
+            f"five failed beats produced {len(heartbeat_lines)} log lines")
+
+    def test_a_recovered_heartbeat_says_so(self):
+        """The other half of _report's contract. Without the resolve line the
+        journal's last word on the heartbeat is the failure, which reads as an
+        outage that never ended."""
+        scheduler = self.build(heartbeat_seconds=0)
+        self.beat_fails_with = RuntimeError("broker refused the heartbeat (rc=4)")
+        with self.assertLogs("light_scheduler", level="ERROR"):
+            scheduler.tick()
+        self.beat_fails_with = None
+        with self.assertLogs("light_scheduler", level="WARNING") as captured:
+            scheduler.tick()
+        self.assertTrue(
+            any("Resolved" in line for line in captured.output),
+            "the heartbeat recovered without saying so")
+        self.assertEqual([1], self.beats)
+
     def test_no_sink_configured_is_not_an_error(self):
         """The scheduler is constructible without a broker — that is what makes
         every test in this file runnable off the Pi."""
@@ -2117,29 +2151,66 @@ class WiringTests(unittest.TestCase):
             "available with an expired state, which is what expire_after "
             "exists to prevent")
 
+    def test_the_heartbeat_publish_checks_its_RETURN_CODE(self):
+        """paho's publish() does not RAISE when disconnected - it RETURNS, with
+        rc=MQTT_ERR_NO_CONN, and for QoS 0 it does not queue the packet either.
+        Measured against the pinned paho-mqtt 2.0.0: rc=4, _out_packet=0. So
+        the scheduler's `except Exception` cannot see a broker outage, and
+        without this check a dropped beat is charged as sent - which since the
+        retain= was dropped means a beat that simply never happened.
+
+        Matching the ASSIGNMENT and the BRANCH, not the bare name `rc`, which
+        the surrounding comment block also contains."""
+        body = self.source.split("def publish_light_heartbeat(")[1].split(
+            "\ndef ")[0]
+        self.assertRegex(
+            body, r"info\s*=\s*client\.publish\(\s*LIGHT_HEARTBEAT_TOPIC")
+        self.assertRegex(
+            body,
+            r"if\s+info\.rc\s*!=\s*mqtt\.MQTT_ERR_SUCCESS\s*:\s*\n(\s*#[^\n]*\n)*\s*raise\b",
+            "a non-zero publish return code is not turned into a raise, so the "
+            "scheduler cannot tell a dropped beat from a sent one")
+
     def test_the_heartbeat_sensor_declares_expire_after(self):
         """expire_after IS the staleness detector - without it the entity never
         goes unavailable and the Home Assistant condition has nothing to read.
         Asserting the VALUE, not merely the key, because the number is coupled
         to the Pi's HEARTBEAT_SECONDS and lives in a different repo from the
         automation that depends on it."""
-        body = self.source.split("def send_discovery_messages(")[1].split(
-            "\ndef ")[0]
-        payload = body.split("publish_config(HEARTBEAT_CONFIG_TOPIC,")[1]
-        self.assertRegex(payload, r'"expire_after"\s*:\s*600\b')
+        self.assertRegex(
+            self._heartbeat_config_payload(), r'"expire_after"\s*:\s*600\b')
 
-    def test_expire_after_is_a_multiple_of_the_pi_s_heartbeat_cadence(self):
-        """The two numbers are the ends of one contract and they are set in
-        different files. A cadence longer than the expiry would make the sensor
-        flap unavailable on a HEALTHY scheduler - a permanent false alarm - so
-        the relationship, not just each value, is what needs pinning."""
-        body = self.source.split("def send_discovery_messages(")[1].split(
-            "\ndef ")[0]
-        payload = body.split("publish_config(HEARTBEAT_CONFIG_TOPIC,")[1]
+    def test_expire_after_leaves_margin_over_the_pi_s_heartbeat_cadence(self):
+        """The two numbers are the ends of one contract, set in different files.
+        A cadence longer than the expiry would flap the sensor unavailable on a
+        HEALTHY scheduler - a permanent false alarm - so the relationship, not
+        just each value, is what needs pinning.
+
+        RENAMED from '..._is_a_multiple_of_...', which is not what it asserts.
+        It checks a MARGIN of 3x, and 3x rather than the nominal 5x because the
+        real cadence is 120-240 s: the beat clock is stamped after the tick
+        returns, so a slow beating tick followed by a fast one slips a whole
+        tick cycle."""
+        payload = self._heartbeat_config_payload()
         expire = int(re.search(r'"expire_after"\s*:\s*(\d+)', payload).group(1))
         self.assertGreaterEqual(
             expire, 3 * lsr.HEARTBEAT_SECONDS,
-            "expire_after leaves too little margin over the publish cadence")
+            "expire_after leaves too little margin over the worst-case cadence")
+
+    def _heartbeat_config_payload(self):
+        """The heartbeat discovery dict's source text, and NOTHING after it.
+
+        Slicing to the end of send_discovery_messages was wide enough to read a
+        LATER entity's expire_after if one ever gained it - a check silently
+        measuring the wrong subject. Bounded at the closing `})` instead."""
+        body = self.source.split("def send_discovery_messages(")[1].split(
+            "\ndef ")[0]
+        after = body.split("publish_config(HEARTBEAT_CONFIG_TOPIC,")
+        self.assertEqual(
+            2, len(after), "the heartbeat discovery call is not unique")
+        payload, sep, _rest = after[1].partition("})")
+        self.assertTrue(sep, "could not find the end of the heartbeat payload")
+        return payload
 
     def test_the_heartbeat_topic_is_NOT_the_source_topic(self):
         """The separation is the design. Republishing the source topic on a
