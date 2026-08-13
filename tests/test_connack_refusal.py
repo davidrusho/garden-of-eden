@@ -2310,6 +2310,43 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
         fault and would silently give it the wrong cause - the wrong-cause
         notification being a defect this ticket has now hit seven times.
         """
+        class _NastyTopic:
+            """`topic` raises into an arm, and `_topic` raises when that arm
+            tries to record the bytes."""
+            payload = b"ON"
+            qos, retain = 1, False
+
+            def __init__(self, first):
+                self._first = first
+
+            @property
+            def topic(self):
+                raise self._first("into the arm")
+
+            @property
+            def _topic(self):
+                raise RuntimeError("and the handler reads me")
+
+        for label, first in (("catch-all", RuntimeError),
+                             ("named arm", AttributeError)):
+            with self.subTest(arm=label):
+                msg = _NastyTopic(first)
+                # Fixture control: reading `_topic` really does raise, and
+                # `getattr(..., None)` really does not suppress it.
+                with self.assertRaises(RuntimeError):
+                    getattr(msg, "_topic", None)
+                try:
+                    with self.assertLogs(mqtt_mod.logger, level="ERROR"):
+                        mqtt_mod.on_message(self.client, None, msg)
+                except BaseException as exc:
+                    self.fail(
+                        f"the {label} raised while RECORDING the incident "
+                        f"({type(exc).__name__}: {exc}) - the T-527.12 "
+                        f"process-killer relocated into the handler for it. "
+                        f"eaf159f introduced this into the arm of last resort "
+                        f"and 4601f55 had it in the named arm since it was "
+                        f"written")
+
         binary = self._PahoShapedMessage(LIGHT_COMMAND.encode(), b"\xff\xfe")
         with self.assertLogs(mqtt_mod.logger, level="ERROR") as captured:
             mqtt_mod.on_message(self.client, None, binary)
@@ -2384,8 +2421,30 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
         # And the honest negative: a non-bytes `_topic` raises INSIDE paho and
         # never reaches on_message at all. Asserted so the docstring in
         # mqtt.py stays checkable rather than being a claim about a library.
+        #
+        # COUNT THE ENTRIES, do not just assert the exception. A bare
+        # `assertRaises(AttributeError)` passes identically for an
+        # AttributeError raised INSIDE on_message, which is the opposite
+        # conclusion and the one the mqtt.py comment would be wrong about -
+        # so it proved nothing about WHERE the fault landed. Named by the
+        # review of eaf159f as an assertion weaker than its own docstring.
+        entries = []
+        client.on_message = lambda _c, _u, msg: (
+            entries.append(1), mqtt_mod.on_message(self.client, _u, msg))[-1]
         with self.assertRaises(AttributeError):
             drive(lambda m: setattr(m, "_topic", "already a str"))
+        self.assertEqual(
+            [], entries,
+            "on_message WAS entered, so the AttributeError came from mqtt.py "
+            "rather than from paho's own read of message.topic - which is the "
+            "opposite of what the guard's comment claims")
+
+        # Positive control for that counter: a healthy message must increment
+        # it, or the assertion above is satisfied by a counter that never works.
+        drive(lambda m: None)
+        self.assertEqual([1], entries,
+                         "CONTROL FAILED: the entry counter does not count, so "
+                         "the assertion above proves nothing")
 
     def test_the_private_attribute_the_guard_reads_is_pinned_against_paho(self):
         """`getattr(msg, "_topic", None)` degrades SILENTLY, and this suite is
@@ -2622,6 +2681,70 @@ class TheImportHelperTellsAbsentApartFromBroken(unittest.TestCase):
                     with self.assertRaises(PahoIsInstalledButUnusable):
                         _import_real_paho_client()
 
+    def test_a_pyc_only_paho_is_INSTALLED_not_absent(self):
+        """A working installation that the helper called absent.
+
+        Found by the review of eaf159f. The origin check read
+        `.endswith(".py")`, so a paho shipped compiled-only - which is a normal
+        way to ship a library - made both paho-dependent tests skip while the
+        suite went green with nothing asserting they had run. The
+        reports-an-absence failure, inside the instrument built to prevent it.
+        """
+        import compileall
+        import os
+        import py_compile
+
+        with self._paho_on_disk("MARKER = 'compiled only'\n") as tmp:
+            source = os.path.join(tmp, "paho", "mqtt", "client.py")
+            compiled = py_compile.compile(source, cfile=source + "c",
+                                          doraise=True)
+            os.remove(source)
+            self.assertTrue(os.path.exists(compiled),
+                            "CONTROL: the fixture did not produce a .pyc, so "
+                            "this measures nothing")
+            module = _import_real_paho_client()
+            self.assertIsNotNone(
+                module, "a compiled-only paho was reported as ABSENT, so the "
+                        "two tests that depend on this helper skip and the "
+                        "suite goes green having asserted nothing")
+            self.assertEqual(module.MARKER, "compiled only")
+        del compileall
+
+    def test_a_stub_in_sys_modules_is_refused_at_the_FIRST_gate(self):
+        """WHERE the stub is actually refused, which is not where the code said.
+
+        This suite plants a module object at `paho.mqtt.client` for the length
+        of mqtt.py's import, and every version of this helper has carried a
+        sentence about refusing it. Every one of those sentences named the
+        WRONG BRANCH - the origin check, at the bottom. Traced during the
+        review of eaf159f: a stub whose `__spec__` is None makes
+        `find_spec("paho")` raise `ValueError` at gate one, which is where the
+        refusal happens. Asserted here so the next reader does not have to
+        re-derive it, and so removing gate one's `except` cannot silently make
+        a stub answerable.
+        """
+        import sys
+        import types
+
+        saved = {k: v for k, v in sys.modules.items()
+                 if k == "paho" or k.startswith("paho.")}
+        try:
+            for name in ("paho", "paho.mqtt", "paho.mqtt.client"):
+                stub = types.ModuleType(name)
+                stub.__spec__ = None
+                sys.modules[name] = stub
+            # Control: the stub really is installed and really has no spec.
+            self.assertIsNone(sys.modules["paho"].__spec__)
+            self.assertIsNone(
+                _import_real_paho_client(),
+                "the helper answered from a stub, which makes every assertion "
+                "that calls it true for free")
+        finally:
+            for name in [k for k in list(sys.modules)
+                         if k == "paho" or k.startswith("paho.")]:
+                del sys.modules[name]
+            sys.modules.update(saved)
+
     def test_the_absence_question_is_answered_without_EXECUTING_anything(self):
         """CONTROL for the design, not for a case.
 
@@ -2733,15 +2856,39 @@ def _import_real_paho_client():
             f"this suite cannot pin anything against it. This is NOT the same "
             f"as paho being absent, and must not be skipped as though it "
             f"were: {exc!r}") from exc
-    if spec is None or spec.origin is None or not spec.origin.endswith(".py"):
-        # NOT a raise, and the asymmetry is deliberate. This is the branch a
-        # STUB reaches - this suite plants a MagicMock at `paho.mqtt.client`
-        # for the length of mqtt.py's import, and a mock satisfies `hasattr`
-        # for every name, so answering from it would make the assertions that
-        # call this helper true for free. "There is no real .py module here"
-        # is honestly an absence of the thing being pinned against, and a FAIL
-        # would be a false finding about the environment.
+    if spec is None:
+        # paho is installed and does not carry paho.mqtt.client. Honestly an
+        # absence of the thing being pinned against, and a FAIL here would be a
+        # false finding about the environment.
         return None
+    if spec.origin is None:
+        # A namespace package standing where a module should be - paho is
+        # there, and what it offers cannot be executed or read.
+        raise PahoIsInstalledButUnusable(
+            f"paho.mqtt.client resolved to a spec with no origin "
+            f"({spec!r}), so there is no module here to pin against. This is "
+            f"NOT the same as paho being absent.")
+    # ~~"or not spec.origin.endswith('.py')"~~ REMOVED 2026-08-12, with its
+    # justification, which was wrong in three separate ways and is kept here
+    # because each one is a plausible belief.
+    #
+    #   1. It called a working installation ABSENT. A paho shipped as .pyc
+    #      only - no source - has a `.pyc` origin, so the whole suite skipped
+    #      its two paho-dependent tests and went green with nothing asserting
+    #      they had run. That is the reports-an-absence failure, in the
+    #      instrument built to prevent it. Measured by the review of eaf159f.
+    #   2. ~~"This is the branch a STUB reaches"~~ - it is not. The stub is
+    #      withdrawn at import time by `_withdraw_stubs()`, and even with it
+    #      live, `find_spec("paho")` raises `ValueError: paho.__spec__ is None`
+    #      at the FIRST gate above and returns None there. Traced through both
+    #      gates; this branch is unreachable for a stub.
+    #   3. ~~"a MagicMock"~~ - the suite plants a `types.ModuleType`
+    #      (tests/test_water_interlock.py), not a MagicMock, so the `hasattr`
+    #      argument was about the wrong object as well as the wrong branch.
+    #
+    # Three wrong sentences about one four-line helper across three review
+    # rounds. What actually keeps a stub from answering here is gate one, and
+    # `test_a_stub_in_sys_modules_is_refused_at_the_FIRST_gate` now says so.
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)

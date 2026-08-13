@@ -500,6 +500,37 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                                 f"{harness} did not restore a deleted file's "
                                 f"content and mode")
 
+    def test_the_probe_refuses_a_harness_whose_runner_it_cannot_find(self):
+        """The guard added to _RESTORE_PROBE in eaf159f, which had no test.
+
+        `setattr(mod, runner, fake)` happily CREATES an attribute, so a harness
+        spelling its entry point differently would have had an unused one
+        planted while its REAL battery ran against the live tree. The guard
+        refuses instead - but `_drive` only ever runs over IN_PLACE, and all
+        seven of those define `run_suites` or `run_suite`, so nothing exercised
+        it. mutate_deploy_verify.py is the only harness spelling it `run_one`,
+        and it is SANDBOXED. Named by the review of eaf159f; this is the case
+        that reaches it.
+
+        Cheap because the guard fires before anything is imported for real -
+        no battery runs, no tree is touched.
+        """
+        verdict = self._drive("mutate_deploy_verify.py", ["mqtt.py"])
+        self.assertIn(
+            "error", verdict,
+            "the probe accepted a harness with no run_suite()/run_suites(), "
+            "which means it planted an unused attribute and let that harness "
+            "run its real battery")
+        self.assertIn("run_suite", verdict["error"])
+        # Control: a harness that DOES have the runner must not hit this
+        # branch, or the guard is refusing everything and proves nothing.
+        other = self._drive("mutate_ha_birth_message.py", ["mqtt.py"])
+        self.assertNotIn(
+            "error", other,
+            f"CONTROL FAILED: an IN_PLACE harness with a real runner was also "
+            f"refused, so the assertion above is not about the runner name: "
+            f"{other}")
+
     @staticmethod
     def _sandbox_copy_calls(harness):
         """Every real `copytree(REPO, ...)` CALL in a harness, as AST nodes.

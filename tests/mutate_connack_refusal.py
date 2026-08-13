@@ -353,8 +353,20 @@ MUTANTS = [
      "    except UnicodeDecodeError:"),
 
     ("the guard's own handler reads msg.topic again - the original re-raise",
-     '                     "decoded: %r", getattr(msg, "_topic", None))',
+     '                     "decoded: %r", _incident_topic_bytes(msg))',
      '                     "decoded: %r", msg.topic)'),
+
+    # --- the helper that makes both topic arms unable to raise -------------
+    # eaf159f gave the CATCH-ALL a raw `getattr(msg, "_topic", None)` and the
+    # review of it measured the consequence: `getattr` suppresses only
+    # AttributeError, so a `_topic` property raising anything else escaped
+    # from inside the arm of last resort. The named arm had carried the same
+    # defect since 4601f55. Both mutants restore one of those two states.
+    ("the helper stops swallowing - the arm of last resort can raise again",
+     '    try:\n        return getattr(msg, "_topic", None)\n'
+     '    except Exception:',
+     '    if True:\n        return getattr(msg, "_topic", None)\n'
+     '    if False:'),
 
     ("escape it with !s instead - reads right, escapes nothing",
      '                logger.error(f"Invalid water low cm value: {payload!r}")',
@@ -429,10 +441,10 @@ MUTANTS = [
     # paho-delivered message) and the needle went with it. A mutant anchored
     # on prose is a mutant one comment edit from silently not existing.
     ("delete the topic catch-all - defence for a direct caller, one guard up",
-     '                     "decoded: %r", getattr(msg, "_topic", None))\n'
+     '                     "decoded: %r", _incident_topic_bytes(msg))\n'
      '        return\n'
      '    except Exception as exc:',
-     '                     "decoded: %r", getattr(msg, "_topic", None))\n'
+     '                     "decoded: %r", _incident_topic_bytes(msg))\n'
      '        return\n'
      '    except RuntimeError as exc:'),
 

@@ -1778,10 +1778,42 @@ class WiringTests(unittest.TestCase):
         self.assertNotIn("LightScheduler(", body)
 
     def test_the_scheduler_starts_BEFORE_the_blocking_loop(self):
-        """loop_forever() never returns, so anything after it never runs."""
-        start = self.source.index("light_scheduler.start()")
-        loop = self.source.index("client.loop_forever(")
-        self.assertLess(start, loop)
+        """loop_forever() never returns, so anything after it never runs.
+
+        LINE-ANCHORED ON BOTH SIDES, because `.index()` finds the FIRST
+        occurrence anywhere in the file and prose counts. This test went red on
+        2026-08-12 with the wiring untouched: a comment in on_message's topic
+        guard gained the words `client.loop_forever(...)` while explaining
+        where that exception route could be closed, and that comment sits ~40K
+        characters ahead of the real call. The failure message named the right
+        property and pointed at the wrong file.
+
+        This repo has the lesson already - a source assertion must match a form
+        only the CODE can produce, never a bare name the prose about it also
+        contains - and it was recorded against a `connect_async` assertion in
+        T-527.1. So fix the assertion rather than the sentence: a comment is
+        free to name a call, and a check that cannot survive being written
+        about is not a check.
+        """
+        import re
+
+        def offset(pattern, what):
+            found = [m.start() for m in
+                     re.finditer(pattern, self.source, re.M)]
+            self.assertEqual(
+                1, len(found),
+                f"expected exactly one CODE occurrence of {what}, found "
+                f"{len(found)} - if this is 0 the call was renamed or moved, "
+                f"and if it is >1 the anchor no longer identifies it")
+            return found[0]
+
+        start = offset(r"^\s+light_scheduler\.start\(\)\s*$",
+                       "light_scheduler.start()")
+        loop = offset(r"^\s+client\.loop_forever\(", "client.loop_forever(")
+        self.assertLess(
+            start, loop,
+            "light_scheduler.start() is after the blocking loop, so the "
+            "photoperiod never starts")
 
     def test_the_unit_gives_the_scheduler_somewhere_to_persist_state(self):
         """Line-anchored, because the unit's own comment block names

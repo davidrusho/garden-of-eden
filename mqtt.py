@@ -1146,6 +1146,38 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # line just as surely. TestConnectSequencing asserts this call is reached.
     start_publisher_threads(client)
 
+def _incident_topic_bytes(msg):
+    """The raw topic bytes for an incident record, or a marker. NEVER raises.
+
+    Both topic drop arms below want `msg._topic` - the bytes are the only
+    useful thing to put in `gardyn.log` when the decoded topic is exactly what
+    could not be produced. Reading it is also the T-527.12 process-killer in
+    miniature: `_topic` can be a property, the arms that read it are handlers
+    for a fault that property just caused, and `getattr(..., None)` suppresses
+    only AttributeError.
+
+    eaf159f introduced that fault into the CATCH-ALL, which is the arm of last
+    resort and the one place a raise cannot be tolerated. Measured before this
+    helper existed: a message whose `topic` raises RuntimeError (into the
+    catch-all) and whose `_topic` also raises left on_message entirely, so the
+    arm labelled "closing the class" leaked a class it had caught one commit
+    earlier. Found by the review of eaf159f. The NAMED arm had the same defect
+    and had had it since 4601f55 - measured the same way, AttributeError first
+    and RuntimeError on the re-read.
+
+    Nil reachability under paho 2.0.0, whose `_topic` is a `__slots__` data
+    attribute rather than a property - and "nil because of the library" is the
+    reasoning this ticket exists to stop accepting as safety, which is why this
+    is four lines rather than a comment.
+    """
+    try:
+        return getattr(msg, "_topic", None)
+    except Exception:
+        # Deliberately swallowing. Nothing here is worth a second incident, and
+        # this function's whole contract is that it cannot add one.
+        return "<_topic unreadable>"
+
+
 def on_message(client, userdata, msg):
     global brightness, speed, WATER_LOW_CM, _last_birth_announce
 
@@ -1172,9 +1204,14 @@ def on_message(client, userdata, msg):
     try:
         topic = msg.topic
     except (UnicodeDecodeError, AttributeError):
-        # UnicodeDecodeError is the ONLY class of the three named here that
-        # this guard can actually receive, and everything below is the record
-        # of getting that wrong twice.
+        # FROM A PAHO-DELIVERED MESSAGE, UnicodeDecodeError is the only class
+        # of the three named here that this guard can receive - and everything
+        # below is the record of getting that wrong twice. The qualifier is
+        # load-bearing and was missing until the review of eaf159f: this
+        # function is also called DIRECTLY, by this repo's own tests and by
+        # anything future that drives it, and those callers do reach the other
+        # two arms. Unqualified, the sentence contradicted the one thirty lines
+        # down that keeps those arms for exactly that reason.
         #
         # ~~"Deliberately NOT `except Exception`: this runs before any
         # dispatch, so a blanket catch here would swallow faults that belong to
@@ -1200,7 +1237,20 @@ def on_message(client, userdata, msg):
         # and travels out through _handle_publish, _packet_handle,
         # _packet_read, loop_read and loop_forever - `_loop`'s own
         # `except Exception` wraps only the `select.select` call. on_message
-        # is never entered, and no guard written here can close that route.
+        # is never entered, and no guard written HERE can close that route.
+        #
+        # "here" is load-bearing and the eaf159f commit message dropped it,
+        # claiming no guard in this repo could - which is falsifiable, and the
+        # review of that commit falsified it. The exception leaves
+        # `loop_forever()` uncaught, so a `try/except` around the
+        # `client.loop_forever(...)` call in __main__ WOULD catch it. Not done,
+        # deliberately: catching there leaves the network loop dead and would
+        # need a supervision loop to be worth anything, and systemd already
+        # owns process-level restart (`Restart=always`, `RestartSec=10`). What
+        # made T-527.12 a PERMANENT loop was redelivery of the same bad message
+        # under QoS 1, not the exit itself. No paho hook closes it either:
+        # `suppress_exceptions` and `message_callback_add` both act AFTER the
+        # guarded read.
         # Measured end-to-end against paho 2.0.0 by driving
         # `client._handle_on_message(m)` with a real MQTTMessage: an
         # undecodable topic returns normally (the T-527.12 fix, which IS live,
@@ -1217,7 +1267,7 @@ def on_message(client, userdata, msg):
         # SETTER accepts a str and stores it unchanged, so the bytes invariant
         # comes from the producer, not from the type.
         logger.error("Dropped an inbound message whose TOPIC could not be "
-                     "decoded: %r", getattr(msg, "_topic", None))
+                     "decoded: %r", _incident_topic_bytes(msg))
         return
     except Exception as exc:
         # See the paragraphs above for why this arm cannot fire on a
@@ -1227,7 +1277,7 @@ def on_message(client, userdata, msg):
         # on a host where gardyn.log is the whole incident record.
         logger.error("Dropped an inbound message whose TOPIC raised an "
                      "UNEXPECTED error: %r (topic bytes: %r)",
-                     exc, getattr(msg, "_topic", None))
+                     exc, _incident_topic_bytes(msg))
         return
 
     try:
@@ -1406,7 +1456,12 @@ def on_message(client, userdata, msg):
         # depends on that.
         #
         # IT ALSO CHANGES DELIVERY SEMANTICS, which the paragraphs above framed
-        # as purely about process exit. Commands are subscribed at QoS 1, and
+        # as purely about process exit. FIVE of the seven COMMAND_SUBSCRIPTIONS
+        # are QoS 1 - `water/level/get` and `pcb/temperature/get` are QoS 0,
+        # where `_handle_publish` sends no PUBACK at all and none of this
+        # applies. (This said "commands are subscribed at QoS 1" flatly until
+        # the review of eaf159f; it overstated the cost, so the conclusion
+        # survives, but a count that is wrong is wrong.) For the five,
         # `_handle_publish` sends the PUBACK only AFTER `_handle_on_message`
         # returns (paho client.py: `self._handle_on_message(message)` then
         # `return self._send_puback(message.mid)`). So an escaping exception
