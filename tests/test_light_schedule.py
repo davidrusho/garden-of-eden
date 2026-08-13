@@ -752,6 +752,72 @@ def _tz_available(name=_DENVER):
     return True
 
 
+class LoadBearingProseAroundTheDstTableIsPinned(unittest.TestCase):
+    """Deliberately NOT under the tzdb skipUnless below.
+
+    It lived inside DstTableIsDerivedFromTheTzdb until the review of
+    2a8c951 pointed out that the class carries
+    `@unittest.skipUnless(_tz_available(), ...)` and this test needs no tzdb
+    at all - it reads a docstring. Measured under
+    `PYTHONTZPATH=/nonexistent`: `OK (skipped=8)`, the tripwire among them.
+    A tripwire coupled to a dependency it does not use is a tripwire that
+    goes quiet on exactly the machines least like the one it was written on.
+    """
+
+    def test_the_load_bearing_SENTENCES_around_the_table_are_pinned(self):
+        """A TRIPWIRE, not a proof — and it is worth being explicit about
+        which.
+
+        The test above reads every column of the table. It reads none of the
+        prose, and the prose is where the conclusion lives: the table only
+        says WHEN the transitions are, while the sentences under it say why
+        naive local time is safe anyway. The 094eac0 review measured three
+        edits that leave the whole suite green and invert the argument —
+        `hour != 2` to `hour != 1`, "are NOT the same hour" to "are the same
+        hour", and "Both are self-correcting within one tick." to "Neither is
+        self-correcting; the lamp stays wrong until the next day."
+
+        Asserting free prose properly is a different and much harder problem,
+        so this does the crude thing instead and says so: three claims are
+        pinned as exact strings, whitespace-normalised so reflowing the
+        docstring is not a failure. Rewording one of them reddens this test,
+        which is the intent — these are the sentences a reader relies on when
+        deciding whether a boundary near a transition is safe, and they should
+        not be edited without somebody noticing.
+
+        What this canNOT do: it cannot tell a correct rewrite from a wrong one.
+        A red result here means "a load-bearing sentence changed, go read it",
+        never "the new sentence is false".
+        """
+        doc = ls.next_boundary_after.__doc__
+        self.assertIsNotNone(doc)
+        flat = " ".join(doc.split())
+
+        claims = (
+            # The two transitions are different hours. Inverting this is what
+            # the whole table exists to prevent, and the table itself stays
+            # consistent under the inversion because it is a separate reader.
+            "the two transitions are NOT the same hour",
+            # Which guard is only half a guard. `hour != 2` to `hour != 1`
+            # reads as a correction and is the opposite of one.
+            'a rule of the form "keep boundaries out of the transition hour" '
+            "would have to name both, and `hour != 2` guards only half of it",
+            # The conclusion. Without this sentence the paragraph above it
+            # reads as a list of hazards rather than as an argument that they
+            # cost nothing.
+            "Both are self-correcting within one tick.",
+        )
+        for claim in claims:
+            with self.subTest(claim=claim[:48]):
+                self.assertIn(
+                    claim, flat,
+                    f"a load-bearing sentence in next_boundary_after's "
+                    f"docstring has been edited or removed. This test cannot "
+                    f"judge the new wording — go and read it, and if the "
+                    f"change is deliberate, update the string here.")
+
+
+
 @unittest.skipUnless(_tz_available(), f"tzdb entry for {_DENVER} unavailable")
 class DstTableIsDerivedFromTheTzdb(unittest.TestCase):
     """Pins next_boundary_after's docstring table against the real tzdb."""
@@ -885,12 +951,21 @@ class DstTableIsDerivedFromTheTzdb(unittest.TestCase):
         # noted by the 094eac0 review as an over-claim in the comment below.
         # A wrong spring row spelled with one-digit hours (`1:00 MST -> 3:00
         # MDT`), or with lowercase abbreviations, matches nothing above and
-        # vanishes. So identify a row by the only two things a row must have —
-        # a transition label and an ISO date — and require the strict pattern
-        # to have read every one of them.
-        loose = re.findall(
-            r"^\s*(spring forward|fall back)\b.*?\d{4}-\d{2}-\d{2}.*$",
-            doc, re.M)
+        # vanishes. So identify a row by the one thing a row must have — a
+        # transition label opening the line — and require the strict pattern to
+        # have read every one of them.
+        #
+        # THE LABEL ALONE, deliberately. This also required an ISO date until
+        # the review of 2a8c951 pointed out that both patterns then share the
+        # same gap: an extra row carrying a malformed date (`2026-3-08`) is
+        # invisible to the loose count and the strict one alike, the two counts
+        # agree, and the suite stays green. Measured, and the gate's own
+        # comment claimed to cover "a row this test cannot parse" generally.
+        # The cost of dropping the date is that prose beginning a line with
+        # "spring forward" or "fall back" now reddens this test — loud, and the
+        # message says what to do about it, which is the right direction for a
+        # gate whose entire history is failing silently.
+        loose = re.findall(r"^\s*(spring forward|fall back)\b.*$", doc, re.M)
         self.assertEqual(
             len(matches), len(loose),
             f"the docstring table has {len(loose)} row(s) and the strict "
@@ -977,69 +1052,43 @@ class DstTableIsDerivedFromTheTzdb(unittest.TestCase):
             f"describes a skip",
         )
 
-        # A `for label, before, after in (...): assertNotEqual(before, after)`
-        # loop stood here until 2026-08-12 and was DEAD — no input could reach
-        # it. Each of the four assertEqual(abbr(...), ...) checks above pins an
-        # abbreviation against zoneinfo's own answer for that side of the
-        # transition, and those two answers differ by construction, so a table
-        # whose two abbreviations matched had already failed one of them.
-        # Deleting the loop flipped no arm of the nine-perturbation control.
-        # Removed rather than repaired: an assertion nothing can fail is a
-        # coverage claim in the shape of code. The `steps by 2` check above IS
-        # load-bearing and is the sole catcher of one arm — do not read this
-        # note as licence to prune that one too.
-
-    def test_the_load_bearing_SENTENCES_around_the_table_are_pinned(self):
-        """A TRIPWIRE, not a proof — and it is worth being explicit about
-        which.
-
-        The test above reads every column of the table. It reads none of the
-        prose, and the prose is where the conclusion lives: the table only
-        says WHEN the transitions are, while the sentences under it say why
-        naive local time is safe anyway. The 094eac0 review measured three
-        edits that leave the whole suite green and invert the argument —
-        `hour != 2` to `hour != 1`, "are NOT the same hour" to "are the same
-        hour", and "Both are self-correcting within one tick." to "Neither is
-        self-correcting; the lamp stays wrong until the next day."
-
-        Asserting free prose properly is a different and much harder problem,
-        so this does the crude thing instead and says so: three claims are
-        pinned as exact strings, whitespace-normalised so reflowing the
-        docstring is not a failure. Rewording one of them reddens this test,
-        which is the intent — these are the sentences a reader relies on when
-        deciding whether a boundary near a transition is safe, and they should
-        not be edited without somebody noticing.
-
-        What this canNOT do: it cannot tell a correct rewrite from a wrong one.
-        A red result here means "a load-bearing sentence changed, go read it",
-        never "the new sentence is false".
-        """
-        doc = ls.next_boundary_after.__doc__
-        self.assertIsNotNone(doc)
-        flat = " ".join(doc.split())
-
-        claims = (
-            # The two transitions are different hours. Inverting this is what
-            # the whole table exists to prevent, and the table itself stays
-            # consistent under the inversion because it is a separate reader.
-            "the two transitions are NOT the same hour",
-            # Which guard is only half a guard. `hour != 2` to `hour != 1`
-            # reads as a correction and is the opposite of one.
-            'a rule of the form "keep boundaries out of the transition hour" '
-            "would have to name both, and `hour != 2` guards only half of it",
-            # The conclusion. Without this sentence the paragraph above it
-            # reads as a list of hazards rather than as an argument that they
-            # cost nothing.
-            "Both are self-correcting within one tick.",
-        )
-        for claim in claims:
-            with self.subTest(claim=claim[:48]):
-                self.assertIn(
-                    claim, flat,
-                    f"a load-bearing sentence in next_boundary_after's "
-                    f"docstring has been edited or removed. This test cannot "
-                    f"judge the new wording — go and read it, and if the "
-                    f"change is deliberate, update the string here.")
+        # RESTORED 2026-08-12, hours after being deleted as dead. It is not
+        # dead, and the reasoning that deleted it is worth keeping because it
+        # is the plausible mistake:
+        #
+        #   "Each of the four assertEqual(abbr(...), ...) checks above pins an
+        #   abbreviation against zoneinfo's answer for that side of the
+        #   transition, and those two answers differ by construction, so a
+        #   table whose two abbreviations matched had already failed one."
+        #
+        # The flaw is that `abbr()` is called with hours taken FROM THE TABLE.
+        # Move both sides of a row onto the same side of the transition and
+        # zoneinfo agrees with both, honestly. Measured by the review of
+        # 2a8c951, and reproduced here before restoring:
+        #
+        #   spring forward … 03:00 MDT -> 05:00 MDT  02:00-02:59 SKIPPED
+        #   fall back       … 05:00 MST -> 05:00 MST  01:00-01:59 REPEATED
+        #
+        # Both tables are wrong - the first says the wall clock steps 03:00 to
+        # 05:00 on spring-forward morning, the second names 05:00 as the
+        # repeated hour - and both pass every other assertion in this test.
+        # With the loop restored each fails on `'MDT' == 'MDT'` / `'MST' ==
+        # 'MST'`.
+        #
+        # "Deleting it flipped no arm of the nine-perturbation control" was
+        # true and was a CORPUS gap, not evidence: neither shape was among the
+        # nine. The `steps by 2` check above is load-bearing too, and remains
+        # the sole catcher of `01:00 MST -> 04:00 MDT`, which this loop does
+        # NOT catch - the two overlap in neither direction.
+        for label, before, after in (("spring forward", s_abbr_from, s_abbr_to),
+                                     ("fall back", f_abbr_from, f_abbr_to)):
+            self.assertNotEqual(
+                before, after,
+                f"the {label} row shows the same abbreviation on both sides, "
+                f"so it describes two readings from the same side of the "
+                f"transition rather than a transition at all - and every "
+                f"other assertion here agrees with it, because they read the "
+                f"hours the table itself supplied")
 
     def test_each_transition_day_has_exactly_one_anomalous_hour(self):
         # Guards the derivation itself rather than the table: if a future tzdb

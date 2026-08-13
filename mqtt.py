@@ -1172,31 +1172,62 @@ def on_message(client, userdata, msg):
     try:
         topic = msg.topic
     except (UnicodeDecodeError, AttributeError):
-        # AttributeError too, from review. The property is
-        # `self._topic.decode(...)`, so a `_topic` holding anything but bytes
-        # raises there instead - the same process-exit shape, one exception
-        # class over, and a guard presented as closing a class should close it.
+        # UnicodeDecodeError is the ONLY class of the three named here that
+        # this guard can actually receive, and everything below is the record
+        # of getting that wrong twice.
         #
         # ~~"Deliberately NOT `except Exception`: this runs before any
         # dispatch, so a blanket catch here would swallow faults that belong to
         # the handler chain below and has no business being that wide."~~ False,
-        # and copied verbatim into the payload guard below where it was found
-        # by the review of bfef37f. This `try` covers ONE statement - the
-        # attribute read - so there is no handler-chain fault it could reach.
-        # The real reason to keep this arm narrow is diagnosis, not scope, and
-        # the catch-all below now closes the class the sentence above claimed
-        # was already closed.
+        # and copied verbatim into the payload guard below where the review of
+        # bfef37f found it. This `try` covers ONE statement.
+        #
+        # ~~"AttributeError too: a `_topic` holding anything but bytes raises
+        # in the property instead - the same process-exit shape, one exception
+        # class over."~~ (4601f55) and ~~"anything else out of `msg.topic`
+        # exited the process, and the catch-all below stops it."~~ (T-527.30).
+        # BOTH FALSE, for one reason neither noticed: PAHO READS `message.topic`
+        # ITSELF, BEFORE CALLING THIS FUNCTION, and guards it against
+        # UnicodeDecodeError ALONE:
+        #
+        #     # paho/mqtt/client.py, _handle_on_message
+        #     try:
+        #         topic = message.topic
+        #     except UnicodeDecodeError:
+        #         topic = None
+        #
+        # So a `_topic` that is not bytes raises INSIDE paho, at that line,
+        # and travels out through _handle_publish, _packet_handle,
+        # _packet_read, loop_read and loop_forever - `_loop`'s own
+        # `except Exception` wraps only the `select.select` call. on_message
+        # is never entered, and no guard written here can close that route.
+        # Measured end-to-end against paho 2.0.0 by driving
+        # `client._handle_on_message(m)` with a real MQTTMessage: an
+        # undecodable topic returns normally (the T-527.12 fix, which IS live,
+        # because paho hands us the message with topic=None and we re-read it),
+        # while a str `_topic` escapes as AttributeError before we run.
+        #
+        # WHAT THAT LEAVES. `_topic` is bytes on every message paho builds -
+        # `_handle_publish` fills it from `struct.unpack` on the wire - so the
+        # non-bytes shape has no production route into either party. The two
+        # extra arms are therefore DEAD against paho dispatch and DEFENCE for
+        # direct callers (this repo's tests, and anything future that drives
+        # on_message itself). Kept on those grounds and no longer on the
+        # process-exit grounds they were written on. Note `MQTTMessage.topic`'s
+        # SETTER accepts a str and stores it unchanged, so the bytes invariant
+        # comes from the producer, not from the type.
         logger.error("Dropped an inbound message whose TOPIC could not be "
                      "decoded: %r", getattr(msg, "_topic", None))
         return
     except Exception as exc:
-        # The topic-side twin of the payload catch-all below, added in the same
-        # change and for the same reason: two named types are not a class, and
-        # anything else out of `msg.topic` exited the process. Named arm first
-        # so an undecodable topic keeps its own diagnosis; this one says
-        # UNEXPECTED because that is a different thing to go and look at.
+        # See the paragraphs above for why this arm cannot fire on a
+        # paho-delivered message. It stays for a direct caller, and it logs the
+        # SAME bytes the named arm does: the arm for the least-understood fault
+        # was the one carrying the least identifying detail, which is backwards
+        # on a host where gardyn.log is the whole incident record.
         logger.error("Dropped an inbound message whose TOPIC raised an "
-                     "UNEXPECTED error: %r", exc)
+                     "UNEXPECTED error: %r (topic bytes: %r)",
+                     exc, getattr(msg, "_topic", None))
         return
 
     try:
@@ -1373,6 +1404,21 @@ def on_message(client, userdata, msg):
         # BaseException is deliberately NOT caught: KeyboardInterrupt and
         # SystemExit must still stop the process, and paho's own shutdown path
         # depends on that.
+        #
+        # IT ALSO CHANGES DELIVERY SEMANTICS, which the paragraphs above framed
+        # as purely about process exit. Commands are subscribed at QoS 1, and
+        # `_handle_publish` sends the PUBACK only AFTER `_handle_on_message`
+        # returns (paho client.py: `self._handle_on_message(message)` then
+        # `return self._send_puback(message.mid)`). So an escaping exception
+        # used to mean NO PUBACK and redelivery on reconnect; now the message
+        # is acked and consumed. For a permanently undecodable payload that is
+        # strictly better - it was an infinite redeliver-and-crash loop. For a
+        # TRANSIENT fault, a one-off MemoryError say, it converts a message
+        # that would have been redelivered and succeeded into a silent drop
+        # with a log line. Judged worth it on this host: the light schedule is
+        # local since T-527, so a lost command costs an override rather than a
+        # photoperiod, and a restart loop costs the photoperiod. Named here so
+        # the trade is on the record rather than discovered later.
         logger.error(
             f"Dropped an inbound message on topic {topic!r} whose payload "
             f"raised an UNEXPECTED error while being decoded or logged. This "

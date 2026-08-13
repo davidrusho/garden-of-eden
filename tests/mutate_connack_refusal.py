@@ -423,11 +423,18 @@ MUTANTS = [
      '    except RuntimeError as exc:\n'
      '        # CLOSING THE CLASS'),
 
-    ("delete the topic catch-all - the same route, one guard up",
-     '    except Exception as exc:\n'
-     '        # The topic-side twin',
-     '    except RuntimeError as exc:\n'
-     '        # The topic-side twin'),
+    # Anchored on the LOG LINE rather than on the comment above it, after the
+    # anchor check caught this one at x0: the review of 2a8c951 rewrote that
+    # comment (paho reads msg.topic itself, so this arm cannot fire on a
+    # paho-delivered message) and the needle went with it. A mutant anchored
+    # on prose is a mutant one comment edit from silently not existing.
+    ("delete the topic catch-all - defence for a direct caller, one guard up",
+     '                     "decoded: %r", getattr(msg, "_topic", None))\n'
+     '        return\n'
+     '    except Exception as exc:',
+     '                     "decoded: %r", getattr(msg, "_topic", None))\n'
+     '        return\n'
+     '    except RuntimeError as exc:'),
 
     # --- 24-25: the invariant the fix RELIES on, in both directions ---------
     # Neither line is in the diff. The fix's whole argument is that the flag is

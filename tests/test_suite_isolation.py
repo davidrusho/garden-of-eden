@@ -339,6 +339,18 @@ def fingerprint(p):
     return f"{digest}:{oct(stat.S_IMODE(os.stat(p).st_mode))}"
 
 runner = "run_suites" if hasattr(mod, "run_suites") else "run_suite"
+# ASSERT THE NAME EXISTS. `setattr` below happily creates a new attribute on a
+# harness that spells its runner differently, and the harness then runs its
+# REAL battery against the live tree while this probe waits for an interrupt
+# that can never arrive. mutate_deploy_verify.py defines `run_one` and is one
+# such harness today; it is SANDBOXED so nothing drives it yet, which is
+# exactly the kind of latent trap that fires the first time somebody widens
+# this probe's coverage. Found by the review of 2a8c951.
+if not hasattr(mod, runner):
+    print("VERDICT " + json.dumps({
+        "error": f"{harness} has no {runner}() - this probe would have "
+                 f"created one and let the harness run its real battery"}))
+    raise SystemExit(0)
 before = {p: fingerprint(p) for p in targets}
 state = {"n": 0, "at_interrupt": None}
 
@@ -537,17 +549,36 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         `def copytree(a, b): pass`. The fourth is the mechanism the failure
         message below warns about, standing on its own.
 
-        THE DESIGN CALL, made deliberately 2026-08-12 rather than left open:
-        this stays call-presence. Execution-reachability is the property that
-        actually matters, and the honest way to get it is to DRIVE each
-        sandboxed harness and assert the live tree is untouched - the same
-        instrument `test_an_interrupted_battery_leaves_no_mutant_behind` uses
-        for IN_PLACE. That is not a docstring's worth of work: the probe's
-        runner-name interception does not reach these harnesses as written
-        (driving mutate_netwatch.py through it returns "main() returned
-        without the injected interrupt" in 0.3s, so nothing was exercised),
-        so it needs the harnesses' own entry points changed. Until that
-        exists, the gate is a NECESSARY condition on SANDBOXED membership and
+        THE DESIGN CALL: this stays call-presence FOR NOW, and the reason
+        recorded here on 2026-08-12 was WRONG. Both versions are kept, because
+        the wrong one is the plausible mistake.
+
+        ~~"The probe's runner-name interception does not reach these harnesses
+        as written - driving mutate_netwatch.py through it returns 'main()
+        returned without the injected interrupt' in 0.3s - so it needs the
+        harnesses' own entry points changed."~~ The MEASUREMENT reproduces;
+        the diagnosis does not. `_RESTORE_PROBE`'s `fake` returns
+        `(True, _GREEN)` / `(False, _RED)`, while mutate_netwatch's
+        `run_suite` returns `(rc: int, out: str)` - so `main()` reads
+        `rc = True`, finds `True != 0`, and aborts at its OWN control A in
+        0.3s. The interception reaches it perfectly; the DOUBLE is wrong about
+        the shape, which is the same happy-path-double defect this probe's
+        comment above records fixing once already for the ran-count.
+
+        And the honest instrument ALREADY WORKS, unchanged, on at least one
+        SANDBOXED harness. Measured by the review of 2a8c951:
+
+          mutate_light_scheduler.py  {"applied": false, "restored": true}
+          mutate_ha_birth_message.py {"applied": true,  "restored": true}  (IN_PLACE control)
+
+        `applied: false, restored: true` against the live tree IS the sandbox
+        property, measured rather than parsed. So the work is a per-harness
+        runner-shape fix in the double - NOT a rewrite of the harnesses - and
+        a single global flip to `(0, ...)` is not it either, because
+        mutate_light_scheduler.py is already driven correctly by the current
+        shape. That is real work with its own failure modes, it is filed
+        rather than rushed into the commit that discovered it, and until it
+        lands this gate is a NECESSARY condition on SANDBOXED membership and
         is not claimed as a sufficient one - which is why the reverse test's
         failure message refuses to prescribe a move.
 

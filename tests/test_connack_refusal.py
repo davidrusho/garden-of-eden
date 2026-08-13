@@ -2328,6 +2328,65 @@ class AnUndecodableTopicIsDroppedNotFatalTests(unittest.TestCase):
             f"a library shape change was reported as a binary payload, which "
             f"points the reader at the broker: {messages}")
 
+    def test_on_message_survives_PAHOS_OWN_DISPATCH_not_just_a_direct_call(self):
+        """The frame every other test in this class skips, and the reason a
+        wrong comment about this guard survived two review rounds.
+
+        Everything else here calls `mqtt_mod.on_message(...)` directly with
+        `_PahoShapedMessage`, a double whose `topic` is a property that raises.
+        A real `MQTTMessage` has `__slots__` and no such property, and - the
+        part that matters - **paho reads `message.topic` ITSELF before calling
+        the callback**, guarded against `UnicodeDecodeError` alone. So the
+        double supplies exactly the shape the guard reads and skips the frame
+        where a non-UnicodeDecodeError fault actually lands. Written from the
+        same belief as the code, which is why every mutant died honestly while
+        `mqtt.py` claimed to close a route it cannot reach.
+
+        This drives the real `Client._handle_on_message`, which is the exact
+        call `_handle_publish` makes on an inbound QoS-1 command.
+
+        SKIPPED where paho is absent rather than failed - it is not installed
+        on the development machine and a failure there would be a false
+        finding about the environment. That makes this the second test whose
+        evidence depends on the import helper telling absent from broken.
+        """
+        real_paho = _import_real_paho_client()
+        if real_paho is None:
+            self.skipTest("paho is not installed here; nothing to dispatch through")
+
+        client = real_paho.Client(real_paho.CallbackAPIVersion.VERSION2)
+        client.on_message = lambda _c, _u, msg: mqtt_mod.on_message(
+            self.client, _u, msg)
+
+        def drive(mutate):
+            msg = real_paho.MQTTMessage(
+                topic=(mqtt_mod.BASE_TOPIC + "/light/command").encode())
+            msg.payload = b"ON"
+            mutate(msg)
+            client._handle_on_message(msg)
+
+        # CONTROL. If a healthy message does not survive this path, every
+        # absence below is meaningless.
+        drive(lambda m: None)
+
+        # THE ONE THAT MATTERS, and the only topic fault this guard can
+        # actually receive: paho catches UnicodeDecodeError itself, hands the
+        # message over, and mqtt.py re-reads `msg.topic` - which is the
+        # T-527.12 process-killer, and it is closed.
+        drive(lambda m: setattr(m, "_topic", b"gardyn/light/\xff"))
+
+        # Payload faults DO reach us, because paho never touches `payload`
+        # before the callback.
+        for payload in (b"\xff\xfe", None, "already a str"):
+            with self.subTest(payload=type(payload).__name__):
+                drive(lambda m, p=payload: setattr(m, "payload", p))
+
+        # And the honest negative: a non-bytes `_topic` raises INSIDE paho and
+        # never reaches on_message at all. Asserted so the docstring in
+        # mqtt.py stays checkable rather than being a claim about a library.
+        with self.assertRaises(AttributeError):
+            drive(lambda m: setattr(m, "_topic", "already a str"))
+
     def test_the_private_attribute_the_guard_reads_is_pinned_against_paho(self):
         """`getattr(msg, "_topic", None)` degrades SILENTLY, and this suite is
         structurally unable to notice - the fixture above sets `_topic`
@@ -2490,26 +2549,103 @@ class TheImportHelperTellsAbsentApartFromBroken(unittest.TestCase):
                 self.assertIn("NOT the same as paho being absent",
                               str(caught.exception))
 
-    def test_a_paho_that_is_absent_is_still_told_apart_from_one_that_is_broken(self):
-        """The pair for the test above, and the reason the split is on
-        `exc.name` rather than on the exception class.
+    @staticmethod
+    def _tree_on_disk(files):
+        """An arbitrary package LAYOUT on sys.path, for the shapes
+        `_paho_on_disk` cannot express.
 
-        Absence and a broken dependency BOTH arrive as ModuleNotFoundError -
-        measured, not assumed - so the class cannot separate them and the
-        missing NAME is the only signal. Getting this wrong in the other
-        direction would fail the suite on every machine without paho, which is
-        a false finding about the environment rather than about mqtt.py, and
-        this development machine is one of them.
+        That fixture always builds a well-formed `paho/mqtt/client.py` and
+        varies only the file BODIES, which is why the malformed-layout states
+        below went unmeasured until the review of 2a8c951 planted them.
         """
-        with self._paho_on_disk("X = 1\n",
-                                package_init="import definitely_absent_xyz\n"):
-            with self.assertRaises(ModuleNotFoundError) as raw:
-                import importlib.util
-                importlib.util.find_spec("paho.mqtt.client")
-            self.assertEqual(raw.exception.name, "definitely_absent_xyz",
-                             "CONTROL: if this is not the missing dependency's "
-                             "own name, the split below is reading the wrong "
-                             "field and proves nothing")
+        import contextlib
+        import os
+        import shutil
+        import sys
+        import tempfile
+
+        @contextlib.contextmanager
+        def _cm():
+            saved_modules = {k: v for k, v in sys.modules.items()
+                             if k == "paho" or k.startswith("paho.")}
+            saved_path = list(sys.path)
+            tmp = tempfile.mkdtemp(prefix="t527-paho-tree-")
+            try:
+                for rel, body in files.items():
+                    path = os.path.join(tmp, rel)
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w") as handle:
+                        handle.write(body)
+                for name in saved_modules:
+                    del sys.modules[name]
+                sys.path.insert(0, tmp)
+                yield tmp
+            finally:
+                sys.path[:] = saved_path
+                for name in [k for k in list(sys.modules)
+                             if k == "paho" or k.startswith("paho.")]:
+                    del sys.modules[name]
+                sys.modules.update(saved_modules)
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        return _cm()
+
+    def test_a_MALFORMED_paho_layout_is_broken_rather_than_absent(self):
+        """The three states the FIRST fix for this still called an absence.
+
+        That fix classified on `exc.name`: a missing name that was paho or
+        under it meant absence. The review of 2a8c951 measured why that cannot
+        work - CPython folds a missing `__path__` into
+        `ModuleNotFoundError(name=<the fullname you asked for>)`, so all three
+        shapes below raise with a name starting "paho" while paho is plainly
+        installed. Reading the name could not separate them from a real
+        absence, and the comment claiming `AttributeError` reached the handler
+        was wrong twice over: it never arrives, and the state it described was
+        being answered as an absence.
+
+        The current split asks the two questions separately instead, which is
+        why these are now correct without any name arithmetic.
+        """
+        ok = {"paho/__init__.py": "", "paho/mqtt/__init__.py": "",
+              "paho/mqtt/client.py": "MARKER = 1\n"}
+        cases = {
+            "paho.mqtt is a MODULE, not a package":
+                {"paho/__init__.py": "", "paho/mqtt.py": "X = 1\n"},
+            "`paho` itself is a MODULE, not a package":
+                {"paho.py": "X = 1\n"},
+            "__init__ imports a missing paho.* submodule":
+                dict(ok, **{"paho/__init__.py": "import paho.nope\n"}),
+        }
+        for label, files in cases.items():
+            with self.subTest(shape=label):
+                with self._tree_on_disk(files):
+                    with self.assertRaises(PahoIsInstalledButUnusable):
+                        _import_real_paho_client()
+
+    def test_the_absence_question_is_answered_without_EXECUTING_anything(self):
+        """CONTROL for the design, not for a case.
+
+        The whole split rests on `find_spec("paho")` being able to say "paho is
+        there" without running paho's `__init__` - if it executed, a broken
+        `__init__` would make the absence question unanswerable and the
+        classifier would be back to guessing. There is no parent to import for
+        a top-level name, so it locates only. Asserted directly, because it is
+        a property of CPython rather than of this repo and a future version
+        changing it would silently re-break the classification.
+        """
+        import importlib.util
+        exploding = {"paho/__init__.py": "raise RuntimeError('boom')\n",
+                     "paho/mqtt/__init__.py": "",
+                     "paho/mqtt/client.py": "MARKER = 1\n"}
+        with self._tree_on_disk(exploding):
+            spec = importlib.util.find_spec("paho")
+            self.assertIsNotNone(
+                spec, "find_spec could not locate a paho whose __init__ "
+                      "raises, so the absence question is being answered by "
+                      "execution and the split above is unsound")
+            # ...and the helper must still call this state BROKEN, not absent.
+            with self.assertRaises(PahoIsInstalledButUnusable):
+                _import_real_paho_client()
 
     def test_the_skip_branch_still_reports_a_genuine_absence_as_None(self):
         """The other half. Widening the raise until it swallows the absent
@@ -2551,62 +2687,60 @@ def _import_real_paho_client():
     """
     import importlib.util
 
+    # ASK "IS PAHO THERE" AND "DOES IT RUN" AS TWO SEPARATE QUESTIONS, because
+    # only the first one can honestly answer ABSENT and it is the cheaper of
+    # the two to get right.
+    #
+    # THE SHAPE THIS REPLACES, and why classifying by `exc.name` was a trap.
+    # Until 2026-08-12 there was one blanket `except (ImportError, ValueError,
+    # AttributeError): return None` here, and everything that went wrong in
+    # paho's own `__init__` came back as "paho is not installed" - `find_spec`
+    # IMPORTS the parent packages, so paho's `__init__` runs at this call, one
+    # branch ABOVE the `exec_module` guard that was hardened for exactly this
+    # (094eac0 review). The first fix for that read `exc.name` and asked
+    # whether the missing name was paho or under it. The review of THAT fix
+    # measured three states it still calls an absence, because CPython folds a
+    # missing `__path__` into `ModuleNotFoundError(name=<the fullname you
+    # asked for>)`:
+    #
+    #   paho.mqtt is a MODULE not a package   name='paho.mqtt.client'
+    #   `paho` itself is a MODULE             name='paho.mqtt'
+    #   __init__ imports a missing paho.*     name='paho.nope'
+    #
+    # All three start with "paho", all three mean paho IS installed, and the
+    # name field cannot tell them from a genuine absence. So stop reading it.
+    #
+    # `find_spec("paho")` LOCATES the top-level package without EXECUTING
+    # anything - there is no parent to import for a top-level name - so it
+    # answers the absence question and nothing else can confound it. After it
+    # succeeds, paho is on sys.path and every subsequent failure is an
+    # installation that cannot run. Verified across nine planted states, with
+    # absent and healthy as the two controls: 9/9 classified correctly, where
+    # the `exc.name` version got three wrong.
+    try:
+        top_level = importlib.util.find_spec("paho")
+    except Exception:
+        # Nothing at all named `paho` that the import system will even look at.
+        top_level = None
+    if top_level is None:
+        return None
+
     try:
         spec = importlib.util.find_spec("paho.mqtt.client")
-    except ModuleNotFoundError as exc:
-        # THE SPLIT IS ONE BRANCH LOWER THAN IT LOOKS, and the comment below
-        # said otherwise until 2026-08-12 ("everything above this point is
-        # about LOCATING paho"). `find_spec` IMPORTS the parent packages, so
-        # paho's own `__init__` RUNS here - before the `exec_module` guard
-        # further down ever sees it. A missing dependency OF paho therefore
-        # landed in the old blanket `except (ImportError, ...)` below and was
-        # reported as "paho is not installed here", which is the identical
-        # false absence that guard exists to stop, one branch up. Found by the
-        # review of 094eac0.
-        #
-        # Measured on this machine, 2026-08-12, which is what the split is
-        # built from rather than reasoning about import machinery:
-        #
-        #   paho absent entirely         ModuleNotFoundError(name='paho')
-        #   __init__ imports absent mod  ModuleNotFoundError(name='<that mod>')
-        #   __init__ from-imports a
-        #     missing NAME               ImportError(name='os')  <- not MNFE
-        #   __init__ raises RuntimeError RuntimeError            <- uncaught
-        #   paho present, no client.py   spec is None
-        #
-        # Only the first row is an absence. The name is the whole signal: a
-        # missing name that IS paho (or under it) means paho is not there; a
-        # missing name that is anything else means paho IS there and cannot
-        # run.
-        if exc.name is not None and (exc.name == "paho"
-                                     or exc.name.startswith("paho.")):
-            return None
-        raise PahoIsInstalledButUnusable(
-            f"paho is installed and one of its own imports failed "
-            f"({exc.name!r} is missing), so this suite cannot pin anything "
-            f"against it. This is NOT the same as paho being absent: "
-            f"{exc!r}") from exc
-    except ValueError:
-        # `__spec__` is None, or the name is not importable as a package.
-        # Genuinely nothing to run against.
-        return None
     except Exception as exc:
-        # Rows three and four above. A bare `ImportError` from a `from ...
-        # import <missing name>` in paho's `__init__` used to return None here
-        # - the same false absence by a different exception class - and a
-        # RuntimeError from that `__init__` was not caught at all and left as
-        # a raw traceback with no explanation of which library broke.
-        #
-        # AttributeError lands here too, and deliberately: it means something
-        # called `paho` is on sys.path and is not a package, which is an
-        # unusable installation rather than a missing one. There is no absence
-        # path that produces it - absence is ModuleNotFoundError, measured
-        # above.
         raise PahoIsInstalledButUnusable(
-            f"paho was found on sys.path and failed while being located, so "
+            f"paho is on sys.path and locating paho.mqtt.client failed, so "
             f"this suite cannot pin anything against it. This is NOT the same "
-            f"as paho being absent: {exc!r}") from exc
+            f"as paho being absent, and must not be skipped as though it "
+            f"were: {exc!r}") from exc
     if spec is None or spec.origin is None or not spec.origin.endswith(".py"):
+        # NOT a raise, and the asymmetry is deliberate. This is the branch a
+        # STUB reaches - this suite plants a MagicMock at `paho.mqtt.client`
+        # for the length of mqtt.py's import, and a mock satisfies `hasattr`
+        # for every name, so answering from it would make the assertions that
+        # call this helper true for free. "There is no real .py module here"
+        # is honestly an absence of the thing being pinned against, and a FAIL
+        # would be a false finding about the environment.
         return None
     module = importlib.util.module_from_spec(spec)
     try:
