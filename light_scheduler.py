@@ -507,6 +507,12 @@ class LightScheduler:
         # from a dead one.
         self._heartbeat_count = 0
         self._last_heartbeat = None
+        # Which thread is the scheduler loop, once one is running. None until
+        # run_forever starts, and re-stamped on every entry so it cannot go
+        # stale. See _heartbeat_locked: this is what stops a FUTURE caller of
+        # tick() from another thread claiming the loop is alive, the way
+        # override_now() did before the call was moved out of _tick_locked.
+        self._scheduler_ident = None
 
     # ------------------------------------------------------------- override
 
@@ -598,9 +604,51 @@ class LightScheduler:
     # ----------------------------------------------------------------- tick
 
     def tick(self):
-        """One pass. Returns the Decision, so a test can assert on it."""
+        """One pass. Returns the Decision, so a test can assert on it.
+
+        THE HEARTBEAT IS EMITTED HERE AND NOT IN _tick_locked, and that
+        placement is the whole of its meaning (T-527.22, corrected after
+        review). _tick_locked is ALSO reached from override_now(), which
+        mqtt.py's apply_light_override() calls on paho's network thread and
+        toggle_light() calls from the physical-button thread. Both of those
+        threads are alive in exactly the failure this heartbeat detects — a
+        dead scheduler thread under a live broker connection — so a beat from
+        either would report liveness for the thread that stopped using a thread
+        that did not.
+
+        The consequence when it was wired into _tick_locked, confirmed by a
+        probe with three gating controls: with the scheduler thread genuinely
+        gone, a person tapping the light in Home Assistant emitted a heartbeat
+        and reset the staleness alarm for a full threshold. That is the worst
+        possible shape — tapping the light is precisely what somebody does on
+        noticing the garden is wrong, so the diagnostic action suppressed the
+        diagnostic, and repeating it suppressed it indefinitely.
+
+        The guard below is the second half. Moving the call here excludes the
+        two callers that exist today; the ident check excludes a future one,
+        because "a tick completed" and "the scheduler loop completed a pass"
+        are different claims and only the second is worth publishing.
+
+        IT ALSO SITS AFTER _tick_locked RETURNS, so a heartbeat means the pass
+        ran to completion rather than that one was attempted. What can raise
+        before it: `self._now()`, which is why
+        test_a_tick_that_raises_leaves_no_heartbeat injects a raising `now`;
+        `decide()`; and `override_is_live()` -> `next_boundary_after()`. NOT
+        `load_schedule`, which an earlier version of this comment named — its
+        own docstring says "NOTHING here raises" and the two sentences
+        contradicted each other. run_forever catches whatever does escape, and
+        correctly leaves no heartbeat behind.
+
+        Note "completed" is not "the lamp was driven". `_apply` swallows a
+        drive failure on purpose and test_a_failed_drive_still_publishes_a_
+        heartbeat pins that: a pigpio drop means the lamp is wrong, not that
+        the scheduler stopped deciding, and reporting it as dead would point
+        the alarm at the wrong subsystem.
+        """
         with self._lock:
-            return self._tick_locked()
+            decision = self._tick_locked()
+            self._heartbeat_locked()
+            return decision
 
     def _clock_verdict(self, state):
         """Should we drive off the wall clock? Returns (trust_it, note).
@@ -730,43 +778,51 @@ class LightScheduler:
         pair = (decision.brightness, decision.source)
         if pair != self._last_published or not applied:
             self._record_published_locked(decision, self._publish(decision))
-        # LAST, AND OUTSIDE THE DEDUPE (T-527.22). Everything above can decline
-        # to publish; this cannot, because its whole job is to be the one topic
-        # whose silence means something. It sits at the END so that what it
-        # asserts is true: a heartbeat means a tick RAN TO COMPLETION, not that
-        # one was attempted. A tick that raises before here — load_schedule and
-        # decide are the only calls that can, everything else returns notes —
-        # is caught by run_forever and correctly leaves no heartbeat behind.
-        self._heartbeat_locked()
         return decision
 
     def _heartbeat_locked(self):
         """Publish the liveness counter if HEARTBEAT_SECONDS have elapsed.
 
-        THE PAYLOAD IS A COUNTER AND NOT A TIMESTAMP, and that choice is the
-        whole safety argument. A timestamp would be read on the Home Assistant
-        side as `now() - as_datetime(state)`, which makes the check depend on
-        THIS host's clock — the one thing T-527.19 established cannot be
-        trusted, since a Pi with no RTC and no network restores a time-of-day
-        from /var/lib/systemd/timesync/clock that can be days out. A clock
-        running AHEAD would then report the heartbeat as permanently fresh,
-        which is a false all-clear on the exact check that exists to catch a
-        silent failure. A counter carries no time at all, so the age is measured
-        by Home Assistant's own clock via last_changed, and a wrong clock here
-        cannot manufacture freshness there.
+        CALLED ONLY FROM tick(), never from _tick_locked — see tick()'s
+        docstring for why, and for what the other placement cost. override_now()
+        and publish_now() are the two methods reachable from paho's network
+        thread, and neither can reach this.
 
-        It only has to CHANGE, which is why it is a counter rather than a
-        constant: HA's `last_changed` moves on a new state string, and relying
-        on `last_reported` instead would pin the check to an HA version whose
-        semantics this repo has no way to assert.
+        THE PAYLOAD CARRIES NO TIME, deliberately. A timestamp payload would be
+        read on the Home Assistant side as `now() - as_datetime(state)`, which
+        makes the check depend on THIS host's clock — the one thing T-527.19
+        established cannot be trusted, since a Pi with no RTC and no network
+        restores a time-of-day from /var/lib/systemd/timesync/clock that can be
+        days out. A clock running AHEAD would report the heartbeat as
+        permanently fresh: a false all-clear on the exact check that exists to
+        catch a silent failure.
 
-        NOT REPUBLISHED BY publish_now(), and that omission is deliberate.
-        publish_now() exists to refresh Home Assistant's retained copy when the
-        SUBSCRIBER changed — a reconnect, a birth message — and it is called
-        from paho's network thread, which is alive precisely in the failure this
-        heartbeat detects: broker connected, scheduler thread dead. Refreshing
-        the heartbeat there would report liveness for the thread that stopped,
-        using the thread that did not. The heartbeat has exactly one writer.
+        STALENESS IS DETECTED BY HOME ASSISTANT'S `expire_after`, NOT by
+        arithmetic on `last_changed`. An earlier version of this docstring
+        argued a counter was sufficient because `last_changed` moves whenever
+        the state string moves. Review showed that reasoning inverted the whole
+        feature: `last_changed` is ALSO reset by an availability flap, because
+        `unavailable` -> value is itself a state change. Measured on the
+        identically-shaped sibling sensor.gardyn_light_schedule_source, whose
+        `last_changed` was 26.3 h NEWER than its last real value change after
+        two flaps in ten days. The fatal case is mqtt.service in its
+        Restart=always / RestartSec=10 crash loop, which this host has already
+        lived through: every restart is an `unavailable` -> value round trip, so
+        `last_changed` would move every ten seconds while the counter stayed
+        frozen and the lamp stayed dark — a permanent all-clear during a
+        permanent outage, from the check built to catch silent failure.
+
+        `expire_after` is immune to that, because it counts RECEIVED MESSAGES
+        and nothing else. Home Assistant's MQTT sensor documentation is explicit
+        that the state payload should not be retained when using it — "it is not
+        recommended to retain the sensor's state payload at the MQTT broker" —
+        and that HA will "store and restore the sensor's state for you and
+        calculate the remaining time to retain the sensor's state before it
+        becomes unavailable". So HA does correctly, and for free, the thing the
+        retained design was approximating badly.
+
+        The counter survives the change and still earns its place: it keeps the
+        payload free of any clock, and a reset says the process restarted.
 
         Best-effort like every other publish here. The broker being down is the
         premise of T-527 and must never stop the photoperiod, so a raise is
@@ -774,6 +830,14 @@ class LightScheduler:
         next tick retries immediately rather than waiting out the interval.
         """
         if self._publish_heartbeat is None:
+            return
+        # Once run_forever is running, IT is the only caller entitled to speak
+        # for the scheduler's liveness. Before then there is no loop to speak
+        # for, so a direct tick() — which is every test in this file — may beat.
+        if (
+            self._scheduler_ident is not None
+            and threading.get_ident() != self._scheduler_ident
+        ):
             return
         stamp = self._heartbeat_clock()
         if (
@@ -941,6 +1005,10 @@ class LightScheduler:
         callable would exhaust them. Nothing here needs to be steerable,
         because the cadence is already injectable through `sleeper`.
         """
+        # Stamped here rather than in start(), so it names the thread actually
+        # running the loop even if this is called directly, and so it cannot go
+        # stale across a restart. See _heartbeat_locked.
+        self._scheduler_ident = threading.get_ident()
         while not self._stop.is_set():
             started = monotonic()
             try:

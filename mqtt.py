@@ -378,27 +378,48 @@ def publish_light_decision(client, decision):
 def publish_light_heartbeat(client, count):
     """Publish the scheduler's liveness counter (T-527.22).
 
-    RETAINED, and that has one consequence worth stating rather than
-    discovering. A retained heartbeat means Home Assistant has a value the
-    moment it subscribes instead of sitting at `unknown` — which the staleness
-    check needs, since `unknown` is not a state you can subtract a time from.
-    The cost is that an HA RESTART re-delivers the retained copy and stamps
-    `last_changed` at the restart, so a scheduler that died an hour ago reads as
-    fresh again for one threshold's worth of time.
+    NOT RETAINED, AND THAT IS THE OPPOSITE OF EVERY OTHER PUBLISH IN THIS FILE.
+    The `retain=True` beside every sibling exists because those topics can be
+    silent for hours, so a subscriber arriving later has to be told the current
+    value or it sits at `unknown`. This topic publishes every 120 s, so the
+    reasoning does not transfer — and following it anyway was a real defect,
+    caught in review.
 
-    That hole is bounded and self-correcting: if the scheduler really is dead
-    the counter stops moving and the staleness re-accrues from the restart, so
-    the check fires one threshold late rather than never. It is the cheaper of
-    the two mistakes here — the alternative, an unretained topic, makes the
-    sensor unavailable across every HA restart and turns the ordinary case into
-    the one needing special handling in the automation.
+    The first version retained this and measured staleness Home-Assistant-side
+    as `now() - last_changed`. `last_changed` is reset by an AVAILABILITY FLAP
+    as well as a value change, because `unavailable` -> value is a state change
+    in its own right. Measured on the identically-shaped sibling
+    sensor.gardyn_light_schedule_source: its `last_changed` sat 26.3 h newer
+    than its last real value change after two flaps in ten days. The case that
+    makes it fatal rather than untidy is mqtt.service in its Restart=always /
+    RestartSec=10 crash loop, which this host has already lived through — each
+    restart is an `unavailable` -> retained value round trip, so `last_changed`
+    would advance every ten seconds while the counter stayed frozen and the
+    lamp stayed dark. A permanent all-clear during a permanent outage.
+
+    So staleness moves onto Home Assistant's `expire_after`, which counts
+    RECEIVED MESSAGES and nothing else. HA's MQTT sensor documentation
+    prescribes exactly this pairing:
+
+      "If set, it defines the number of seconds after the sensor's state
+       expires if it's not updated. After expiry, the sensor's state becomes
+       `unavailable`."
+
+      "As this could cause the sensor to become available with an expired
+       state, it is not recommended to retain the sensor's state payload at
+       the MQTT broker. Home Assistant will store and restore the sensor's
+       state for you and calculate the remaining time to retain the sensor's
+       state before it becomes unavailable."
+
+    That second paragraph also removes the HA-restart hole the retained version
+    accepted as a cost: HA accounts for the elapsed time itself.
 
     It is emphatically NOT fixed by having the reconnect path republish this.
     See _heartbeat_locked: the failure this detects is a dead scheduler thread
     under a live broker connection, and the reconnect path runs on the thread
     that is still alive.
     """
-    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count), retain=True)
+    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count))
 
 
 def clear_retired_entities(client):
@@ -812,19 +833,34 @@ def send_discovery_messages(client):
     # source sensor beside it, and for the same reason: it is not something to
     # look at, it is something for an automation to condition on.
     #
+    # expire_after IS THE STALENESS DETECTOR, and it is the whole reason this
+    # entity exists. HA's MQTT sensor docs: "If set, it defines the number of
+    # seconds after the sensor's state expires if it's not updated. After
+    # expiry, the sensor's state becomes `unavailable`." It counts RECEIVED
+    # MESSAGES, so unlike last_changed arithmetic it cannot be reset by an
+    # availability flap or by a crash loop's restart churn — see
+    # publish_light_heartbeat for the measurement that ruled that approach out.
+    #
+    # 600 s is 5x light_scheduler.HEARTBEAT_SECONDS. Wide enough to ride out a
+    # broker blip and a netwatch reboot cycle, short enough that a wedged
+    # scheduler thread is caught inside the same 15-minute dwell window the
+    # obedience checks already measure. The two numbers are coupled and live in
+    # different repos, which is exactly why the Pi's constant is pinned by a
+    # named test.
+    #
     # NO device_class AND NO state_class, both deliberate. device_class
     # "timestamp" would require an ISO datetime payload, which is the design
-    # this deliberately rejects (see _heartbeat_locked — the payload must carry
-    # no time, or the check inherits this Pi's untrustworthy clock).
-    # state_class would enrol an ever-increasing counter in long-term
-    # statistics, which nothing wants: the VALUE is meaningless and only its
-    # movement is read.
+    # this rejects (the payload must carry no time, or the check inherits this
+    # Pi's untrustworthy clock). state_class would enrol an ever-increasing
+    # counter in long-term statistics, which nothing wants: the VALUE is
+    # meaningless and only its arrival is read.
     HEARTBEAT_CONFIG_TOPIC = ("homeassistant/sensor/gardyn/" + IDENTIFIER
                               + "_light_heartbeat/config")
     publish_config(HEARTBEAT_CONFIG_TOPIC, {
         "name": "Light Schedule Heartbeat",
         "unique_id": IDENTIFIER + "_light_heartbeat",
         "state_topic": LIGHT_HEARTBEAT_TOPIC,
+        "expire_after": 600,
         "icon": "mdi:heart-pulse",
         "entity_category": "diagnostic",
         "device": device_info,
@@ -1207,8 +1243,28 @@ def on_connect(client, userdata, flags, rc, properties=None):
     # line just as surely. TestConnectSequencing asserts this call is reached.
     start_publisher_threads(client)
 
+
 def _incident_topic_bytes(msg):
-    """The raw topic bytes for an incident record, or a marker. NEVER raises.
+    """The raw topic bytes for an incident record, or a marker.
+
+    RAISES NOTHING DERIVED FROM `Exception`. That qualifier is load-bearing and
+    an earlier version of this line said "NEVER raises", which was false in the
+    same shape as the defect this helper exists to close, one level up:
+    `getattr` suppresses only `AttributeError`, and `except Exception`
+    suppresses only `Exception`. A `_topic` property raising `KeyboardInterrupt`,
+    `SystemExit`, `GeneratorExit` or any other bare `BaseException` still
+    escapes — measured, all four. That is deliberate rather than a gap;
+    swallowing `KeyboardInterrupt` in a service is worse than the fault it would
+    hide. What was wrong was the promise, not the code.
+
+    Two further edges from the same probe, both nil-reachability under paho
+    2.0.0 and both recorded so the next reader does not have to re-derive them:
+    a `_topic` property raising `AttributeError` returns None here, which is
+    indistinguishable in the log from the attribute being absent; and a `_topic`
+    whose `__repr__` raises `RecursionError` escapes on_message entirely,
+    because CPython's logging.Handler.emit re-raises RecursionError rather than
+    routing it to handleError. A ValueError in `__repr__` is swallowed
+    correctly.
 
     Both topic drop arms below want `msg._topic` - the bytes are the only
     useful thing to put in `gardyn.log` when the decoded topic is exactly what

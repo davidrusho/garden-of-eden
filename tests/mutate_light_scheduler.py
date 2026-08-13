@@ -303,18 +303,59 @@ MUTANTS = [
     # real one still ran. An additive "mutant" tests nothing.
     ("the heartbeat is folded INTO the dedupe, so a healthy unchanging "
      "scheduler goes silent - the exact fault this ticket exists to fix", SRC,
-     "        self._heartbeat_locked()\n        return decision",
-     "        if pair != self._last_published or not applied:\n"
-     "            self._heartbeat_locked()\n        return decision"),
+     # Gates on whether the DEDUPE let a publish through, by reading
+     # _last_published either side of the tick. An earlier draft compared
+     # decision.source against _last_published (a str against a tuple), which
+     # is unequal always and beats always - inert, the third time this file has
+     # produced that shape.
+     "            decision = self._tick_locked()\n            self._heartbeat_locked()",
+     "            before = self._last_published\n"
+     "            decision = self._tick_locked()\n"
+     "            if self._last_published != before:\n"
+     "                self._heartbeat_locked()"),
+    # MOVES the call. The first version inserted one at the top of
+    # _tick_locked and LEFT the real one in place - the additive shape this
+    # file's own comment two entries up calls "tests nothing". It was killed,
+    # but by collateral rather than by the guarantee its label names.
     ("the heartbeat fires BEFORE the decision, so it reports a tick that was "
      "merely attempted rather than one that completed", SRC,
-     "    def _tick_locked(self):\n"
-     '        """One pass, with self._lock already held. See __init__ on the lock."""\n'
-     "        schedule, note = load_schedule(self._config_path)",
-     "    def _tick_locked(self):\n"
-     '        """One pass, with self._lock already held. See __init__ on the lock."""\n'
-     "        self._heartbeat_locked()\n"
-     "        schedule, note = load_schedule(self._config_path)"),
+     "            decision = self._tick_locked()\n            self._heartbeat_locked()\n            return decision",
+     "            self._heartbeat_locked()\n            return self._tick_locked()"),
+    # THE FINDING THIS COMMIT ANSWERS, planted at its real call site. Reaching
+    # the heartbeat from override_now() is what a person tapping the light in
+    # Home Assistant does, on paho's network thread, while the scheduler thread
+    # is dead - so the diagnostic action silences the diagnostic. Written as an
+    # addition to override_now rather than a move out of tick(), because that
+    # is the single site where the defect actually lived.
+    ("override_now() emits a heartbeat, so paho's network thread and the "
+     "physical button both speak for a scheduler thread that may be dead", SRC,
+     "            self._set_override_locked(brightness)\n            return self._tick_locked()",
+     "            self._set_override_locked(brightness)\n"
+     "            decision = self._tick_locked()\n"
+     "            self._heartbeat_locked()\n            return decision"),
+    ("the scheduler-thread guard is inert, so any future caller of tick() from "
+     "another thread can speak for the loop's liveness", SRC,
+     "        if (\n            self._scheduler_ident is not None\n"
+     "            and threading.get_ident() != self._scheduler_ident\n        ):\n            return",
+     "        if False:\n            return"),
+    ("the guard is inverted into a hard check, so the REAL loop is refused and "
+     "the heartbeat never publishes at all", SRC,
+     "            self._scheduler_ident is not None\n"
+     "            and threading.get_ident() != self._scheduler_ident",
+     "            self._scheduler_ident is None\n"
+     "            or threading.get_ident() != self._scheduler_ident"),
+    ("run_forever never claims the ident, so the guard can never reject "
+     "anything", SRC,
+     "        self._scheduler_ident = threading.get_ident()\n        while not self._stop.is_set():",
+     "        while not self._stop.is_set():"),
+    ("the cadence is derived from the tick, so retuning timedatectl cost "
+     "silently moves what Home Assistant is watching", SRC,
+     "HEARTBEAT_SECONDS = 120",
+     "HEARTBEAT_SECONDS = 4 * TICK_SECONDS"),
+    ("the cadence outruns Home Assistant's expire_after, so a HEALTHY "
+     "scheduler flaps the sensor unavailable - a permanent false alarm", SRC,
+     "HEARTBEAT_SECONDS = 120",
+     "HEARTBEAT_SECONDS = 900"),
     ("the first tick after a restart waits out a whole interval, so a fresh "
      "process is indistinguishable from a dead one", SRC,
      "        self._last_heartbeat = None",
@@ -348,10 +389,23 @@ MUTANTS = [
      "reports liveness on behalf of the dead scheduler thread", SRC,
      "            self._record_published_locked(decision, self._publish(decision))\n\n    # ----------------------------------------------------------------- tick",
      "            self._record_published_locked(decision, self._publish(decision))\n            self._heartbeat_locked()\n\n    # ----------------------------------------------------------------- tick"),
-    ("the heartbeat is published UNRETAINED, so Home Assistant sits at "
-     "`unknown` after every restart", MQTT,
-     '    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count), retain=True)',
-     '    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count))'),
+    # RETAINING is the mutant now, not the fix. The first version had this
+    # backwards: it treated retain=True as correct and the absence as the
+    # defect. HA's MQTT sensor docs say the opposite for an expire_after
+    # sensor, and a retained replay is what lets the entity come back
+    # available with an expired state.
+    ("the heartbeat is RETAINED, so a replay makes the sensor available with "
+     "an expired state and an availability flap resets the staleness", MQTT,
+     '    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count))',
+     '    client.publish(LIGHT_HEARTBEAT_TOPIC, str(count), retain=True)'),
+    ("expire_after is dropped, so the sensor never goes unavailable and the "
+     "staleness check has nothing to read", MQTT,
+     '        "expire_after": 600,\n',
+     ''),
+    ("expire_after is shorter than the publish cadence, so a HEALTHY scheduler "
+     "flaps the sensor unavailable between beats", MQTT,
+     '        "expire_after": 600,',
+     '        "expire_after": 60,'),
     ("the heartbeat is published onto the SOURCE topic, destroying the one "
      "property that makes that topic readable", MQTT,
      'LIGHT_HEARTBEAT_TOPIC = BASE_TOPIC + "/light/schedule/heartbeat"',
@@ -425,8 +479,12 @@ MUTANTS = [
     # had no concurrent test at all.
     ("the tick is not serialised, so a command landing inside one is reverted",
      SRC,
-     "        with self._lock:\n            return self._tick_locked()",
-     "        if True:\n            return self._tick_locked()"),
+     # Re-anchored when tick() gained the heartbeat call (T-527.22). The old
+     # anchor was `with self._lock:\n return self._tick_locked()`, which now
+     # matches nothing - the harness reported it NOT APPLIED, which is that
+     # gate working in the direction that costs nothing.
+     "        with self._lock:\n            decision = self._tick_locked()",
+     "        if True:\n            decision = self._tick_locked()"),
     ("recording an override and applying it are two acquisitions again, so a "
      "tick can run between them", SRC,
      "        with self._lock:\n            self._set_override_locked(brightness)\n"

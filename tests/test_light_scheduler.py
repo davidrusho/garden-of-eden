@@ -26,6 +26,7 @@ import inspect
 import io
 import json
 import logging
+import re
 import os
 import subprocess
 import sys
@@ -1516,14 +1517,80 @@ class HeartbeatTests(SchedulerHarness):
         scheduler.tick()
         self.assertEqual([1, 2], self.beats)
 
-    def test_an_override_tick_publishes_a_heartbeat_too(self):
-        """override_now() routes through _tick_locked, so it is a completed
-        tick by every measure this file uses."""
+    def test_an_override_tick_does_NOT_publish_a_heartbeat(self):
+        """THE CONTRACT FLIP, and the most important test in this class.
+
+        An earlier version of this file asserted the OPPOSITE — that
+        override_now() beats too, on the reasoning that it routes through
+        _tick_locked and is therefore a completed tick. That reasoning is
+        true and irrelevant: override_now() is reached from mqtt.py's
+        apply_light_override() on PAHO'S NETWORK THREAD, and from
+        toggle_light() on the physical-button thread. Both are alive in
+        exactly the failure this heartbeat detects.
+
+        The cost of the old contract, confirmed by probe: with the scheduler
+        thread genuinely dead, a person tapping the light in Home Assistant
+        emitted a beat and reset the staleness alarm for a full threshold.
+        Tapping the light is precisely what somebody does on noticing the
+        garden is wrong, so the diagnostic action suppressed the diagnostic,
+        and repeating it suppressed it indefinitely.
+
+        Found by review. The code, the tests and the commit message had all
+        agreed on the weaker contract, which is why no assertion caught it."""
         scheduler = self.build(heartbeat_seconds=120)
         scheduler.tick()
         self.beat_clock = 300.0
         scheduler.override_now(25)
-        self.assertEqual([1, 2], self.beats)
+        self.assertEqual(
+            [1], self.beats,
+            "override_now() emitted a heartbeat; it is reachable from paho's "
+            "network thread and must never speak for the scheduler thread")
+
+    def test_a_beat_from_a_NON_scheduler_thread_is_refused(self):
+        """Belt to the placement's braces. Moving the call into tick() excludes
+        the two paho-thread callers that exist TODAY; this excludes a future
+        one, because tick() is public and nothing stops another thread calling
+        it. Once run_forever is running it is the only caller entitled to speak
+        for the loop's liveness."""
+        scheduler = self.build(heartbeat_seconds=0)
+        # Stand in for run_forever having claimed the loop on another thread.
+        scheduler._scheduler_ident = threading.get_ident() + 1
+        scheduler.tick()
+        self.assertEqual([], self.beats)
+        # And the guard is not simply "never beat": the real loop still does.
+        scheduler._scheduler_ident = threading.get_ident()
+        scheduler.tick()
+        self.assertEqual([1], self.beats)
+
+    def test_the_guard_is_INERT_before_any_loop_is_running(self):
+        """The permissive half, named so it is not 'tidied' into a hard check.
+        Before run_forever there is no loop to speak for, so a direct tick()
+        may beat — which is what every other test in this class relies on, and
+        what makes the whole class runnable without threads."""
+        scheduler = self.build()
+        self.assertIsNone(scheduler._scheduler_ident)
+        scheduler.tick()
+        self.assertEqual([1], self.beats)
+
+    def test_run_forever_claims_the_ident_on_the_thread_it_runs_on(self):
+        """The stamp has to name the thread actually running the loop, or the
+        guard above rejects the real scheduler and the heartbeat never
+        publishes at all — a silent, total failure of the feature."""
+        scheduler = self.build(heartbeat_seconds=0)
+        seen = []
+
+        def stop_after_one(_seconds):
+            seen.append(scheduler._scheduler_ident)
+            scheduler.stop()
+
+        thread = threading.Thread(
+            target=scheduler.run_forever, kwargs={}, daemon=True)
+        scheduler._sleeper = stop_after_one
+        thread.start()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([thread.ident], seen)
+        self.assertEqual([1], self.beats)
 
     # ------------------------------------------------------------ failure
 
@@ -1642,13 +1709,27 @@ class ModuleDefaultTests(unittest.TestCase):
 
     def test_the_heartbeat_cadence_is_not_derived_from_the_tick(self):
         """They are tuned against different things — the tick against
-        `timedatectl` cost, the heartbeat against recorder rows and the
-        staleness threshold — so a future retune of one must not move the
-        other. Asserting they are independent constants, not that the numbers
-        differ, which they could coincidentally stop doing."""
+        `timedatectl` cost, the heartbeat against Home Assistant's expire_after
+        and recorder rows — so a future retune of one must not move the other.
+        Asserting they are independent constants, not that the numbers differ,
+        which they could coincidentally stop doing.
+
+        THE COMMENT IS STRIPPED BEFORE MATCHING, and that is not tidiness.
+        Review drove five arms through this: it correctly reddens on
+        `HEARTBEAT_SECONDS = 4 * TICK_SECONDS`, and it ALSO reddened on a
+        correct file the moment a clarifying comment on the assignment line
+        mentioned TICK_SECONDS — this repo's source assertions have twice now
+        matched prose rather than code. Stripping the comment closes that.
+
+        WHAT IT STILL CANNOT SEE, stated rather than implied: an indirection
+        (`_HB = 4 * TICK_SECONDS` on one line, `HEARTBEAT_SECONDS = _HB` on the
+        next) walks straight past it. A single-line source check cannot follow a
+        name, and pretending otherwise is worse than the gap. The battery
+        carries the direct-derivation mutant, which is the spelling anyone
+        would actually write."""
         source = inspect.getsource(lsr)
         assignment = [
-            line for line in source.splitlines()
+            line.split("#")[0] for line in source.splitlines()
             if line.startswith("HEARTBEAT_SECONDS")
         ]
         self.assertEqual(1, len(assignment))
@@ -2006,19 +2087,59 @@ class WiringTests(unittest.TestCase):
             "the scheduler is constructed without a heartbeat sink",
         )
 
-    def test_the_heartbeat_is_published_RETAINED(self):
-        """Without retain, Home Assistant sits at `unknown` after every restart
-        and the staleness check has no time to subtract from."""
+    def test_the_heartbeat_is_published_UNRETAINED(self):
+        """The reverse of every sibling publish in mqtt.py, and deliberately.
+
+        Home Assistant's MQTT sensor docs, on the expire_after this entity
+        depends on: "As this could cause the sensor to become available with an
+        expired state, it is not recommended to retain the sensor's state
+        payload at the MQTT broker."
+
+        The first version DID retain it and measured staleness as
+        `now() - last_changed`. Review found that reasoning inverted the
+        feature: last_changed is reset by an availability flap too, so
+        mqtt.service in its Restart=always crash loop would have advanced it
+        every ten seconds while the counter stayed frozen and the lamp stayed
+        dark. A permanent all-clear during a permanent outage."""
         body = self.source.split("def publish_light_heartbeat(")[1].split(
             "\ndef ")[0]
+        # [^\n]* and NOT [^)]*: the payload argument is `str(count)`, whose own
+        # closing paren ends a [^)]* run before it can reach the end of the
+        # call. That spelling failed on a correct file once already.
         self.assertRegex(
-            body,
-            # [^\n]* and NOT [^)]*: the payload argument is `str(count)`, whose
-            # own closing paren ends a [^)]* run before it can reach `retain`.
-            # That spelling failed on a correct file, which is the direction
-            # that reads as a real finding.
-            r"client\.publish\(\s*LIGHT_HEARTBEAT_TOPIC\s*,[^\n]*retain\s*=\s*True",
-        )
+            body, r"client\.publish\(\s*LIGHT_HEARTBEAT_TOPIC\s*,[^\n]*\)")
+        call = [line for line in body.splitlines()
+                if "client.publish(LIGHT_HEARTBEAT_TOPIC" in line]
+        self.assertEqual(1, len(call))
+        self.assertNotIn(
+            "retain", call[0],
+            "the heartbeat is retained; a retained replay makes the sensor "
+            "available with an expired state, which is what expire_after "
+            "exists to prevent")
+
+    def test_the_heartbeat_sensor_declares_expire_after(self):
+        """expire_after IS the staleness detector - without it the entity never
+        goes unavailable and the Home Assistant condition has nothing to read.
+        Asserting the VALUE, not merely the key, because the number is coupled
+        to the Pi's HEARTBEAT_SECONDS and lives in a different repo from the
+        automation that depends on it."""
+        body = self.source.split("def send_discovery_messages(")[1].split(
+            "\ndef ")[0]
+        payload = body.split("publish_config(HEARTBEAT_CONFIG_TOPIC,")[1]
+        self.assertRegex(payload, r'"expire_after"\s*:\s*600\b')
+
+    def test_expire_after_is_a_multiple_of_the_pi_s_heartbeat_cadence(self):
+        """The two numbers are the ends of one contract and they are set in
+        different files. A cadence longer than the expiry would make the sensor
+        flap unavailable on a HEALTHY scheduler - a permanent false alarm - so
+        the relationship, not just each value, is what needs pinning."""
+        body = self.source.split("def send_discovery_messages(")[1].split(
+            "\ndef ")[0]
+        payload = body.split("publish_config(HEARTBEAT_CONFIG_TOPIC,")[1]
+        expire = int(re.search(r'"expire_after"\s*:\s*(\d+)', payload).group(1))
+        self.assertGreaterEqual(
+            expire, 3 * lsr.HEARTBEAT_SECONDS,
+            "expire_after leaves too little margin over the publish cadence")
 
     def test_the_heartbeat_topic_is_NOT_the_source_topic(self):
         """The separation is the design. Republishing the source topic on a
