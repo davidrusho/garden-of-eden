@@ -369,15 +369,56 @@ state = {"n": 0, "at_interrupt": None, "sandbox_before": None,
 # So find the copy and fingerprint it too. Five of the six sandboxed harnesses
 # pass their sandbox root to the runner as the first positional argument;
 # mutate_light_schedule.py takes none and rebinds a module-level ROOT instead.
+_REPO_REAL = os.path.realpath(repo)
+
+
+def _outside_repo(path):
+    real = os.path.realpath(path)
+    return real != _REPO_REAL and not real.startswith(_REPO_REAL + os.sep)
+
+
+# Map each live target to its counterpart inside the harness's copy.
+#
+# EVERY candidate is tried, not just the first string-shaped one. An earlier
+# version took args[0] if it was a str and only otherwise consulted mod.ROOT -
+# which meant a runner called with the LIVE repo as its first argument shadowed
+# a perfectly good sandboxed ROOT, and a runner whose first argument was a
+# suite NAME produced a meaningless relative path that still reported
+# sandbox_found: True. Both are the same defect: a candidate treated as
+# authoritative because of its POSITION rather than because it resolved to
+# anything.
+#
+# Module globals are searched too, because a harness may hold no sandbox ROOT
+# at all and still be fully sandboxed through per-file paths - exactly the case
+# for a harness whose ROOT points at the repo while its TARGET and TEST_FILE
+# point into the copy. Judging that harness unsandboxed reads as a real defect
+# and is not one.
 def sandbox_paths(args):
-    root = None
+    candidates = []
     if args and isinstance(args[0], (str, os.PathLike)):
-        root = str(args[0])
-    elif isinstance(getattr(mod, "ROOT", None), (str, os.PathLike)):
-        root = str(mod.ROOT)
-    if not root or os.path.realpath(root) == os.path.realpath(repo):
-        return None
-    return {p: os.path.join(root, os.path.relpath(p, repo)) for p in targets}
+        candidates.append(str(args[0]))
+    for value in vars(mod).values():
+        if isinstance(value, (str, os.PathLike)):
+            candidates.append(str(value))
+
+    found = {}
+    for live in targets:
+        rel = os.path.relpath(live, repo)
+        for cand in candidates:
+            if not cand or not _outside_repo(cand):
+                continue
+            if os.path.isdir(cand):
+                joined = os.path.join(cand, rel)
+                if os.path.exists(joined):
+                    found[live] = joined
+                    break
+            elif cand.endswith(os.sep + rel) or cand.endswith(rel):
+                if os.path.exists(cand):
+                    found[live] = cand
+                    break
+    # All or nothing: a partial map would compare some targets and silently
+    # ignore the rest, and "some of it is sandboxed" is not the property.
+    return found if len(found) == len(targets) else None
 
 
 def sandbox_fingerprints(args):
@@ -697,9 +738,10 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         T-527.31 review proved this by injecting a fourth pre-mutant suite
         call into one sandboxed harness: the interrupt landed on that control,
         no mutant was ever applied anywhere, and this class stayed GREEN. So
-        each harness's verdict is checked against the control letters the
-        harness itself printed - an independent source for the number the
-        probe guessed.
+        each harness's verdict must also show that a mutation was on disk
+        INSIDE ITS COPY at the moment of the interrupt - see
+        _assert_a_mutation_was_actually_on_disk, which is where that is
+        checked and why it is not done by reading the harness's stdout.
         """
         control = self._drive("mutate_ha_birth_message.py", ["mqtt.py"])
         self.assertNotIn("error", control, control.get("error"))
@@ -713,7 +755,16 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         for harness in sorted(self.SANDBOX_TARGETS):
             with self.subTest(harness=harness):
                 verdict = self._drive(harness, self.SANDBOX_TARGETS[harness])
-                self._assert_a_mutation_was_actually_on_disk(harness, verdict)
+                # ORDER IS LOAD-BEARING, and getting it wrong was a HIGH
+                # finding on the first version of this test. The three
+                # assertions diagnose three different faults, and the first one
+                # to fire is the message a maintainer acts on. `sandbox_found`
+                # fires when the PROBE could not locate the copy; `error` and
+                # `applied` fire when the HARNESS is broken. Put the probe's
+                # own complaint first and a real loss of sandboxing - a mutant
+                # sitting in the working tree, which is what this test exists
+                # to catch - gets reported as "the probe could not find your
+                # sandbox", sending the reader to the wrong file entirely.
                 self.assertNotIn(
                     "error", verdict,
                     f"{harness}: {verdict.get('error')}. If this says main() "
@@ -732,6 +783,10 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                     verdict["restored"],
                     f"{harness} left the working tree changed after an "
                     f"interrupt")
+                # Last, because it is the weakest claim of the three: it says
+                # the measurement was taken on something real, not that the
+                # harness behaved.
+                self._assert_a_mutation_was_actually_on_disk(harness, verdict)
 
     def test_every_harness_declares_a_runner_shape(self):
         """RUNNER_SHAPE is hand-maintained, so it decays - and a missing entry

@@ -347,17 +347,27 @@ class ShaContract(unittest.TestCase):
             finally:
                 os.chmod(path, 0o600)
 
-    def test_None_is_NOT_equal_to_a_real_digest(self):
+    def test_an_unreadable_file_compares_DIFFERENT_from_a_real_snapshot(self):
         """The direction the restore paths depend on. They write whenever
-        `sha(path) != snapshot`, so an unreadable file must compare as
-        DIFFERENT and be rewritten - never be skipped as unchanged."""
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
-            fh.write("hello\n")
-            path = fh.name
-        try:
-            self.assertNotEqual(ms.sha(path), None)
-        finally:
+        `sha(path) != snapshot`, so a file that has become unreadable must
+        compare as DIFFERENT and be rewritten - never be skipped as unchanged.
+
+        The first version of this test asserted `sha(real_file) != None`, which
+        is implied by any test that pins a real digest and exercised none of
+        the stated direction. It is the comparison against a REAL snapshot that
+        matters, because that is the one the restore loops actually make.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "target.py")
+            with open(path, "w") as fh:
+                fh.write("hello\n")
+            snapshot = ms.sha(path)
+            self.assertIsNotNone(snapshot, "CONTROL FAILED - no baseline")
             os.unlink(path)
+            self.assertNotEqual(
+                snapshot, ms.sha(path),
+                "a vanished file compared EQUAL to its snapshot, so a restore "
+                "loop would skip it and leave a mutant in the tree")
 
 
 class PurgePycache(unittest.TestCase):
@@ -369,8 +379,8 @@ class PurgePycache(unittest.TestCase):
     """
 
     def _tree(self, tmp):
-        for rel in ("__pycache__", "pkg/__pycache__", ".git/objects",
-                    ".github/scripts/__pycache__"):
+        for rel in ("__pycache__", "pkg/__pycache__",
+                    ".git/objects/__pycache__", ".github/scripts/__pycache__"):
             os.makedirs(os.path.join(tmp, rel), exist_ok=True)
         marks = {}
         # `.github/scripts/__pycache__` is the one that discriminates, and it
@@ -414,8 +424,23 @@ class PurgePycache(unittest.TestCase):
             self._tree(tmp)
             git_file = os.path.join(tmp, ".git", "objects", "keep")
             open(git_file, "w").close()
+            # THE DISCRIMINATING MARK. Asserting only that `keep` survives is
+            # true for free: purge_pycache never deletes anything but a
+            # directory named __pycache__, so that assertion cannot tell the
+            # name-prune from the old substring form, from no guard at all, or
+            # from a stub. A __pycache__ INSIDE .git is the case where the
+            # guard is the only thing doing any work.
+            git_pycache = os.path.join(tmp, ".git", "objects", "__pycache__",
+                                       "d.pyc")
+            open(git_pycache, "w").close()
             ms.purge_pycache(tmp)
             self.assertTrue(os.path.exists(git_file), ".git content was touched")
+            self.assertTrue(
+                os.path.exists(git_pycache),
+                "a __pycache__ INSIDE .git was purged - the guard is not "
+                "pruning the walk. Note `topdown=False` produces exactly this, "
+                "because the prune then happens after os.walk has already "
+                "yielded the subtree.")
 
     def test_a_tree_with_no_pycache_is_not_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:

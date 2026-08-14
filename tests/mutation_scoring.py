@@ -70,12 +70,19 @@ def purge_pycache(repo):
     """
     for root, dirs, _ in os.walk(repo):
         # Prune rather than `continue`, and match the DIRECTORY NAME rather
-        # than testing `".git" in root`. The substring form matched any path
-        # containing `.git` anywhere - a checkout under a directory with
-        # `.git` in its name, or any `.github/` tree - while still descending
-        # into `.git` itself, so it was neither the skip nor the guard it read
-        # as. Harmless in effect (skipping a `__pycache__` deletion is safe),
-        # but a check should be the check it says it is.
+        # than testing `".git" in root`.
+        #
+        # Being precise about what the substring form did, because the first
+        # version of this comment overstated it: it WAS a working .git guard.
+        # `os.walk` descended into .git, but every root beneath .git also
+        # contains the substring, so nothing under it was ever deleted. The
+        # two real defects were that it was OVER-BROAD - it also skipped any
+        # `.github/` tree, leaving stale bytecode there - and that it went
+        # entirely INERT for a checkout whose ancestor path contains `.git`,
+        # which is the dangerous one: a purge that silently does nothing is a
+        # stale-bytecode condition, and stale bytecode makes a battery's
+        # verdicts belong to the previous mutant. The wasted traversal is a
+        # performance cost, not a correctness one.
         dirs[:] = [d for d in dirs if d != ".git"]
         for name in list(dirs):
             if name == "__pycache__":
