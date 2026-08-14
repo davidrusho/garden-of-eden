@@ -12,10 +12,30 @@ tests/mutate_camera_quality.py and tests/mutate_light_logging.py, which were
 still reporting 29/29, 17/17 and 14/14 on a rule they did not implement.
 
 Three times in one repo is a copy-paste problem, not a thinking problem. The
-rule now has one implementation, the harnesses import it, and a fix applied here
-cannot be half-applied across the fleet. tests/test_mutation_scoring.py drives
-this file directly, on inputs written for it, rather than restating the rule -
-a rule copied into its own test scores itself.
+rule now has one implementation and the harnesses that import it cannot get a
+half-applied fix. tests/test_mutation_scoring.py drives this file directly, on
+inputs written for it, rather than restating the rule - a rule copied into its
+own test scores itself.
+
+THE CONSOLIDATION IS NOT FINISHED, and this docstring used to claim otherwise
+("a fix applied here cannot be half-applied across the fleet"). Only THREE
+harnesses import this module - mutate_camera_quality.py, mutate_light_logging.py
+and mutate_retired_entities.py. Five still carry their own copy:
+
+    mutate_connack_refusal.py   ran_count + score_run + literal verdict strings
+    mutate_light_scheduler.py   ran_count
+    mutate_light_schedule.py    ran_count
+    mutate_payload_scanner.py   ran_count + named_failures
+    mutate_health_log.py        first-match `re.search`, a different rule again
+    mutate_netwatch.py          first-match `re.search`
+
+T-527.36 made that concrete rather than theoretical: `ran_count` was anchored
+here (see below) and those copies are still unanchored, so the divergence the
+sentence promised was impossible now exists. Whether any of them is exposed to
+a live forgery was NOT established - the two `Ran 175 tests` strings in
+tests/test_connack_refusal.py sit in a docstring body and a standalone comment,
+neither of which unittest prints. Do not read the absence of a confirmed
+exploit as coverage.
 
 WHAT THE RULE IS, and why each half exists:
 
@@ -125,8 +145,36 @@ def ran_count(out):
 
     Summed rather than taken from one match because a harness may run several
     suites per verdict and concatenate their output.
+
+    ANCHORED AT THE START OF A LINE, for the same reason `named_failures` is
+    (T-527.36). unittest prints its summary at column 0 and nothing else does,
+    so an unanchored match counts TEXT ABOUT a summary as a summary: a
+    docstring quoting "Ran 1 test", or - the shape this repo produces
+    routinely - a subprocess's captured output pasted into an assertion
+    message. Both only appear when a run goes RED, so the inflation lands
+    exclusively on the runs a battery is trying to score, and `score_run` then
+    reads the moved count as an import death and returns NO VERDICT for a
+    genuine kill. A battery over this very module hit it: at HEAD it aborts at
+    its own CONTROL B, scoring a deliberately-broken scorer NO VERDICT (28 ran
+    against a 26 clean baseline) instead of KILLED.
+
+    BE PRECISE ABOUT THE SCALE, because the first version of this paragraph
+    was not. unittest prints the docstring of each test that FAILED, so the
+    forgery is emitted PER FAILING TEST, not per red run - which means the
+    inflation depends on WHICH tests a mutant reddens, not merely that one
+    did. Measured over the 16 mutants in tests/mutate_mutation_scoring.py,
+    anchored against unanchored: 2 changed verdict (KILLED -> NO VERDICT),
+    14 were identical. Mutant 3's red output carries no forgery at all. The
+    mechanism and the failure direction below are general; "every red run"
+    was a one-instance measurement written up as a property.
+
+    Note the failure direction, because it decides how urgent this is: the
+    inflation cannot manufacture a KILL, only suppress one. It reads as "no
+    information" rather than as a false pass - but a battery that reports no
+    information about every mutant is indistinguishable from one whose suite
+    is broken, which is how it goes unread.
     """
-    return sum(int(n) for n in re.findall(r"Ran (\d+) tests?", out))
+    return sum(int(n) for n in re.findall(r"^Ran (\d+) tests?", out, re.M))
 
 
 def named_failures(out):

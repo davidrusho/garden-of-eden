@@ -546,7 +546,13 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                  # mqtt.py structurally cannot narrow the rule that reads
                  # mqtt.py, which is how that scanner shipped with two
                  # confirmed forgery escapes under a green control.
-                 "mutate_payload_scanner.py"}
+                 "mutate_payload_scanner.py",
+                 # T-527.36. Sandboxed from the start, and not as a default:
+                 # its target is tests/mutation_scoring.py, which three other
+                 # harnesses import at their own module scope. Mutating it in
+                 # the working tree would hand a concurrent session verdicts
+                 # from a deliberately broken scorer, with nothing to say so.
+                 "mutate_mutation_scoring.py"}
 
     # Harnesses that also DELETE a file rather than only editing one. The
     # restore path for a deletion is different code (move to a stash, copy
@@ -584,6 +590,12 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         "mutate_light_schedule.py": ["light_schedule.py",
                                      "tests/test_light_schedule.py"],
         "mutate_payload_scanner.py": ["tests/test_connack_refusal.py"],
+        # Only the module, not tests/test_mutation_scoring.py: the battery
+        # mutates the RULE and leaves the suite that drives it alone. Listing
+        # the suite too would make `applied: false` true for a file the
+        # harness never intended to write, which is the failure the note on
+        # mutate_upgrade_policy.py above describes.
+        "mutate_mutation_scoring.py": ["tests/mutation_scoring.py"],
     }
 
     # What each harness's suite runner returns as its FIRST element, which the
@@ -611,6 +623,7 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         "mutate_light_scheduler.py": "bool",
         "mutate_light_schedule.py": "bool",
         "mutate_payload_scanner.py": "bool",
+        "mutate_mutation_scoring.py": "bool",
         "mutate_health_log.py": "rc",
         "mutate_upgrade_policy.py": "rc",
         "mutate_netwatch.py": "rc",

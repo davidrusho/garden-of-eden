@@ -35,6 +35,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests import mutation_scoring as ms  # noqa: E402
 
 
+def _quoted(out):
+    """Indent captured output before pasting it into an assertion message.
+
+    A message is only ever printed when the run is RED, and it is printed into
+    the very stream a mutation harness parses. Pasted flush-left, a captured
+    summary line ("Ran 3 tests in 0.001s") is indistinguishable from this
+    suite's own, so it is added to `ran_count` and the harness reads the moved
+    count as an import death - turning every genuine kill into NO VERDICT.
+    Indenting is enough, because both parsers anchor at column 0, and it keeps
+    the evidence intact where a redaction would not.
+
+    The same habit is what `test_an_EMBEDDED_error_line_is_not_a_named_case`
+    was written for on the FAIL:/ERROR: side.
+    """
+    return "\n".join("    " + line for line in out.splitlines())
+
+
 class _UnittestOutput:
     """Runs real unittest over generated modules and returns (ok, output).
 
@@ -110,7 +127,8 @@ class RealUnittestShapes(unittest.TestCase):
         fail_ok, fail = _UnittestOutput.run(test_x=_ONE_FAILURE_SRC)
         dead_ok, dead = _UnittestOutput.run(test_x=_IMPORT_DEATH_SRC)
 
-        self.assertTrue(green_ok, f"CONTROL FAILED - green case is red:\n{green}")
+        self.assertTrue(green_ok,
+                        f"CONTROL FAILED - green case is red:\n{_quoted(green)}")
         self.assertFalse(fail_ok, "CONTROL FAILED - failing case is green")
         self.assertFalse(dead_ok, "CONTROL FAILED - import-death case is green")
 
@@ -121,7 +139,7 @@ class RealUnittestShapes(unittest.TestCase):
         self.assertEqual(
             1, ms.ran_count(dead),
             f"the import-death case must COLLAPSE the collected count - that "
-            f"collapse is the only tell for this shape. Got:\n{dead}")
+            f"collapse is the only tell for this shape. Got:\n{_quoted(dead)}")
 
     def test_an_import_death_is_reported_as_a_NAMED_error(self):
         """The premise the ran-count tell exists for, asserted rather than
@@ -192,6 +210,22 @@ class ScoreRunVerdicts(unittest.TestCase):
         self.assertEqual(ms.KILLED, ms.score_run(ok, out)[0])
         self.assertEqual(ms.NO_VERDICT, ms.score_run(ok, out, clean_ran=3)[0])
 
+    def test_a_clean_ran_of_ZERO_still_arms_the_tell(self):
+        """`is not None`, never truthiness - and only a baseline of 0 can
+        tell the two spellings apart.
+
+        A mutant swapping `if clean_ran is not None` for `if clean_ran`
+        SURVIVED (found by review, 2026-08-14), because every case here
+        passed either None or 3. Zero is a real baseline: a suite whose
+        collection is already broken on the clean tree reports `Ran 0 tests`,
+        and that is exactly when a harness most needs the tell armed rather
+        than silently disabled. Under the mutant this returns KILLED, which
+        credits the suite for a red run that collected nothing.
+        """
+        out = ("ERROR: test_x (unittest.loader._FailedTest.test_x)\n"
+               "Ran 1 test in 0.000s\n\nFAILED (errors=1)\n")
+        self.assertEqual(ms.NO_VERDICT, ms.score_run(False, out, clean_ran=0)[0])
+
     def test_a_count_that_moves_UPWARD_is_also_NO_VERDICT(self):
         """Not symmetry for its own sake - a mutant that REINTRODUCES deleted
         code can add collected tests, and tests/mutate_retired_entities.py has
@@ -218,7 +252,14 @@ class RanCountParsing(unittest.TestCase):
         """
         ok_x, out_x = _UnittestOutput.run(test_x=_GREEN_SRC)
         ok_y, out_y = _UnittestOutput.run(test_y=_GREEN_SRC)
-        self.assertTrue(ok_x and ok_y, out_x + out_y)
+        # _quoted() here too, and this is the site that matters most: it is a
+        # CONTROL, so it only ever speaks when the generator itself has broken.
+        # Pasted flush-left it forged three summary lines (+7 to the count),
+        # which moved the battery's ran-count and turned a CONTROL FAILED into
+        # a NO VERDICT - "no information" printed by the one assertion whose
+        # whole job is to shout. Found by review; the other two sites were
+        # fixed and this one was missed.
+        self.assertTrue(ok_x and ok_y, _quoted(out_x + out_y))
         combined = f"--- x ---\n{out_x}\n--- y ---\n{out_y}"
         self.assertEqual(
             2, combined.count("Ran 3 tests"),
@@ -237,14 +278,99 @@ class RanCountParsing(unittest.TestCase):
     def test_no_summary_line_at_all_reads_zero(self):
         self.assertEqual(0, ms.ran_count("segmentation fault\n"))
 
+    def test_an_EMBEDDED_summary_line_is_not_counted(self):
+        """The ran-count sibling of the FAIL:/ERROR: rule below, and it was
+        missing until T-527.36.
+
+        Two forgeries, and they arrive by different routes. PROSE ABOUT a
+        summary is the first: this class's own singular-form case has a
+        docstring quoting both spellings, unittest prints a docstring in the
+        failure header, and that added 2 to the count of every red run of this
+        suite - which made a battery over `mutation_scoring.py` report NO
+        VERDICT for all fourteen of its mutants. CAPTURED OUTPUT pasted into
+        an assertion message is the second, and it is the one this repo
+        produces habitually.
+
+        Both are only ever emitted on a RED run, so the inflation lands
+        exclusively on the runs being scored. The failure direction is
+        suppression rather than a false kill - which is the quieter half of
+        why it survived: `score_run` answers "no information", and no
+        information is what a reader stops reading.
+
+        The fixture must contain a summary that is REAL-looking but indented,
+        or it cannot exhibit the defect - the unanchored and anchored forms
+        agree on everything else.
+        """
+        out = ("FAIL: test_a (genpkg.test_x.T.test_a)\n"
+               "unittest writes 'Ran 1 test', not 'Ran 1 tests'\n"
+               "AssertionError: the case must collapse the count. Got:\n"
+               "    Ran 3 tests in 0.001s\n"
+               "\n"
+               "    OK\n"
+               "Ran 12 tests in 0.400s\n"
+               "\n"
+               "FAILED (failures=1)\n")
+        self.assertEqual(
+            12, ms.ran_count(out),
+            "only the flush-left summary is this run's own; the quoted "
+            "spellings and the indented capture are text ABOUT a run")
+
 
 class NamedFailureParsing(unittest.TestCase):
 
     def test_it_takes_FAIL_and_ERROR_lines_and_nothing_else(self):
-        _, out = _UnittestOutput.run(test_x=_ONE_FAILURE_SRC)
-        fails = ms.named_failures(out)
+        """BOTH prefixes, because the name promises both.
+
+        Until T-527.36 this ran only `_ONE_FAILURE_SRC`, which emits a FAIL:
+        and no ERROR: at all - so the ERROR half of its own name was true for
+        free, and a mutant dropping "ERROR:" from the prefix tuple survived
+        the case named for it. The battery caught it the loud way: the mutant
+        died, but under three OTHER tests, which is what a
+        `killed, but NOT by the test named for it` line is for.
+        """
+        _, failed = _UnittestOutput.run(test_x=_ONE_FAILURE_SRC)
+        fails = ms.named_failures(failed)
         self.assertEqual(1, len(fails), fails)
         self.assertTrue(fails[0].startswith("FAIL: test_a"), fails)
+
+        # An import death is this repo's real source of an ERROR: line -
+        # unittest reports the unimportable module through _FailedTest.
+        _, dead = _UnittestOutput.run(test_x=_IMPORT_DEATH_SRC)
+        errors = ms.named_failures(dead)
+        self.assertEqual(1, len(errors), errors)
+        self.assertTrue(
+            errors[0].startswith("ERROR: "),
+            f"the ERROR: prefix is not being collected, so half of this "
+            f"test's name is unpinned. Got: {errors}")
+
+    def test_it_preserves_the_ORDER_unittest_printed(self):
+        """The docstring promises "in order" and nothing pinned it: the only
+        ordering assertion ran on a ONE-element list, where every ordering is
+        the same ordering. Mutants wrapping the return in `sorted()` and in
+        `reversed()` both SURVIVED (found by review, 2026-08-14).
+
+        Order is not cosmetic here. A harness prints the first few named
+        cases as the evidence for a kill, and attribution - "was this mutant
+        killed by the test named for it?" - is read off that list. Re-sorted
+        alphabetically, the case a reader sees first is the one whose name
+        sorts first, not the one that failed first.
+
+        The fixture must therefore be in an order that is NOT its sorted
+        order, or the two implementations agree and this is vacuous again.
+        """
+        out = ("FAIL: test_zulu (genpkg.test_x.T.test_zulu)\n"
+               "AssertionError: 1 != 0\n"
+               "ERROR: test_alpha (genpkg.test_x.T.test_alpha)\n"
+               "ValueError: boom\n"
+               "FAIL: test_mike (genpkg.test_x.T.test_mike)\n")
+        got = ms.named_failures(out)
+        self.assertNotEqual(sorted(got), got,
+                            "CONTROL FAILED - the fixture is already in "
+                            "sorted order, so a sorting mutant is invisible")
+        self.assertEqual(
+            ["FAIL: test_zulu (genpkg.test_x.T.test_zulu)",
+             "ERROR: test_alpha (genpkg.test_x.T.test_alpha)",
+             "FAIL: test_mike (genpkg.test_x.T.test_mike)"], got)
 
     def test_an_EMBEDDED_error_line_is_not_a_named_case(self):
         """The lines must be matched at the START of the line, not anywhere in
@@ -461,6 +587,70 @@ class VerdictFormatting(unittest.TestCase):
         lines = {ms.format_verdict(v, [])
                  for v in (ms.SURVIVED, ms.KILLED, ms.NO_VERDICT)}
         self.assertEqual(3, len(lines), lines)
+
+    def test_the_DEFAULT_indent_is_the_two_spaces_the_grep_recipe_anchors_on(self):
+        """This module's own docstring prescribes
+        `grep -E "^  killed \\( *0 failing"` for finding a kill that named
+        nothing. That recipe anchors on the two-space default, and nothing
+        pinned it - a mutant changing `indent="  "` to `indent=""` SURVIVED
+        the suite (found by review, 2026-08-14).
+
+        The failure is silent in the worst direction: the recipe stops
+        matching, so a search for the one signature that exposes a mutant
+        which tested nothing returns zero hits and reads as "there are none".
+        """
+        for verdict in (ms.SURVIVED, ms.KILLED, ms.NO_VERDICT):
+            with self.subTest(verdict=verdict):
+                line = ms.format_verdict(verdict, [])
+                self.assertTrue(
+                    line.startswith("  ") and not line.startswith("   "),
+                    f"the default indent is no longer exactly two spaces, so "
+                    f"the documented grep recipe cannot match: {line!r}")
+        self.assertRegex(ms.format_verdict(ms.KILLED, []),
+                         r"^  killed \( *0 failing")
+
+    def test_a_NO_VERDICT_also_reports_its_named_case_count(self):
+        """The count is what separates the two tells that produce NO VERDICT.
+
+        Zero named cases means the module never collected anything; a
+        non-zero count with a moved ran-count means unittest wrapped an
+        unimportable module in `_FailedTest` and named it. Same verdict, two
+        different reasons to go looking, and the count is the only thing in
+        the line that distinguishes them. A mutant hardcoding it to 0
+        SURVIVED (found by review, 2026-08-14).
+        """
+        self.assertIn("2 named case(s)",
+                      ms.format_verdict(ms.NO_VERDICT, ["ERROR: a", "ERROR: b"]))
+        self.assertIn("0 named case(s)",
+                      ms.format_verdict(ms.NO_VERDICT, []))
+
+
+class QuotedHelper(unittest.TestCase):
+    """`_quoted` is this file's own guard against forging a summary line.
+
+    It had no test at all until review found it (2026-08-14), and it has no
+    mutation coverage by construction - the battery's SANDBOX_TARGETS reach
+    `tests/mutation_scoring.py` only, so a regression to `return out` would
+    re-create the exact defect this helper exists to remove and nothing in
+    the repo would report it.
+    """
+
+    def test_it_defeats_ran_count_on_a_real_capture(self):
+        _, dead = _UnittestOutput.run(test_x=_IMPORT_DEATH_SRC)
+        self.assertEqual(
+            1, ms.ran_count(dead),
+            "CONTROL FAILED - the raw capture carries no summary line, so "
+            "this cannot show that quoting removes one")
+        self.assertEqual(
+            0, ms.ran_count(_quoted(dead)),
+            "a quoted capture still forges a summary line; anything pasting "
+            "it into an assertion message will move a battery's ran-count")
+
+    def test_every_line_is_indented_and_nothing_is_dropped(self):
+        raw = "alpha\nbeta\n\ngamma"
+        quoted = _quoted(raw)
+        self.assertEqual(["    alpha", "    beta", "    ", "    gamma"],
+                         quoted.splitlines())
 
 
 if __name__ == "__main__":
