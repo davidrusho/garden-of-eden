@@ -69,11 +69,18 @@ def purge_pycache(repo):
     being READ, which is why this exists as well as the env var.
     """
     for root, dirs, _ in os.walk(repo):
-        if ".git" in root:
-            continue
+        # Prune rather than `continue`, and match the DIRECTORY NAME rather
+        # than testing `".git" in root`. The substring form matched any path
+        # containing `.git` anywhere - a checkout under a directory with
+        # `.git` in its name, or any `.github/` tree - while still descending
+        # into `.git` itself, so it was neither the skip nor the guard it read
+        # as. Harmless in effect (skipping a `__pycache__` deletion is safe),
+        # but a check should be the check it says it is.
+        dirs[:] = [d for d in dirs if d != ".git"]
         for name in list(dirs):
             if name == "__pycache__":
                 shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+                dirs.remove(name)
 
 
 def sha(path):
@@ -139,13 +146,19 @@ def score_run(ok, out, clean_ran=None):
 
 
 def format_verdict(verdict, fails, indent="  "):
-    """The one-line report for a scored mutant.
+    r"""The one-line report for a scored mutant.
 
     The named-case COUNT is printed for every kill, because it is the only tell
     for a mutant that died broadly: a real kill names one or two cases, and
     `killed (0 failing case(s))` is what a module that stopped importing looks
-    like. Note that string is not a safe grep pattern on its own - it is a
-    substring of every count ending in zero - so match the whole field.
+    like.
+
+    GREP FOR THE WHOLE LINE, NOT FOR THE FRAGMENT. The full line is safe - it
+    is not a substring of `killed (10 failing case(s))` or any other count. The
+    BARE fragment `0 failing case(s)` is the unsafe one, because it matches
+    every count ending in zero, and reaching for it is how a clean run gets
+    read as having three kills that tested nothing. Either match the whole
+    field (`grep -E "^  killed \( *0 failing"`) or read the column.
     """
     if verdict == SURVIVED:
         return f"{indent}SURVIVED - no test noticed"

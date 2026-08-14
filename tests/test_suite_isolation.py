@@ -353,7 +353,38 @@ if not hasattr(mod, runner):
                  f"created one and let the harness run its real battery"}))
     raise SystemExit(0)
 before = {p: fingerprint(p) for p in targets}
-state = {"n": 0, "at_interrupt": None}
+state = {"n": 0, "at_interrupt": None, "sandbox_before": None,
+         "sandbox_at_interrupt": None}
+
+# THE SANDBOX SIDE OF THE MEASUREMENT (T-527.31 review).
+#
+# `applied: false` against the live tree is also what a probe that never
+# reached a mutation would produce, so on its own it cannot tell a real
+# sandbox from a dead probe. The fix is not to work out whether the
+# interrupted call was a CONTROL or a MUTANT - that is not observable from
+# out here, and it does not matter: "this harness writes its mutations into a
+# copy rather than into the working tree" is demonstrated just as well by a
+# control's mutation as by a mutant's.
+#
+# So find the copy and fingerprint it too. Five of the six sandboxed harnesses
+# pass their sandbox root to the runner as the first positional argument;
+# mutate_light_schedule.py takes none and rebinds a module-level ROOT instead.
+def sandbox_paths(args):
+    root = None
+    if args and isinstance(args[0], (str, os.PathLike)):
+        root = str(args[0])
+    elif isinstance(getattr(mod, "ROOT", None), (str, os.PathLike)):
+        root = str(mod.ROOT)
+    if not root or os.path.realpath(root) == os.path.realpath(repo):
+        return None
+    return {p: os.path.join(root, os.path.relpath(p, repo)) for p in targets}
+
+
+def sandbox_fingerprints(args):
+    paths = sandbox_paths(args)
+    if paths is None:
+        return None
+    return {live: fingerprint(sand) for live, sand in paths.items()}
 
 # The controls' canned output MUST LOOK LIKE unittest, not like a sentinel.
 # This double used to return the bare string "control", which was fine until
@@ -389,6 +420,10 @@ def fake(*a, **k):
     # must look RED), and call 3 — where the harness has one — is control C (an
     # import-time death, must classify as NO VERDICT). Interrupting before those
     # pass would abort the harness through its own guard rather than mid-mutant.
+    if state["n"] == 1:
+        # Call 1 is control A, which every harness runs on a PRISTINE tree -
+        # so this is the sandbox baseline, taken before anything is mutated.
+        state["sandbox_before"] = sandbox_fingerprints(a)
     if state["n"] <= n_controls:
         if state["n"] == 1:
             return _GREEN_OK, _GREEN
@@ -402,6 +437,7 @@ def fake(*a, **k):
         if not any(v == "<missing>" for v in now.values()):
             return False, "keep going until a file is gone"
     state["at_interrupt"] = now
+    state["sandbox_at_interrupt"] = sandbox_fingerprints(a)
     raise KeyboardInterrupt("simulated interrupt with a mutant applied")
 
 setattr(mod, runner, fake)
@@ -419,6 +455,15 @@ except KeyboardInterrupt:
             "deleted": any(v == "<missing>"
                            for v in state["at_interrupt"].values()),
             "restored": all(fingerprint(p) == before[p] for p in targets),
+            # True only when a mutation was demonstrably on disk INSIDE the
+            # copy at the moment of the interrupt. That is the sandbox
+            # property measured from the other side, and it is what stops
+            # `applied: false` being satisfied by a probe that mutated nothing
+            # anywhere.
+            "sandbox_mutated": bool(
+                state["sandbox_before"] and state["sandbox_at_interrupt"]
+                and state["sandbox_before"] != state["sandbox_at_interrupt"]),
+            "sandbox_found": state["sandbox_at_interrupt"] is not None,
         }
 print("VERDICT " + json.dumps(verdict))
 """
@@ -480,9 +525,13 @@ class MutationHarnessRestoreTests(unittest.TestCase):
     SANDBOX_TARGETS = {
         "mutate_health_log.py": ["bin/gardyn-health-log.py",
                                  "tests/test_health_log.py"],
+        # NOT tests/fixtures/gardyn-upgrade-policy.json, though the harness
+        # names it: CONFIG_MUTANTS mutate a deepcopy of the PARSED fixture in
+        # memory, and the file itself is only ever read. Listing a path the
+        # harness never intends to write makes `applied: false` true for a
+        # reason that has nothing to do with sandboxing.
         "mutate_upgrade_policy.py": ["bin/gardyn-check-upgrade-policy.py",
-                                     "tests/test_upgrade_policy.py",
-                                     "tests/fixtures/gardyn-upgrade-policy.json"],
+                                     "tests/test_upgrade_policy.py"],
         "mutate_netwatch.py": ["bin/gardyn-netwatch.py",
                                "bin/install-systemd-units.sh",
                                "services/etc/systemd/system/mqtt.service",
@@ -543,6 +592,45 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                          f"probe produced no verdict:\n{proc.stdout[-3000:]}")
         return json.loads(lines[0][len("VERDICT "):])
 
+    def _assert_a_mutation_was_actually_on_disk(self, harness, verdict):
+        """The positive control for a SANDBOXED harness's verdict.
+
+        `applied: false` against the working tree is the result we want - and
+        it is also exactly what a probe that mutated nothing anywhere would
+        produce. A dead probe and a real sandbox are otherwise byte-identical,
+        which the T-527.31 review demonstrated by injecting a fourth
+        pre-mutant suite call into one harness: the interrupt landed on that
+        control, nothing was ever mutated, and this class stayed GREEN.
+
+        The fix is NOT to work out whether the interrupted call was a control
+        or a mutant. That is not observable from outside the harness, and it
+        does not matter: "this harness writes its mutations into a copy rather
+        than into the working tree" is demonstrated just as well by a
+        control's mutation as by a mutant's. What matters is that a mutation
+        was on disk SOMEWHERE, and that somewhere was not here.
+
+        Deliberately NOT built on the harness's stdout. Counting the
+        `CONTROL <letter>` lines it prints was the first attempt and it is
+        wrong: mutate_health_log.py and mutate_upgrade_policy.py announce
+        their controls only when one FAILS, so a healthy run reports zero
+        letters and the check fires falsely on two of the six.
+        """
+        self.assertTrue(
+            verdict.get("sandbox_found"),
+            f"{harness}: the probe could not locate this harness's sandbox, so "
+            f"it cannot tell a real copy from a probe that mutated nothing. It "
+            f"looks for the runner's first positional argument and then for a "
+            f"module-level ROOT; this harness exposes neither.")
+        self.assertTrue(
+            verdict.get("sandbox_mutated"),
+            f"{harness}: no mutation was on disk ANYWHERE when the battery was "
+            f"interrupted - not in the working tree and not in the copy. So "
+            f"`applied: {verdict.get('applied')}` says nothing about "
+            f"sandboxing; the probe never reached a mutation at all. Suspect "
+            f"the probe's n_controls inference "
+            f"(hasattr(mod, 'CONTROL_C')) against this harness's real control "
+            f"count.")
+
     def test_an_interrupted_battery_leaves_no_mutant_behind(self):
         for harness, targets in sorted(self.IN_PLACE.items()):
             with self.subTest(harness=harness):
@@ -594,11 +682,24 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         sandbox property itself: the harness got as far as running a suite for
         a mutant, and at that moment nothing in the working tree had changed.
 
-        THE CONTROL IS THE HALF THAT MATTERS. `applied: false` is also what a
-        probe that never reached a mutant would produce, so an IN_PLACE
-        harness is driven the same way and must report `applied: true`. If it
-        does not, this whole test is measuring nothing and says so rather than
-        passing.
+        THE CONTROLS ARE THE HALF THAT MATTERS, and there are two of them
+        because one is not enough. `applied: false` is also what a probe that
+        never reached a mutant would produce.
+
+        The first control is global: an IN_PLACE harness driven the same way
+        must report `applied: true`, proving the probe can put a mutant on
+        disk at all.
+
+        The second is PER HARNESS, and the first does not imply it. Whether
+        the probe reaches a mutant depends on `n_controls`, which the probe
+        INFERS from `hasattr(mod, "CONTROL_C")` - a per-harness property. One
+        harness passing establishes nothing about the other six. The
+        T-527.31 review proved this by injecting a fourth pre-mutant suite
+        call into one sandboxed harness: the interrupt landed on that control,
+        no mutant was ever applied anywhere, and this class stayed GREEN. So
+        each harness's verdict is checked against the control letters the
+        harness itself printed - an independent source for the number the
+        probe guessed.
         """
         control = self._drive("mutate_ha_birth_message.py", ["mqtt.py"])
         self.assertNotIn("error", control, control.get("error"))
@@ -612,6 +713,7 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         for harness in sorted(self.SANDBOX_TARGETS):
             with self.subTest(harness=harness):
                 verdict = self._drive(harness, self.SANDBOX_TARGETS[harness])
+                self._assert_a_mutation_was_actually_on_disk(harness, verdict)
                 self.assertNotIn(
                     "error", verdict,
                     f"{harness}: {verdict.get('error')}. If this says main() "

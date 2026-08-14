@@ -373,7 +373,8 @@ def _run():
 
     # The byte-identity assertion. Read this line before believing any score
     # above it - a run that exited is not a run whose cleanup ran.
-    drifted = [p for p in _ORIGINALS if sha(p) != shas[p]]
+    drifted = [p for p in _ORIGINALS
+               if shas[p] is None or sha(p) != shas[p]]
     if not drifted:
         print("\nTREE RESTORED: mqtt.py and config.py are byte-identical to "
               "their pre-run state.")

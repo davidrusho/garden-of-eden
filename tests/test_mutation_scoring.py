@@ -300,6 +300,129 @@ class CompileGate(unittest.TestCase):
                             "<probe>"))
 
 
+class ShaContract(unittest.TestCase):
+    """`sha()` returning None instead of raising is what makes the harnesses'
+    per-file restore independent, and nothing pinned it until the T-527.32
+    review ran a mutant that made it raise and watched the mutant SURVIVE.
+
+    The claim in `mutate_camera_quality.py` and `mutate_light_logging.py` is
+    explicit: *"Each file independently: one loop abandons the rest the moment
+    one raises, and it raises out of a `finally`, so the second file stays
+    mutated with nothing reporting it."* The `try` in those loops wraps only
+    the WRITE - the `sha(path)` read above it is unguarded, so the contract has
+    to hold here or that comment is false.
+    """
+
+    def test_it_hashes_a_real_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("hello\n")
+            path = fh.name
+        try:
+            # The real sha256 of b"hello\n", not a self-consistent re-derivation
+            # through the same function - which would pass with any hash.
+            self.assertEqual(
+                "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+                ms.sha(path))
+        finally:
+            os.unlink(path)
+
+    def test_a_MISSING_file_returns_None_rather_than_raising(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(ms.sha(os.path.join(tmp, "not-there")))
+
+    def test_an_UNREADABLE_file_returns_None_rather_than_raising(self):
+        """The OSError branch that is not a missing file. A restore loop reads
+        this before its own try/except, so raising here would abandon every
+        remaining file in the loop."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "locked.txt")
+            with open(path, "w") as fh:
+                fh.write("x")
+            os.chmod(path, 0o000)
+            try:
+                if os.access(path, os.R_OK):
+                    self.skipTest("running as a user that ignores file modes "
+                                  "(root), so this OSError cannot be produced")
+                self.assertIsNone(ms.sha(path))
+            finally:
+                os.chmod(path, 0o600)
+
+    def test_None_is_NOT_equal_to_a_real_digest(self):
+        """The direction the restore paths depend on. They write whenever
+        `sha(path) != snapshot`, so an unreadable file must compare as
+        DIFFERENT and be rewritten - never be skipped as unchanged."""
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("hello\n")
+            path = fh.name
+        try:
+            self.assertNotEqual(ms.sha(path), None)
+        finally:
+            os.unlink(path)
+
+
+class PurgePycache(unittest.TestCase):
+    """`purge_pycache` was exported and untested; a no-op version survived the
+    T-527.32 review's battery. Its own docstring argues it is not redundant
+    with PYTHONDONTWRITEBYTECODE (*"neither stops a stale one being READ"*), so
+    a silently inert purge would make every battery's verdicts suspect with no
+    signal at all.
+    """
+
+    def _tree(self, tmp):
+        for rel in ("__pycache__", "pkg/__pycache__", ".git/objects",
+                    ".github/scripts/__pycache__"):
+            os.makedirs(os.path.join(tmp, rel), exist_ok=True)
+        marks = {}
+        # `.github/scripts/__pycache__` is the one that discriminates, and it
+        # is here deliberately. A stale .pyc under `.github` is as poisonous as
+        # any other, and the OLD substring test (`if ".git" in root`) skipped
+        # that whole subtree - so it left this one behind. Without it every
+        # assertion in this class passes under both implementations, because
+        # the substring form only ever skips MORE and skipping never deletes
+        # anything. A fixture that cannot exhibit the defect is not coverage of
+        # it, however carefully the assertion is written.
+        for rel in ("__pycache__/a.pyc", "pkg/__pycache__/b.pyc",
+                    ".github/scripts/__pycache__/c.pyc"):
+            marks[rel] = os.path.join(tmp, rel)
+            open(marks[rel], "w").close()
+        return marks
+
+    def test_it_removes_every_pycache_it_should(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marks = self._tree(tmp)
+            # Control first: if these are not there, "removed" proves nothing.
+            for rel, path in marks.items():
+                self.assertTrue(os.path.exists(path),
+                                f"CONTROL FAILED - fixture never created {rel}")
+            ms.purge_pycache(tmp)
+            for rel, path in marks.items():
+                self.assertFalse(os.path.exists(path),
+                                 f"{rel} survived the purge")
+
+    def test_it_leaves_the_git_directory_alone(self):
+        """`.git` is skipped by DIRECTORY NAME, not by substring.
+
+        The two forms differ only on a path that CONTAINS `.git` without being
+        it - `.github/` being the one that actually occurs - and they differ
+        only in the purge direction, never in the delete-something-it-should-
+        not direction. So the discriminating assertion is in
+        test_it_removes_every_pycache_it_should, which requires the
+        `.github/scripts/__pycache__` mark to go. This test covers the other
+        half: real `.git` content is left alone.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._tree(tmp)
+            git_file = os.path.join(tmp, ".git", "objects", "keep")
+            open(git_file, "w").close()
+            ms.purge_pycache(tmp)
+            self.assertTrue(os.path.exists(git_file), ".git content was touched")
+
+    def test_a_tree_with_no_pycache_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "pkg"))
+            ms.purge_pycache(tmp)  # must not raise
+
+
 class VerdictFormatting(unittest.TestCase):
 
     def test_a_kill_reports_its_named_case_COUNT(self):

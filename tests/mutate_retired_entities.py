@@ -476,7 +476,7 @@ def _run():
 
     # The byte-identity assertion. Read this line before believing any score
     # above it - a run that exited is not a run whose cleanup ran.
-    if sha(MQTT) == original_sha:
+    if original_sha is not None and sha(MQTT) == original_sha:
         print("\nTREE RESTORED: mqtt.py is byte-identical to its pre-run state.")
     else:
         print("\n*** TREE NOT RESTORED - mqtt.py DIFFERS. Fix before committing. ***")
