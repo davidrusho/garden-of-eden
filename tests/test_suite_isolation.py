@@ -552,7 +552,11 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                  # harnesses import at their own module scope. Mutating it in
                  # the working tree would hand a concurrent session verdicts
                  # from a deliberately broken scorer, with nothing to say so.
-                 "mutate_mutation_scoring.py"}
+                 "mutate_mutation_scoring.py",
+                 # T-527.28. log_hygiene.py is imported by mqtt.py at module
+                 # scope, so mutating it in the working tree would hand a
+                 # concurrent session a broken log formatter.
+                 "mutate_log_hygiene.py"}
 
     # Harnesses that also DELETE a file rather than only editing one. The
     # restore path for a deletion is different code (move to a stash, copy
@@ -596,6 +600,8 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         # harness never intended to write, which is the failure the note on
         # mutate_upgrade_policy.py above describes.
         "mutate_mutation_scoring.py": ["tests/mutation_scoring.py"],
+        # Only the module. The suite that drives it is not mutated.
+        "mutate_log_hygiene.py": ["log_hygiene.py"],
     }
 
     # What each harness's suite runner returns as its FIRST element, which the
@@ -624,6 +630,7 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         "mutate_light_schedule.py": "bool",
         "mutate_payload_scanner.py": "bool",
         "mutate_mutation_scoring.py": "bool",
+        "mutate_log_hygiene.py": "bool",
         "mutate_health_log.py": "rc",
         "mutate_upgrade_policy.py": "rc",
         "mutate_netwatch.py": "rc",

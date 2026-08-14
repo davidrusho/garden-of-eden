@@ -27,6 +27,7 @@ import subprocess
 import threading
 from threading import Timer
 import logging
+import log_hygiene
 import paho.mqtt.client as mqtt
 import base64
 import json
@@ -53,13 +54,41 @@ from app.sensors.distance.distance import Distance, MeasurementError
 # logging.BASIC_FORMAT with no timestamps.
 logging.basicConfig(
     level=logging.WARNING,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    # Single-sourced in log_hygiene so basicConfig and install() cannot drift.
+    # They were separate literals until review showed an edit to this one would
+    # be silently discarded by the formatter install() builds from its own copy.
+    format=log_hygiene.LOG_FORMAT,
     handlers=[
         logging.FileHandler("gardyn.log"),  # Log to a file
         logging.StreamHandler()  # Log to the console (stdout)
     ],
     force=True,
 )
+
+# T-527.28. Closes the exc_info forgery route that no call-site escaping can
+# reach - logger.exception() renders the traceback, whose final line is str(e),
+# not repr(e). Six call sites share these handlers (two here, four in
+# light_scheduler.py, which runs in-process and propagates to root), so this is
+# one fix rather than six comments. See log_hygiene.py for the full argument
+# and for why newlines are indented rather than escaped.
+#
+# MUST come after basicConfig. Be precise about why - this comment said
+# basicConfig calls setFormatter "unconditionally" and that is false; CPython
+# guards it with `if h.formatter is None`. The ordering matters because the two
+# handlers above are constructed INSIDE the basicConfig call, so they carry no
+# formatter when that loop runs and basicConfig's plain one lands on both.
+# Installing afterwards is what replaces it.
+#
+# THE RETURN VALUE IS CHECKED, not decorative. An install that matches no
+# handlers is the failure this fix cannot afford: the log keeps its normal
+# shape and the forgery route is wide open, with nothing anywhere to say so.
+_scrubbed_handlers = log_hygiene.install()
+if not _scrubbed_handlers:
+    # Deliberately not `logger.` - this runs before that name is bound.
+    logging.getLogger(__name__).error(
+        "log_hygiene.install() matched no handlers: log records are NOT "
+        "escaped and a control character in an exception message can forge "
+        "a record in gardyn.log")
 
 # NOTE: the light module raises its OWN logger to INFO at import (see
 # app/sensors/light/light.py) so that policy travels with the module rather than
