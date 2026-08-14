@@ -20,8 +20,8 @@ almost entirely a DELETION - the case where a green suite says least:
 
 Run:  python3 tests/mutate_retired_entities.py
 
-Two controls gate every result and BOTH must hold before any verdict is read. A
-battery scores a mutant by whether the test run FAILED, so a broken scorer
+THREE controls gate every result and ALL must hold before any verdict is read.
+A battery scores a mutant by whether the test run FAILED, so a broken scorer
 reports every mutant caught - the most reassuring output available, and the one
 that goes straight into a summary as proof of rigour:
 
@@ -29,8 +29,24 @@ that goes straight into a summary as proof of rigour:
   CONTROL B  deliberately broken code -> must be RED
              (A alone is worthless: it is scored by the same path that may be
              broken, so only B proves the scorer can tell pass from fail.)
+  CONTROL C  compiles, dies at import -> must score NO VERDICT
+             (a POSITIVE control for the scoring rule: without it, "0
+             no-verdict mutants" is equally consistent with the rule working
+             and with the rule never being reachable.)
+
+CONTROL C AND THE SCORING RULE ARRIVED HERE UNDER T-527.32, and until then this
+file did not have them. It treated ANY red run as a kill, and reported 29/29 on
+that basis - a figure that was not evidence, because a mutant that compiles and
+then dies at import reddens every suite without the behaviour under test ever
+executing. That is the same defect T-527.11 fixed in mutate_connack_refusal.py
+and T-527.13 fixed in mutate_light_schedule.py; finding it a third time is why
+the rule now lives in tests/mutation_scoring.py rather than being restated in
+each harness. It is pinned by tests/test_mutation_scoring.py.
 
 Mechanics that have bitten this repo before, all handled:
+  * every mutant gated on compile() BEFORE the write, so invalid Python never
+    reaches disk - not after, which leaves broken source there for the length
+    of a call, in the exact window the restore handlers exist to close.
   * __pycache__ purged before every run and PYTHONDONTWRITEBYTECODE=1 set. .pyc
     validity keys on (mtime-seconds, size), so a mutation applied and reverted
     inside one second can silently re-run the previous bytecode.
@@ -39,15 +55,27 @@ Mechanics that have bitten this repo before, all handled:
   * every anchor required to match EXACTLY once, and the mutated file compared
     against the original, because a replacement that matches nothing exits
     successfully and is indistinguishable from one that changed nothing.
-  * the tree asserted byte-identical at the end.
+  * restore on try/finally AND atexit AND SIGTERM/SIGINT. None subsumes
+    another: `finally` covers an exception, atexit covers an exit down a path
+    that skips it, and a signal runs neither.
+  * the tree asserted byte-identical at the end. Read that line before
+    believing any score above it - a run that exited is not a run whose
+    cleanup ran.
 """
+import atexit
 import hashlib
 import os
-import shutil
+import signal
 import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+from tests.mutation_scoring import (  # noqa: E402
+    NO_VERDICT, SURVIVED, compile_gate, format_verdict, purge_pycache,
+    ran_count, score_run, sha)
+
 MQTT = os.path.join(REPO, "mqtt.py")
 
 SUITES = ["tests.test_retired_entities", "tests.test_water_interlock"]
@@ -244,19 +272,35 @@ MUTANTS = [
      "    if not (0 <= distance <= 100):"),
 ]
 
+# Break something every suite depends on and nothing else could mask.
+CONTROL_B = ("CONTROL B: a deliberately broken tree - must be RED",
+             'client.publish(topic, "", retain=True)',
+             'client.publish("gardyn/CONTROL_B_BROKEN", "", retain=True)')
 
-def purge_pycache():
-    for root, dirs, _ in os.walk(REPO):
-        if ".git" in root:
-            continue
-        for d in list(dirs):
-            if d == "__pycache__":
-                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+# CONTROL C - the gap compile() does NOT close.
+#
+# A MISSING IMPORT, not a typo'd name. A typo raises only because that
+# particular statement happens to execute at module scope; move it inside a
+# function and the control silently stops testing anything while still looking
+# correct. An import statement cannot be moved out of the import.
+#
+# The anchor is a module-scope assignment, so the appended import runs at
+# import time. This compiles cleanly - so it reaches disk past the compile gate
+# - and then dies when unittest imports the module, which unittest reports as a
+# NAMED error through `unittest.loader._FailedTest`. That is why the
+# zero-named-cases tell alone cannot see this shape, and why score_run compares
+# the COLLECTED count against the clean baseline.
+CONTROL_C = ("CONTROL C: compiles, dies at import - must score NO VERDICT",
+             "_publisher_threads_lock = threading.Lock()",
+             "_publisher_threads_lock = threading.Lock()\n"
+             "import a_module_that_certainly_does_not_exist")
+
+_ORIGINAL_SRC = None
 
 
 def run_suites():
     """Return (all_passed, combined_output). stderr merged - unittest uses it."""
-    purge_pycache()
+    purge_pycache(REPO)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     combined = []
     ok = True
@@ -271,21 +315,7 @@ def run_suites():
     return ok, "\n".join(combined)
 
 
-def sha(path):
-    with open(path, "rb") as fh:
-        return hashlib.sha256(fh.read()).hexdigest()
-
-
-def main():
-    original_src = open(MQTT).read()
-    original_sha = sha(MQTT)
-    try:
-        return _run(original_src, original_sha)
-    finally:
-        _restore(original_src)
-
-
-def _restore(original_src):
+def restore():
     """Put mqtt.py back, whatever happened.
 
     Without this a battery killed part-way through - ^C, a timeout, an
@@ -293,92 +323,165 @@ def _restore(original_src):
     tree, which is a silent and entirely plausible-looking change to the file
     that runs the garden.
     """
-    try:
-        if sha(MQTT) == hashlib.sha256(original_src.encode()).hexdigest():
-            return
-    except OSError:
-        pass
+    if _ORIGINAL_SRC is None:
+        return
+    if sha(MQTT) != hashlib.sha256(_ORIGINAL_SRC.encode()).hexdigest():
+        with open(MQTT, "w") as fh:
+            fh.write(_ORIGINAL_SRC)
+
+
+def _on_signal(signum, _frame):
+    restore()
+    sys.exit(128 + signum)
+
+
+def apply_mutation(anchor, replacement):
+    """Return True if applied. Refuses anything that is not an exact single hit."""
+    src = open(MQTT).read()
+    count = src.count(anchor)
+    if count != 1:
+        print(f"  ANCHOR MATCHED {count} TIMES - mutation NOT applied, no verdict")
+        return False
+    mutated = src.replace(anchor, replacement, 1)
+    if mutated == src:
+        print("  replacement changed nothing - mutation NOT applied, no verdict")
+        return False
+    refusal = compile_gate(mutated, MQTT)
+    if refusal:
+        print(f"  {refusal}")
+        return False
     with open(MQTT, "w") as fh:
-        fh.write(original_src)
+        fh.write(mutated)
+    return True
 
 
-def _run(original_src, original_sha):
+def main():
+    """Three restore paths, none of which subsumes another.
+
+      try/finally      an exception out of the run, including the
+                       KeyboardInterrupt tests/test_suite_isolation.py injects.
+                       Restores SYNCHRONOUSLY, before the exception leaves.
+      atexit           a clean exit down a path that skips the finally.
+      SIGTERM/SIGINT   a signal, which runs NEITHER of the above.
+    """
+    global _ORIGINAL_SRC
+    _ORIGINAL_SRC = open(MQTT).read()
+    atexit.register(restore)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+    try:
+        return _run()
+    finally:
+        restore()
+
+
+def _run():
+    original_sha = sha(MQTT)
 
     print("=" * 70)
-    print("CONTROL A - clean tree must be GREEN")
+    print("CONTROL A (positive, runs FIRST as a gate) - clean tree must be GREEN")
+    print("=" * 70)
     ok, out = run_suites()
-    print(f"  clean tree: {'GREEN' if ok else 'RED'}")
     if not ok:
         print(out[-3000:])
-        print("\nABORT: clean tree is not green. No mutant verdict is readable.")
+        print("\nCONTROL A FAILED - the suites do not pass on a clean tree.")
+        print("This is NO DATA, not a score. Fix the suites before reading "
+              "anything.")
         return 2
+    clean_ran = ran_count(out)
+    if clean_ran == 0:
+        print("\nCONTROL A FAILED - a green run that collected NO tests. NO DATA.")
+        return 2
+    print(f"  GREEN - suites pass on the clean tree ({clean_ran} tests)\n")
 
     print("=" * 70)
-    print("CONTROL B - a deliberately broken assertion must be RED")
-    # Break something every suite depends on and nothing else could mask.
-    broken = original_src.replace(
-        'client.publish(topic, "", retain=True)',
-        'client.publish("gardyn/CONTROL_B_BROKEN", "", retain=True)')
-    if broken == original_src:
-        print("ABORT: control-B anchor did not match. Harness is broken.")
+    print("CONTROL B (negative) - a deliberately broken tree must be RED")
+    print("=" * 70)
+    _, anchor, replacement = CONTROL_B
+    if not apply_mutation(anchor, replacement):
+        print("\nCONTROL B could not be applied - the scorer is unproven. NO DATA.")
+        restore()
         return 2
-    open(MQTT, "w").write(broken)
     ok_b, _ = run_suites()
-    open(MQTT, "w").write(original_src)
-    print(f"  broken tree: {'GREEN' if ok_b else 'RED'}")
+    restore()
     if ok_b:
-        print("\nABORT: the suites passed a deliberately broken tree.")
-        print("The scorer cannot tell pass from fail; every verdict below")
-        print("would be meaningless. Fix the harness before reading any result.")
+        print("  GREEN - but it MUST be RED.")
+        print("\nCONTROL B FAILED - the scorer cannot tell pass from fail.")
+        print("Every 'killed' below would be meaningless. NO DATA.")
         return 2
+    print("  RED - the scorer can distinguish pass from fail\n")
 
     print("=" * 70)
-    print("BOTH CONTROLS OK - mutant verdicts are readable\n")
+    print("CONTROL C (positive, for the no-verdict rule) - an import-time break")
+    print("that COMPILES must be classified NO VERDICT, never a kill")
+    print("=" * 70)
+    _, anchor, replacement = CONTROL_C
+    if not apply_mutation(anchor, replacement):
+        print("\nCONTROL C could not be applied. NO DATA.")
+        restore()
+        return 2
+    ok_c, out_c = run_suites()
+    restore()
+    verdict, fails = score_run(ok_c, out_c, clean_ran)
+    if verdict != NO_VERDICT:
+        print(f"  scored '{verdict}' with {len(fails)} named failing case(s), "
+              f"but it MUST score '{NO_VERDICT}'.")
+        print("\nCONTROL C FAILED - either the scoring rule is not doing its "
+              "job, or this mutant no longer reproduces the shape it was "
+              "written for. Either way the no-verdict path is unproven. NO DATA.")
+        return 2
+    print("  NO VERDICT - an import-time break is not counted as a kill\n")
 
-    killed, survived = 0, []
+    print("=" * 70)
+    print(f"{len(MUTANTS)} MUTANTS")
+    print("=" * 70)
+    killed, survived, unapplied, no_verdict = [], [], [], []
     for i, (label, old, new) in enumerate(MUTANTS, 1):
-        count = original_src.count(old)
-        if count != 1:
-            print(f"  [{i:2}] HARNESS ERROR ({count} anchor matches): {label}")
-            survived.append((label, f"anchor matched {count}x, not 1"))
+        print(f"[{i}/{len(MUTANTS)}] {label}")
+        if not apply_mutation(old, new):
+            unapplied.append(label)
+            restore()
             continue
-
-        mutated = original_src.replace(old, new, 1)
-        open(MQTT, "w").write(mutated)
-
-        # Prove the edit landed. A no-op replacement looks exactly like a
-        # survivor, and it is the failure mode a kill count cannot show.
-        if open(MQTT).read() == original_src:
-            print(f"  [{i:2}] HARNESS ERROR (file unchanged): {label}")
-            survived.append((label, "mutation did not apply"))
-            open(MQTT, "w").write(original_src)
-            continue
-
-        ok_m, _ = run_suites()
-        open(MQTT, "w").write(original_src)
-
-        if ok_m:
-            print(f"  [{i:2}] SURVIVED  {label}")
-            survived.append((label, "suites stayed green"))
+        ok_m, out_m = run_suites()
+        restore()
+        # Read WHY it died, not just the colour.
+        verdict, fails = score_run(ok_m, out_m, clean_ran)
+        print(format_verdict(verdict, fails))
+        if verdict == SURVIVED:
+            survived.append(label)
+        elif verdict == NO_VERDICT:
+            no_verdict.append(label)
         else:
-            killed += 1
-            print(f"  [{i:2}] killed    {label}")
+            for line in fails[:3]:
+                print(f"      {line}")
+            killed.append(label)
 
     print("\n" + "=" * 70)
-    print(f"RESULT: {killed}/{len(MUTANTS)} killed")
-
-    restored = sha(MQTT) == original_sha
-    print(f"tree restored byte-identical: {restored}")
-
+    print(f"RESULT: {len(killed)} killed, {len(survived)} survived, "
+          f"{len(no_verdict)} no verdict, {len(unapplied)} not applied, "
+          f"of {len(MUTANTS)}")
+    print("=" * 70)
     if survived:
-        print("\nSURVIVORS - a survivor is a question about the CODE and the")
-        print("HARNESS, not only about the suite. Three explanations: the test")
-        print("is weak, the mutation never applied, or the mutated code is")
-        print("redundant and genuinely changes nothing.")
-        for label, why in survived:
-            print(f"  - {label}: {why}")
+        print("\nSURVIVORS - a survivor is a question about the CODE, the "
+              "CORPUS and the\nHARNESS, not only about the suite: the test may "
+              "be weak, the mutation may\nnever have applied, the mutated code "
+              "may be redundant, or the construct may\nnot exist in the corpus "
+              "the suites actually read.")
+    for label in survived:
+        print(f"  SURVIVED  {label}")
+    for label in no_verdict:
+        print(f"  NO VERDICT  {label}")
+    for label in unapplied:
+        print(f"  NOT APPLIED  {label}")
 
-    return 0 if (killed == len(MUTANTS) and restored) else 1
+    # The byte-identity assertion. Read this line before believing any score
+    # above it - a run that exited is not a run whose cleanup ran.
+    if sha(MQTT) == original_sha:
+        print("\nTREE RESTORED: mqtt.py is byte-identical to its pre-run state.")
+    else:
+        print("\n*** TREE NOT RESTORED - mqtt.py DIFFERS. Fix before committing. ***")
+        return 1
+    return 0 if not (survived or unapplied or no_verdict) else 1
 
 
 if __name__ == "__main__":

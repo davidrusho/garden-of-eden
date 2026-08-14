@@ -12,28 +12,47 @@ test goes RED. Everything else is supporting fire.
 
 Run:  python3 tests/mutate_camera_quality.py
 
-Two controls gate every result and BOTH must hold before any verdict is read. A
-battery scores a mutant by whether the test run FAILED, so a broken scorer
+THREE controls gate every result and ALL must hold before any verdict is read.
+A battery scores a mutant by whether the test run FAILED, so a broken scorer
 reports every mutant caught - the most reassuring output available:
 
   CONTROL A  clean tree               -> must be GREEN
   CONTROL B  deliberately broken code -> must be RED
              (A alone is worthless: it is scored by the same path that may be
              broken, so only B proves the scorer can tell pass from fail.)
+  CONTROL C  compiles, dies at import -> must score NO VERDICT
+             (a POSITIVE control for the scoring rule: without it, "0
+             no-verdict mutants" is equally consistent with the rule working
+             and with the rule never being reachable.)
+
+CONTROL C AND THE SCORING RULE ARRIVED HERE UNDER T-527.32. Before that this
+file treated ANY red run as a kill and reported 17/17 on that basis, which was
+not evidence: a mutant that compiles and then dies at import reddens every
+suite without the behaviour under test ever executing. The rule lives in
+tests/mutation_scoring.py, because this was the third harness in this repo
+found with the same defect, and it is pinned by tests/test_mutation_scoring.py.
 
 __pycache__ is purged before every run and PYTHONDONTWRITEBYTECODE=1 is set;
 stderr is merged into stdout because unittest reports there; every anchor must
-match exactly once; each mutated file is compared against the original, since a
-replacement matching nothing exits successfully and looks like a survivor; and
-the tree is asserted byte-identical at the end.
+match exactly once; every mutant is gated on compile() BEFORE the write, so
+invalid Python never reaches disk; restore runs on try/finally AND atexit AND
+SIGTERM/SIGINT, none of which subsumes another; and the tree is asserted
+byte-identical at the end.
 """
+import atexit
 import hashlib
 import os
-import shutil
+import signal
 import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+from tests.mutation_scoring import (  # noqa: E402
+    NO_VERDICT, SURVIVED, compile_gate, format_verdict, purge_pycache,
+    ran_count, score_run, sha)
+
 MQTT = os.path.join(REPO, "mqtt.py")
 CONFIG = os.path.join(REPO, "config.py")
 
@@ -143,17 +162,34 @@ MUTANTS = [
 ]
 
 
-def purge_pycache():
-    for root, dirs, _ in os.walk(REPO):
-        if ".git" in root:
-            continue
-        for d in list(dirs):
-            if d == "__pycache__":
-                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+# (file, label, anchor, replacement) - same shape as MUTANTS, so the same
+# apply/score path drives them and a control cannot drift from a mutant.
+CONTROL_B = (MQTT, "CONTROL B: a deliberately broken tree - must be RED",
+             "'--jpeg', str(quality),", "'--CONTROL-B-BROKEN', str(quality),")
+
+# CONTROL C - the gap compile() does NOT close.
+#
+# A MISSING IMPORT, not a typo'd name: a typo raises only because that
+# particular statement happens to execute at module scope, so moving it into a
+# function would silently stop the control testing anything while it still
+# looked correct. An import statement cannot be moved out of the import.
+#
+# Anchored on a module-scope assignment so the appended import runs at import
+# time. This compiles - so it reaches disk past the compile gate - and then
+# dies when unittest imports the module, which unittest reports as a NAMED
+# error through `unittest.loader._FailedTest`. That is why the zero-named-cases
+# tell alone cannot see this shape and score_run compares the COLLECTED count.
+CONTROL_C = (MQTT,
+             "CONTROL C: compiles, dies at import - must score NO VERDICT",
+             "_publisher_threads_lock = threading.Lock()",
+             "_publisher_threads_lock = threading.Lock()\n"
+             "import a_module_that_certainly_does_not_exist")
+
+_ORIGINALS = {}
 
 
 def run_suites():
-    purge_pycache()
+    purge_pycache(REPO)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     combined, ok = [], True
     for suite in SUITES:
@@ -167,21 +203,7 @@ def run_suites():
     return ok, "\n".join(combined)
 
 
-def sha(path):
-    with open(path, "rb") as fh:
-        return hashlib.sha256(fh.read()).hexdigest()
-
-
-def main():
-    sources = {MQTT: open(MQTT).read(), CONFIG: open(CONFIG).read()}
-    shas = {p: sha(p) for p in sources}
-    try:
-        return _run(sources, shas)
-    finally:
-        _restore(sources)
-
-
-def _restore(sources):
+def restore():
     """Put every mutated file back, whatever happened.
 
     Without this a battery killed part-way through - ^C, a timeout, an
@@ -190,15 +212,12 @@ def _restore(sources):
     code. mqtt.py is the file that runs the garden.
     """
     errors = []
-    for path, text in sources.items():
+    for path, text in _ORIGINALS.items():
         # Each file independently: one loop abandons the rest the moment one
         # raises, and it raises out of a `finally`, so the second file stays
         # mutated with nothing reporting it.
-        try:
-            if sha(path) == hashlib.sha256(text.encode()).hexdigest():
-                continue
-        except OSError:
-            pass
+        if sha(path) == hashlib.sha256(text.encode()).hexdigest():
+            continue
         try:
             with open(path, "w") as fh:
                 fh.write(text)
@@ -208,78 +227,161 @@ def _restore(sources):
         raise OSError("could not restore: " + "; ".join(errors))
 
 
-def _run(sources, shas):
+def _on_signal(signum, _frame):
+    restore()
+    sys.exit(128 + signum)
+
+
+def apply_mutation(path, anchor, replacement):
+    """Return True if applied. Refuses anything that is not an exact single hit."""
+    src = open(path).read()
+    count = src.count(anchor)
+    if count != 1:
+        print(f"  ANCHOR MATCHED {count} TIMES in {os.path.basename(path)} - "
+              f"mutation NOT applied, no verdict")
+        return False
+    mutated = src.replace(anchor, replacement, 1)
+    if mutated == src:
+        print("  replacement changed nothing - mutation NOT applied, no verdict")
+        return False
+    refusal = compile_gate(mutated, path)
+    if refusal:
+        print(f"  {refusal}")
+        return False
+    with open(path, "w") as fh:
+        fh.write(mutated)
+    return True
+
+
+def main():
+    """Three restore paths, none of which subsumes another.
+
+      try/finally      an exception out of the run, including the
+                       KeyboardInterrupt tests/test_suite_isolation.py injects.
+                       Restores SYNCHRONOUSLY, before the exception leaves.
+      atexit           a clean exit down a path that skips the finally.
+      SIGTERM/SIGINT   a signal, which runs NEITHER of the above.
+    """
+    _ORIGINALS.update({MQTT: open(MQTT).read(), CONFIG: open(CONFIG).read()})
+    atexit.register(restore)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+    try:
+        return _run()
+    finally:
+        restore()
+
+
+def _run():
+    shas = {p: sha(p) for p in _ORIGINALS}
 
     print("=" * 70)
-    print("CONTROL A - clean tree must be GREEN")
+    print("CONTROL A (positive, runs FIRST as a gate) - clean tree must be GREEN")
+    print("=" * 70)
     ok, out = run_suites()
-    print(f"  clean tree: {'GREEN' if ok else 'RED'}")
     if not ok:
         print(out[-3000:])
-        print("\nABORT: clean tree is not green. No mutant verdict is readable.")
+        print("\nCONTROL A FAILED - the suites do not pass on a clean tree.")
+        print("This is NO DATA, not a score. Fix the suites before reading "
+              "anything.")
         return 2
+    clean_ran = ran_count(out)
+    if clean_ran == 0:
+        print("\nCONTROL A FAILED - a green run that collected NO tests. NO DATA.")
+        return 2
+    print(f"  GREEN - suites pass on the clean tree ({clean_ran} tests)\n")
 
     print("=" * 70)
-    print("CONTROL B - a deliberately broken tree must be RED")
-    broken = sources[MQTT].replace("'--jpeg', str(quality),",
-                                   "'--CONTROL-B-BROKEN', str(quality),")
-    if broken == sources[MQTT]:
-        print("ABORT: control-B anchor did not match. Harness is broken.")
+    print("CONTROL B (negative) - a deliberately broken tree must be RED")
+    print("=" * 70)
+    path, _, anchor, replacement = CONTROL_B
+    if not apply_mutation(path, anchor, replacement):
+        print("\nCONTROL B could not be applied - the scorer is unproven. NO DATA.")
+        restore()
         return 2
-    open(MQTT, "w").write(broken)
     ok_b, _ = run_suites()
-    open(MQTT, "w").write(sources[MQTT])
-    print(f"  broken tree: {'GREEN' if ok_b else 'RED'}")
+    restore()
     if ok_b:
-        print("\nABORT: the suites passed a deliberately broken tree.")
-        print("The scorer cannot tell pass from fail; every verdict below")
-        print("would be meaningless. Fix the harness before reading anything.")
+        print("  GREEN - but it MUST be RED.")
+        print("\nCONTROL B FAILED - the scorer cannot tell pass from fail.")
+        print("Every 'killed' below would be meaningless. NO DATA.")
         return 2
+    print("  RED - the scorer can distinguish pass from fail\n")
 
     print("=" * 70)
-    print("BOTH CONTROLS OK - mutant verdicts are readable\n")
+    print("CONTROL C (positive, for the no-verdict rule) - an import-time break")
+    print("that COMPILES must be classified NO VERDICT, never a kill")
+    print("=" * 70)
+    path, _, anchor, replacement = CONTROL_C
+    if not apply_mutation(path, anchor, replacement):
+        print("\nCONTROL C could not be applied. NO DATA.")
+        restore()
+        return 2
+    ok_c, out_c = run_suites()
+    restore()
+    verdict, fails = score_run(ok_c, out_c, clean_ran)
+    if verdict != NO_VERDICT:
+        print(f"  scored '{verdict}' with {len(fails)} named failing case(s), "
+              f"but it MUST score '{NO_VERDICT}'.")
+        print("\nCONTROL C FAILED - either the scoring rule is not doing its "
+              "job, or this mutant no longer reproduces the shape it was "
+              "written for. Either way the no-verdict path is unproven. NO DATA.")
+        return 2
+    print("  NO VERDICT - an import-time break is not counted as a kill\n")
 
-    killed, survived = 0, []
+    print("=" * 70)
+    print(f"{len(MUTANTS)} MUTANTS")
+    print("=" * 70)
+    killed, survived, unapplied, no_verdict = [], [], [], []
     for i, (path, label, old, new) in enumerate(MUTANTS, 1):
-        src = sources[path]
-        count = src.count(old)
-        if count != 1:
-            print(f"  [{i:2}] HARNESS ERROR ({count} anchor matches): {label}")
-            survived.append((label, f"anchor matched {count}x, not 1"))
+        print(f"[{i}/{len(MUTANTS)}] {label}")
+        if not apply_mutation(path, old, new):
+            unapplied.append(label)
+            restore()
             continue
-
-        open(path, "w").write(src.replace(old, new, 1))
-        if open(path).read() == src:
-            print(f"  [{i:2}] HARNESS ERROR (file unchanged): {label}")
-            survived.append((label, "mutation did not apply"))
-            open(path, "w").write(src)
-            continue
-
-        ok_m, _ = run_suites()
-        open(path, "w").write(src)
-
-        if ok_m:
-            print(f"  [{i:2}] SURVIVED  {label}")
-            survived.append((label, "suites stayed green"))
+        ok_m, out_m = run_suites()
+        restore()
+        # Read WHY it died, not just the colour.
+        verdict, fails = score_run(ok_m, out_m, clean_ran)
+        print(format_verdict(verdict, fails))
+        if verdict == SURVIVED:
+            survived.append(label)
+        elif verdict == NO_VERDICT:
+            no_verdict.append(label)
         else:
-            killed += 1
-            print(f"  [{i:2}] killed    {label}")
+            for line in fails[:3]:
+                print(f"      {line}")
+            killed.append(label)
 
     print("\n" + "=" * 70)
-    print(f"RESULT: {killed}/{len(MUTANTS)} killed")
-
-    restored = all(sha(p) == shas[p] for p in sources)
-    print(f"tree restored byte-identical: {restored}")
-
+    print(f"RESULT: {len(killed)} killed, {len(survived)} survived, "
+          f"{len(no_verdict)} no verdict, {len(unapplied)} not applied, "
+          f"of {len(MUTANTS)}")
+    print("=" * 70)
     if survived:
-        print("\nSURVIVORS - a survivor is a question about the CODE and the")
-        print("HARNESS, not only about the suite. Three explanations: the test")
-        print("is weak, the mutation never applied, or the mutated code is")
-        print("redundant and genuinely changes nothing.")
-        for label, why in survived:
-            print(f"  - {label}: {why}")
+        print("\nSURVIVORS - a survivor is a question about the CODE, the "
+              "CORPUS and the\nHARNESS, not only about the suite: the test may "
+              "be weak, the mutation may\nnever have applied, the mutated code "
+              "may be redundant, or the construct may\nnot exist in the corpus "
+              "the suites actually read.")
+    for label in survived:
+        print(f"  SURVIVED  {label}")
+    for label in no_verdict:
+        print(f"  NO VERDICT  {label}")
+    for label in unapplied:
+        print(f"  NOT APPLIED  {label}")
 
-    return 0 if (killed == len(MUTANTS) and restored) else 1
+    # The byte-identity assertion. Read this line before believing any score
+    # above it - a run that exited is not a run whose cleanup ran.
+    drifted = [p for p in _ORIGINALS if sha(p) != shas[p]]
+    if not drifted:
+        print("\nTREE RESTORED: mqtt.py and config.py are byte-identical to "
+              "their pre-run state.")
+    else:
+        print(f"\n*** TREE NOT RESTORED - {', '.join(drifted)} DIFFER. "
+              f"Fix before committing. ***")
+        return 1
+    return 0 if not (survived or unapplied or no_verdict) else 1
 
 
 if __name__ == "__main__":

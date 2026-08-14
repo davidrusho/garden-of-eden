@@ -318,8 +318,9 @@ class DiscoveryOrderTests(unittest.TestCase):
 _RESTORE_PROBE = r"""
 import hashlib, importlib.util, json, os, stat, sys
 
-repo, harness, targets, mode = (sys.argv[1], sys.argv[2],
-                                json.loads(sys.argv[3]), sys.argv[4])
+repo, harness, targets, mode, shape = (sys.argv[1], sys.argv[2],
+                                       json.loads(sys.argv[3]), sys.argv[4],
+                                       sys.argv[5])
 sys.path.insert(0, repo)
 
 spec = importlib.util.spec_from_file_location(
@@ -371,6 +372,17 @@ _IMPORT_DEATH = ("ERROR: test_x (unittest.loader._FailedTest.test_x)\n"
                  "Ran 1 test in 0.000s\n\nFAILED (errors=1)\n")
 n_controls = 3 if hasattr(mod, "CONTROL_C") else 2
 
+# THE DOUBLE'S FIRST ELEMENT HAS TWO SHAPES IN THIS REPO, and returning the
+# wrong one is invisible at the call site (T-527.31). `run_suites()` returns
+# (ok: bool, out: str); `run_suite(root)` in the netwatch/health_log/
+# upgrade_policy family returns (rc: int, out: str). Hand a bool to an
+# rc-shaped harness and its own control A reads `rc = True`, finds `True != 0`,
+# and aborts in 0.3s — which the probe then reports as "main() returned without
+# the injected interrupt", i.e. as a fault in the HARNESS rather than in the
+# double. That misreading is what deferred this ticket once already: the
+# measurement reproduced and the diagnosis did not.
+_GREEN_OK, _RED_OK = (0, 1) if shape == "rc" else (True, False)
+
 def fake(*a, **k):
     state["n"] += 1
     # Call 1 is control A (clean, must look GREEN), call 2 is control B (broken,
@@ -379,10 +391,10 @@ def fake(*a, **k):
     # pass would abort the harness through its own guard rather than mid-mutant.
     if state["n"] <= n_controls:
         if state["n"] == 1:
-            return True, _GREEN
+            return _GREEN_OK, _GREEN
         if state["n"] == 2:
-            return False, _RED
-        return False, _IMPORT_DEATH
+            return _RED_OK, _RED
+        return _RED_OK, _IMPORT_DEATH
     now = {p: fingerprint(p) for p in targets}
     if mode == "delete":
         # Wait for the DELETE mutant, whose restore is a different code path
@@ -455,10 +467,73 @@ class MutationHarnessRestoreTests(unittest.TestCase):
     # back), so interrupting at the first text mutant never reaches it.
     HAS_DELETE_MUTANTS = {"mutate_setup_units.py"}
 
+    # The SANDBOXED harnesses' targets: the files each would rewrite IN THE
+    # WORKING TREE if its copytree were removed or bypassed. These are what
+    # test_a_sandboxed_harness_leaves_the_working_tree_untouched fingerprints,
+    # so a harness listed with the wrong paths would report "untouched" about
+    # files it never had any intention of writing.
+    #
+    # mutate_deploy_verify.py is deliberately absent: it spells its runner
+    # `run_one`, which the probe refuses by design, and
+    # test_the_probe_refuses_a_harness_whose_runner_it_cannot_find is the case
+    # that covers it.
+    SANDBOX_TARGETS = {
+        "mutate_health_log.py": ["bin/gardyn-health-log.py",
+                                 "tests/test_health_log.py"],
+        "mutate_upgrade_policy.py": ["bin/gardyn-check-upgrade-policy.py",
+                                     "tests/test_upgrade_policy.py",
+                                     "tests/fixtures/gardyn-upgrade-policy.json"],
+        "mutate_netwatch.py": ["bin/gardyn-netwatch.py",
+                               "bin/install-systemd-units.sh",
+                               "services/etc/systemd/system/mqtt.service",
+                               "services/etc/gardyn/netwatch.env.example",
+                               "tests/test_netwatch.py"],
+        "mutate_light_scheduler.py": ["light_scheduler.py", "mqtt.py",
+                                      "tests/test_light_scheduler.py",
+                                      "services/etc/systemd/system/mqtt.service"],
+        "mutate_light_schedule.py": ["light_schedule.py",
+                                     "tests/test_light_schedule.py"],
+        "mutate_payload_scanner.py": ["tests/test_connack_refusal.py"],
+    }
+
+    # What each harness's suite runner returns as its FIRST element, which the
+    # probe's double has to match (T-527.31).
+    #
+    # `run_suites()` returns (ok: bool, out: str). `run_suite(root)` in the
+    # netwatch / health_log / upgrade_policy family returns (rc: int, out: str).
+    # These cannot be told apart without running the thing, so this is a hand
+    # table - but a WRONG entry is loud rather than silent: the harness aborts
+    # at its own control A and the probe reports "main() returned without the
+    # injected interrupt", with the shape named in the failure message below.
+    #
+    # Before this table existed the double returned bools unconditionally, so
+    # every rc-shaped harness read `rc = True`, found `True != 0` and gave up in
+    # 0.3s. That was measured and then MISDIAGNOSED as "the probe's interception
+    # does not reach these harnesses", which is what deferred driving them.
+    RUNNER_SHAPE = {
+        "mutate_retired_entities.py": "bool",
+        "mutate_camera_quality.py": "bool",
+        "mutate_light_logging.py": "bool",
+        "mutate_setup_units.py": "bool",
+        "mutate_pump_api_interlock.py": "bool",
+        "mutate_ha_birth_message.py": "bool",
+        "mutate_connack_refusal.py": "bool",
+        "mutate_light_scheduler.py": "bool",
+        "mutate_light_schedule.py": "bool",
+        "mutate_payload_scanner.py": "bool",
+        "mutate_health_log.py": "rc",
+        "mutate_upgrade_policy.py": "rc",
+        "mutate_netwatch.py": "rc",
+        # Refused by the probe before its shape ever matters; listed so the
+        # completeness check below has one entry per harness.
+        "mutate_deploy_verify.py": "rc",
+    }
+
     def _drive(self, harness, targets, mode="text"):
         proc = subprocess.run(
             [sys.executable, "-c", _RESTORE_PROBE, REPO, harness,
-             json.dumps([os.path.join(REPO, t) for t in targets]), mode],
+             json.dumps([os.path.join(REPO, t) for t in targets]), mode,
+             self.RUNNER_SHAPE[harness]],
             cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
         )
@@ -499,6 +574,91 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                 self.assertTrue(verdict["restored"],
                                 f"{harness} did not restore a deleted file's "
                                 f"content and mode")
+
+    def test_a_sandboxed_harness_leaves_the_working_tree_untouched(self):
+        """The sandbox property MEASURED, not parsed (T-527.31).
+
+        test_a_sandboxed_harness_still_works_on_a_copy below asks the AST
+        whether a `copytree(REPO, ...)` CALL NODE exists. That is a necessary
+        condition and its own docstring lists five constructs it accepts while
+        the harness still writes the originals - the call under `if False:`,
+        the call in a function nobody invokes, the call after a `return`,
+        `copytree(REPO, backup)` followed by `root = REPO`, and a locally
+        defined `def copytree(a, b): pass`. SANDBOXED membership is what
+        EXEMPTS a harness from test_an_interrupted_battery_leaves_no_mutant_
+        behind, the only check that would catch a stranded mutant in a shipping
+        file, so a false pass there removes real coverage.
+
+        This drives the harness for real and fingerprints the LIVE files it
+        would rewrite. `applied: false` with the interrupt reached is the
+        sandbox property itself: the harness got as far as running a suite for
+        a mutant, and at that moment nothing in the working tree had changed.
+
+        THE CONTROL IS THE HALF THAT MATTERS. `applied: false` is also what a
+        probe that never reached a mutant would produce, so an IN_PLACE
+        harness is driven the same way and must report `applied: true`. If it
+        does not, this whole test is measuring nothing and says so rather than
+        passing.
+        """
+        control = self._drive("mutate_ha_birth_message.py", ["mqtt.py"])
+        self.assertNotIn("error", control, control.get("error"))
+        self.assertTrue(
+            control["applied"],
+            "CONTROL FAILED - an IN_PLACE harness driven through this probe "
+            "did not put a mutant on disk, so `applied: false` below would be "
+            "consistent with the probe never reaching a mutant at all. Every "
+            "verdict in this test is void.")
+
+        for harness in sorted(self.SANDBOX_TARGETS):
+            with self.subTest(harness=harness):
+                verdict = self._drive(harness, self.SANDBOX_TARGETS[harness])
+                self.assertNotIn(
+                    "error", verdict,
+                    f"{harness}: {verdict.get('error')}. If this says main() "
+                    f"returned without the injected interrupt, suspect "
+                    f"RUNNER_SHAPE[{harness!r}] "
+                    f"(declared {self.RUNNER_SHAPE[harness]!r}) before "
+                    f"suspecting the harness - a bool handed to an rc-shaped "
+                    f"runner aborts it at its own control A.")
+                self.assertFalse(
+                    verdict["applied"],
+                    f"{harness} is listed SANDBOXED, but a mutant was on disk "
+                    f"IN THE WORKING TREE when the battery was interrupted. It "
+                    f"is writing the originals, so its exemption from the "
+                    f"interrupted-battery restore check is unearned.")
+                self.assertTrue(
+                    verdict["restored"],
+                    f"{harness} left the working tree changed after an "
+                    f"interrupt")
+
+    def test_every_harness_declares_a_runner_shape(self):
+        """RUNNER_SHAPE is hand-maintained, so it decays - and a missing entry
+        is a KeyError in _drive rather than a skipped harness, which is the
+        loud direction. This catches it at the table instead."""
+        self.assertEqual(
+            set(self.RUNNER_SHAPE), set(self.IN_PLACE) | self.SANDBOXED,
+            "a mutation harness has no RUNNER_SHAPE entry, so the probe cannot "
+            "be pointed at it")
+        self.assertEqual({"bool", "rc"}, set(self.RUNNER_SHAPE.values()),
+                         "an unrecognised runner shape - the probe only knows "
+                         "these two, and anything else silently falls back to "
+                         "the bool branch")
+
+    def test_every_sandboxed_harness_declares_its_targets(self):
+        """The other hand table. A SANDBOXED harness absent from
+        SANDBOX_TARGETS is simply not driven, and its absence is invisible in
+        the result of the test that matters."""
+        self.assertEqual(
+            set(self.SANDBOX_TARGETS), self.SANDBOXED - {"mutate_deploy_verify.py"},
+            "a SANDBOXED harness is not driven through the restore probe (or "
+            "one is listed that is not SANDBOXED)")
+        for harness, targets in sorted(self.SANDBOX_TARGETS.items()):
+            for target in targets:
+                self.assertTrue(
+                    os.path.exists(os.path.join(REPO, target)),
+                    f"{harness} declares {target}, which does not exist - so "
+                    f"it fingerprints '<missing>' on both sides and can never "
+                    f"report a mutant on disk")
 
     def test_the_probe_refuses_a_harness_whose_runner_it_cannot_find(self):
         """The guard added to _RESTORE_PROBE in eaf159f, which had no test.

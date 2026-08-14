@@ -8,16 +8,36 @@ been shown capable of going red.
 
 Run:  python3 tests/mutate_light_logging.py
 
-Two controls gate every result, and BOTH must hold before any mutant verdict is
-read. A battery scores a mutant by whether the test run FAILED, so a broken
+THREE controls gate every result, and ALL must hold before any mutant verdict
+is read. A battery scores a mutant by whether the test run FAILED, so a broken
 scorer reports every mutant caught - the most reassuring output available:
 
-  CONTROL A  clean tree            -> must be GREEN
-  CONTROL B  broken assertion      -> must be RED
+  CONTROL A  clean tree               -> must be GREEN
+  CONTROL B  broken assertion         -> must be RED
              (A alone is worthless; it is scored by the same path that may be
              broken, so only B proves the scorer can distinguish the two.)
+  CONTROL C  compiles, dies at import -> must score NO VERDICT
+             (a POSITIVE control for the scoring rule: without it, "0
+             no-verdict mutants" is equally consistent with the rule working
+             and with the rule never being reachable.)
+
+EACH PHASE CARRIES ITS OWN THREE. This file mutates two files against two
+different suites, so a single set of controls at the top would leave the whole
+mqtt.py half scored by a path nothing had proved - and its clean-tree ran-count
+is a different number, which is the figure the no-verdict rule compares
+against.
+
+CONTROL C AND THE SCORING RULE ARRIVED UNDER T-527.32. Before that this file
+treated ANY red run as a kill and reported 14/14 on that basis, which was not
+evidence: a mutant that compiles and then dies at import reddens the suite
+without the behaviour under test ever executing. The rule now lives in
+tests/mutation_scoring.py - this was the third harness found with the same
+defect - and is pinned by tests/test_mutation_scoring.py.
 
 Mechanics that have bitten this repo before, all handled here:
+  * every mutant gated on compile() BEFORE the write, so invalid Python never
+    reaches disk - not after, which leaves broken source there for the length
+    of a call, in the exact window the restore handlers exist to close.
   * __pycache__ purged before every run, and PYTHONDONTWRITEBYTECODE=1 set.
     .pyc validity keys on (mtime-seconds, size), so a mutation applied and
     reverted inside one second can silently re-run the previous bytecode. This
@@ -27,15 +47,27 @@ Mechanics that have bitten this repo before, all handled here:
   * each mutated file compared against the source captured before the run,
     because a replacement that matches nothing is indistinguishable from one
     that changed nothing.
-  * the tree is asserted byte-identical at the end.
+  * restore on try/finally AND atexit AND SIGTERM/SIGINT. None subsumes
+    another: `finally` covers an exception, atexit covers an exit down a path
+    that skips it, and a signal runs neither.
+  * the tree is asserted byte-identical at the end. Read that line before
+    believing any score above it - a run that exited is not a run whose
+    cleanup ran.
 """
+import atexit
 import hashlib
 import os
-import shutil
+import signal
 import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+from tests.mutation_scoring import (  # noqa: E402
+    NO_VERDICT, SURVIVED, compile_gate, format_verdict, purge_pycache,
+    ran_count, score_run, sha)
+
 LIGHT = os.path.join(REPO, "app", "sensors", "light", "light.py")
 MQTT = os.path.join(REPO, "mqtt.py")
 SUITE = "tests.test_light_logging"
@@ -103,18 +135,41 @@ MQTT_MUTANTS = [
 ]
 
 
-def purge_pycache():
-    for root, dirs, _ in os.walk(REPO):
-        if ".git" in root:
-            continue
-        for d in list(dirs):
-            if d == "__pycache__":
-                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+# (file, suite, label, anchor, replacement) for each phase's controls.
+#
+# CONTROL C is a MISSING IMPORT, not a typo'd name: a typo raises only because
+# that particular statement happens to execute at module scope, so moving it
+# into a function would silently stop the control testing anything while it
+# still looked correct. An import statement cannot be moved out of the import.
+# Each anchor is a module-scope statement, so the appended import runs at import
+# time. Both compile - so they reach disk past the compile gate - and then die
+# when unittest imports the module, which unittest reports as a NAMED error via
+# `unittest.loader._FailedTest`. That is exactly why the zero-named-cases tell
+# alone cannot see this shape, and why score_run compares the COLLECTED count.
+CONTROL_B = (LIGHT, SUITE, "CONTROL B: a broken assertion - must be RED",
+             'logger.info("Turning light on")',
+             'logger.info("THIS_STRING_IS_NOT_WHAT_THE_TEST_EXPECTS")')
+CONTROL_C = (LIGHT, SUITE,
+             "CONTROL C: compiles, dies at import - must score NO VERDICT",
+             "logger = logging.getLogger(__name__)",
+             "logger = logging.getLogger(__name__)\n"
+             "import a_module_that_certainly_does_not_exist")
+MQTT_CONTROL_B = (MQTT, MQTT_SUITE,
+                  "CONTROL B: a broken policy - must be RED",
+                  "logger.setLevel(logging.INFO)",
+                  "logger.setLevel(logging.CRITICAL)")
+MQTT_CONTROL_C = (MQTT, MQTT_SUITE,
+                  "CONTROL C: compiles, dies at import - must score NO VERDICT",
+                  "_publisher_threads_lock = threading.Lock()",
+                  "_publisher_threads_lock = threading.Lock()\n"
+                  "import a_module_that_certainly_does_not_exist")
+
+_ORIGINALS = {}
 
 
 def run_suite(suite=SUITE):
     """Return (passed, combined_output). stderr merged - unittest writes there."""
-    purge_pycache()
+    purge_pycache(REPO)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     proc = subprocess.run(
         [sys.executable, "-m", "unittest", suite],
@@ -125,20 +180,133 @@ def run_suite(suite=SUITE):
     return proc.returncode == 0, out
 
 
-def sha(path):
-    with open(path, "rb") as fh:
-        return hashlib.sha256(fh.read()).hexdigest()
-
-
 def main():
-    originals = {LIGHT: open(LIGHT).read(), MQTT: open(MQTT).read()}
+    """Three restore paths, none of which subsumes another.
+
+      try/finally      an exception out of the run, including the
+                       KeyboardInterrupt tests/test_suite_isolation.py injects.
+                       Restores SYNCHRONOUSLY, before the exception leaves.
+      atexit           a clean exit down a path that skips the finally.
+      SIGTERM/SIGINT   a signal, which runs NEITHER of the above.
+    """
+    _ORIGINALS.update({LIGHT: open(LIGHT).read(), MQTT: open(MQTT).read()})
+    atexit.register(restore)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     try:
-        return _run(originals)
+        return _run()
     finally:
-        _restore(originals)
+        restore()
 
 
-def _restore(originals):
+def _on_signal(signum, _frame):
+    restore()
+    sys.exit(128 + signum)
+
+
+def apply_mutation(path, anchor, replacement):
+    """Return True if applied. Refuses anything that is not an exact single hit."""
+    src = open(path).read()
+    count = src.count(anchor)
+    if count != 1:
+        print(f"  ANCHOR MATCHED {count} TIMES in {os.path.basename(path)} - "
+              f"mutation NOT applied, no verdict")
+        return False
+    mutated = src.replace(anchor, replacement, 1)
+    if mutated == src:
+        print("  replacement changed nothing - mutation NOT applied, no verdict")
+        return False
+    refusal = compile_gate(mutated, path)
+    if refusal:
+        print(f"  {refusal}")
+        return False
+    with open(path, "w") as fh:
+        fh.write(mutated)
+    return True
+
+
+def _controls(path, suite, control_b, control_c, phase):
+    """Run this phase's three controls. Returns the clean ran-count, or None.
+
+    None means NO DATA for the phase - the caller must abort rather than score
+    anything, because every verdict below a failed control is meaningless.
+    """
+    print("=" * 68)
+    print(f"{phase} CONTROL A (positive, runs FIRST as a gate) - clean tree "
+          f"must be GREEN")
+    ok, out = run_suite(suite)
+    if not ok:
+        print(out[-2500:])
+        print(f"\n{phase} CONTROL A FAILED - {suite} does not pass on a clean "
+              f"tree. This is NO DATA, not a score.")
+        return None
+    clean_ran = ran_count(out)
+    if clean_ran == 0:
+        print(f"\n{phase} CONTROL A FAILED - a green run that collected NO "
+              f"tests. NO DATA.")
+        return None
+    print(f"  GREEN - {suite} passes on the clean tree ({clean_ran} tests)")
+
+    print(f"{phase} CONTROL B (negative) - a deliberately broken tree must be RED")
+    if not apply_mutation(path, control_b[3], control_b[4]):
+        print(f"\n{phase} CONTROL B could not be applied - the scorer is "
+              f"unproven. NO DATA.")
+        restore()
+        return None
+    ok_b, _ = run_suite(suite)
+    restore()
+    if ok_b:
+        print(f"\n{phase} CONTROL B FAILED - the suite passed a deliberately "
+              f"broken tree, so the scorer cannot tell pass from fail. Every "
+              f"'killed' below would be meaningless. NO DATA.")
+        return None
+    print("  RED - the scorer can distinguish pass from fail")
+
+    print(f"{phase} CONTROL C (positive, for the no-verdict rule) - an "
+          f"import-time break that COMPILES must score NO VERDICT")
+    if not apply_mutation(path, control_c[3], control_c[4]):
+        print(f"\n{phase} CONTROL C could not be applied. NO DATA.")
+        restore()
+        return None
+    ok_c, out_c = run_suite(suite)
+    restore()
+    verdict, fails = score_run(ok_c, out_c, clean_ran)
+    if verdict != NO_VERDICT:
+        print(f"  scored '{verdict}' with {len(fails)} named failing case(s), "
+              f"but it MUST score '{NO_VERDICT}'.")
+        print(f"\n{phase} CONTROL C FAILED - either the scoring rule is not "
+              f"doing its job, or this mutant no longer reproduces the shape "
+              f"it was written for. NO DATA.")
+        return None
+    print("  NO VERDICT - an import-time break is not counted as a kill\n")
+    return clean_ran
+
+
+def _score_phase(path, suite, mutants, clean_ran, tag, buckets):
+    """Apply and score one phase's mutants into the shared buckets."""
+    killed, survived, unapplied, no_verdict = buckets
+    for i, (label, old, new) in enumerate(mutants, 1):
+        print(f"[{tag}{i}/{len(mutants)}] {label}")
+        if not apply_mutation(path, old, new):
+            unapplied.append(label)
+            restore()
+            continue
+        ok_m, out_m = run_suite(suite)
+        restore()
+        # Read WHY it died, not just the colour.
+        verdict, fails = score_run(ok_m, out_m, clean_ran)
+        print(format_verdict(verdict, fails))
+        if verdict == SURVIVED:
+            survived.append(label)
+        elif verdict == NO_VERDICT:
+            no_verdict.append(label)
+        else:
+            for line in fails[:3]:
+                print(f"      {line}")
+            killed.append(label)
+
+
+def restore():
     """Put every mutated file back, whatever happened.
 
     Without this a battery killed part-way through - ^C, a timeout, an
@@ -148,15 +316,12 @@ def _restore(originals):
     is the controller.
     """
     errors = []
-    for path, text in originals.items():
+    for path, text in _ORIGINALS.items():
         # Each file independently: one loop abandons the rest the moment one
         # raises, and it raises out of a `finally`, so the second file stays
         # mutated with nothing reporting it.
-        try:
-            if sha(path) == hashlib.sha256(text.encode()).hexdigest():
-                continue
-        except OSError:
-            pass
+        if sha(path) == hashlib.sha256(text.encode()).hexdigest():
+            continue
         try:
             with open(path, "w") as fh:
                 fh.write(text)
@@ -166,135 +331,68 @@ def _restore(originals):
         raise OSError("could not restore: " + "; ".join(errors))
 
 
-def _run(originals):
-    # No stash directory: every early `return 2` below leaked one, and the copy
-    # it held was never read - _restore() rebuilds from `originals`, which is
-    # captured before anything runs.
-    original_sha = sha(LIGHT)
-    original_src = originals[LIGHT]
+def _run():
+    """Two phases, each with its own three controls and its own baseline.
 
-    print("=" * 68)
-    print("CONTROL A - clean tree must be GREEN")
-    ok, out = run_suite()
-    print(f"  clean tree: {'GREEN' if ok else 'RED'}")
-    if not ok:
-        print(out[-2500:])
-        print("\nABORT: clean tree is not green. No mutant verdict is readable.")
+    The phases target DIFFERENT files against DIFFERENT suites, so a single
+    clean ran-count would be the wrong comparison for one of them - and the
+    ran-count is what the no-verdict rule reads. A phase whose controls do not
+    hold aborts the whole run rather than being scored, because a battery that
+    reports part of a score reads as a complete one.
+    """
+    shas = {p: sha(p) for p in _ORIGINALS}
+
+    clean_ran = _controls(LIGHT, SUITE, CONTROL_B, CONTROL_C, "[light.py]")
+    if clean_ran is None:
         return 2
 
     print("=" * 68)
-    print("CONTROL B - a deliberately broken assertion must be RED")
-    broken = original_src.replace(
-        'logger.info("Turning light on")',
-        'logger.info("THIS_STRING_IS_NOT_WHAT_THE_TEST_EXPECTS")')
-    if broken == original_src:
-        print("ABORT: control-B anchor did not match. Harness is broken.")
-        return 2
-    open(LIGHT, "w").write(broken)
-    ok_b, _ = run_suite()
-    open(LIGHT, "w").write(original_src)
-    print(f"  broken assertion: {'GREEN' if ok_b else 'RED'}")
-    if ok_b:
-        print("\nABORT: the suite passed a deliberately broken tree.")
-        print("The scorer cannot tell pass from fail; every verdict below would")
-        print("be meaningless. Fix the harness before reading any result.")
+    print(f"{len(MUTANTS)} light.py MUTANTS (scored by {SUITE})")
+    print("=" * 68)
+    buckets = ([], [], [], [])
+    _score_phase(LIGHT, SUITE, MUTANTS, clean_ran, "", buckets)
+
+    mqtt_clean_ran = _controls(MQTT, MQTT_SUITE, MQTT_CONTROL_B, MQTT_CONTROL_C,
+                               "[mqtt.py]")
+    if mqtt_clean_ran is None:
         return 2
 
     print("=" * 68)
-    print("BOTH CONTROLS OK - mutant verdicts are readable\n")
+    print(f"{len(MQTT_MUTANTS)} mqtt.py policy MUTANTS (scored by {MQTT_SUITE})")
+    print("=" * 68)
+    _score_phase(MQTT, MQTT_SUITE, MQTT_MUTANTS, mqtt_clean_ran, "m", buckets)
 
-    killed, survived = 0, []
-    for i, (label, old, new) in enumerate(MUTANTS, 1):
-        count = original_src.count(old)
-        if count != 1:
-            print(f"  [{i}] HARNESS ERROR ({count} anchor matches): {label}")
-            survived.append((label, f"anchor matched {count}x, not 1"))
-            continue
-
-        mutated = original_src.replace(old, new)
-        open(LIGHT, "w").write(mutated)
-
-        # Prove the edit actually landed - a no-op replace looks like a survivor.
-        if open(LIGHT).read() == original_src:
-            print(f"  [{i}] HARNESS ERROR (file unchanged): {label}")
-            survived.append((label, "mutation did not apply"))
-            open(LIGHT, "w").write(original_src)
-            continue
-
-        ok_m, _ = run_suite()
-        open(LIGHT, "w").write(original_src)
-
-        if ok_m:
-            print(f"  [{i}] SURVIVED  {label}")
-            survived.append((label, "suite stayed green"))
-        else:
-            killed += 1
-            print(f"  [{i}] killed    {label}")
-
-    # --- mqtt.py pass -------------------------------------------------------
-    print("\n" + "=" * 68)
-    print("mqtt.py policy mutants (scored by " + MQTT_SUITE + ")")
-    mqtt_src = originals[MQTT]
-    mqtt_sha = sha(MQTT)
-
-    ok_m, _ = run_suite(MQTT_SUITE)
-    print(f"  CONTROL A - clean tree: {'GREEN' if ok_m else 'RED'}")
-    if not ok_m:
-        print("  ABORT: mqtt suite is not green on a clean tree; verdicts unreadable.")
-        return 2
-    broken_m = mqtt_src.replace("logger.setLevel(logging.INFO)",
-                                "logger.setLevel(logging.CRITICAL)")
-    if broken_m == mqtt_src:
-        # Not a bare `assert`: those are stripped under `python -O`, and every
-        # other control-B abort in this file prints and returns 2.
-        print("  ABORT: mqtt control-B anchor did not match. Harness is broken.")
-        return 2
-    open(MQTT, "w").write(broken_m)
-    ok_mb, _ = run_suite(MQTT_SUITE)
-    open(MQTT, "w").write(mqtt_src)
-    print(f"  CONTROL B - broken policy: {'GREEN' if ok_mb else 'RED'}")
-    if ok_mb:
-        print("  ABORT: mqtt suite passed a deliberately broken policy.")
-        return 2
-    print()
-
-    for j, (label, old_s, new_s) in enumerate(MQTT_MUTANTS, 1):
-        count = mqtt_src.count(old_s)
-        if count != 1:
-            print(f"  [m{j}] HARNESS ERROR ({count} anchor matches): {label}")
-            survived.append((label, f"anchor matched {count}x, not 1"))
-            continue
-        open(MQTT, "w").write(mqtt_src.replace(old_s, new_s, 1))
-        if open(MQTT).read() == mqtt_src:
-            print(f"  [m{j}] HARNESS ERROR (file unchanged): {label}")
-            survived.append((label, "mutation did not apply"))
-            open(MQTT, "w").write(mqtt_src)
-            continue
-        ok_mm, _ = run_suite(MQTT_SUITE)
-        open(MQTT, "w").write(mqtt_src)
-        if ok_mm:
-            print(f"  [m{j}] SURVIVED  {label}")
-            survived.append((label, "suite stayed green"))
-        else:
-            killed += 1
-            print(f"  [m{j}] killed    {label}")
-
+    killed, survived, unapplied, no_verdict = buckets
     total = len(MUTANTS) + len(MQTT_MUTANTS)
     print("\n" + "=" * 68)
-    print(f"RESULT: {killed}/{total} killed")
-
-    restored = sha(LIGHT) == original_sha and sha(MQTT) == mqtt_sha
-    print(f"tree restored byte-identical: {restored}")
-
+    print(f"RESULT: {len(killed)} killed, {len(survived)} survived, "
+          f"{len(no_verdict)} no verdict, {len(unapplied)} not applied, "
+          f"of {total}")
+    print("=" * 68)
     if survived:
-        print("\nSURVIVORS - a survivor is a question about the CODE and the")
-        print("HARNESS, not only about the suite. Three explanations: the test")
-        print("is weak, the mutation never applied, or the mutated code is")
-        print("redundant and genuinely changes nothing.")
-        for label, why in survived:
-            print(f"  - {label}: {why}")
+        print("\nSURVIVORS - a survivor is a question about the CODE, the "
+              "CORPUS and the\nHARNESS, not only about the suite: the test may "
+              "be weak, the mutation may\nnever have applied, the mutated code "
+              "may be redundant, or the construct may\nnot exist in the corpus "
+              "the suites actually read.")
+    for label in survived:
+        print(f"  SURVIVED  {label}")
+    for label in no_verdict:
+        print(f"  NO VERDICT  {label}")
+    for label in unapplied:
+        print(f"  NOT APPLIED  {label}")
 
-    return 0 if (killed == total and restored) else 1
+    # The byte-identity assertion. Read this line before believing any score
+    # above it - a run that exited is not a run whose cleanup ran.
+    drifted = [p for p in _ORIGINALS if sha(p) != shas[p]]
+    if not drifted:
+        print("\nTREE RESTORED: light.py and mqtt.py are byte-identical to "
+              "their pre-run state.")
+    else:
+        print(f"\n*** TREE NOT RESTORED - {', '.join(drifted)} DIFFER. "
+              f"Fix before committing. ***")
+        return 1
+    return 0 if not (survived or unapplied or no_verdict) else 1
 
 
 if __name__ == "__main__":
