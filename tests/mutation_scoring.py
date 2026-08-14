@@ -173,8 +173,46 @@ def ran_count(out):
     information" rather than as a false pass - but a battery that reports no
     information about every mutant is indistinguishable from one whose suite
     is broken, which is how it goes unread.
+
+    MATCH THE WHOLE SUMMARY SHAPE, not just its opening words. The anchor
+    alone is NECESSARY BUT NOT SUFFICIENT, and that was measured rather than
+    reasoned: unittest prints a failing test's docstring first line on its own
+    line AT COLUMN 0, so a docstring that BEGINS "Ran 99 tests ..." is
+    counted by an anchored-but-loose pattern exactly as a real summary is.
+    Measured on real output - three collected tests, anchored sum 102, and
+    the forged line sorts FIRST so even a single `re.search` returns 99.
+
+    Requiring ` in <float>s` closes it, because unittest's own format string
+    is fixed ("Ran %d test%s in %.3fs") while a docstring reproducing the
+    whole shape is no longer something anyone writes by accident. It is not
+    a proof - a docstring beginning "Ran 99 tests in 0.5s" still defeats it -
+    and tests/test_mutation_scoring.py pins that residual as a KNOWN
+    LIMITATION rather than leaving it to be rediscovered.
+
+    TWO MISS SHAPES THE LOOSE FORM DID NOT HAVE, neither reachable here.
+    `$` under re.M matches only immediately before `\\n`, so a CRLF line
+    ending or a trailing space defeats it and the summary is MISSED - which
+    collapses the count and suppresses every kill, the same silent direction
+    this rule exists to remove. Both are unreachable today: every harness in
+    this repo captures with `text=True`, which universal-newlines a CRLF
+    away, and unittest emits no trailing space. Stated because the failure
+    would be silent if either premise ever stopped holding, and because a
+    reader tightening this further should know which way the risk runs.
+
+    A MEASURED WAY TO CLOSE THE RESIDUAL, not taken here: unittest prints
+    `separator2` (70 dashes) immediately before the summary, while a failing
+    test's docstring is printed between `separator1` and `separator2`, so
+    requiring the preceding line distinguishes them completely. Verified by
+    review against six real suites plus the concatenated multi-suite and
+    import-death shapes, with identical counts everywhere and the whole-shape
+    forgery correctly excluded. NOT adopted yet because it interacts with
+    tests/test_suite_isolation.py's restore probe, whose canned doubles carry
+    no separator line - they would read as zero collected, which turns that
+    probe's CONTROL C into a false failure. Doing it means updating the
+    doubles in the same change and re-running every harness.
     """
-    return sum(int(n) for n in re.findall(r"^Ran (\d+) tests?", out, re.M))
+    return sum(int(n) for n in
+               re.findall(r"^Ran (\d+) tests? in [\d.]+s$", out, re.M))
 
 
 def named_failures(out):

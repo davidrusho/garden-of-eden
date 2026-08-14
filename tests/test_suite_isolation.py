@@ -642,8 +642,28 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         )
         lines = [ln for ln in proc.stdout.splitlines()
                  if ln.startswith("VERDICT ")]
+        # INDENTED, and that is not cosmetic (T-527.36). This pastes a
+        # subprocess's captured output into an assertion message, and the
+        # subprocess is a mutation harness whose own stdout carries unittest
+        # summary lines at column 0. Flush-left, those become indistinguishable
+        # from THIS run's summary, so any battery scoring this file would read
+        # an inflated ran-count, and `mutation_scoring.score_run` turns a moved
+        # count into NO VERDICT - suppressing every genuine kill, silently,
+        # because "no information" is what a reader skims past.
+        #
+        # Nothing scores this file today, so this was a latent coupling rather
+        # than a live fault. It is fixed here rather than guarded against: an
+        # earlier version of this change added a test asserting no harness
+        # SCORES a forging suite, and a review showed that guard was blind for
+        # three of fifteen harnesses (two spell their suite inline in argv, one
+        # names it MQTT_SUITE) while asserting in its own docstring that it
+        # could not be. It also pinned a PROXY - "does the file contain a
+        # summary-shaped literal" - when the hazard is a MECHANISM, the
+        # flush-left paste. Removing the hazard beats guarding it.
+        indented = "\n".join("    " + ln
+                             for ln in proc.stdout[-3000:].splitlines())
         self.assertEqual(1, len(lines),
-                         f"probe produced no verdict:\n{proc.stdout[-3000:]}")
+                         f"probe produced no verdict:\n{indented}")
         return json.loads(lines[0][len("VERDICT "):])
 
     def _assert_a_mutation_was_actually_on_disk(self, harness, verdict):

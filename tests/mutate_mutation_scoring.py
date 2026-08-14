@@ -114,15 +114,16 @@ MUTANTS = [
     # ---- ran_count -----------------------------------------------------
     ("ran_count: drop the singular form from the regex, so a one-test suite "
      "reads as zero collected",
-     'return sum(int(n) for n in re.findall(r"^Ran (\\d+) tests?", out, re.M))',
-     'return sum(int(n) for n in re.findall(r"^Ran (\\d+) tests", out, re.M))',
+     'r"^Ran (\\d+) tests? in [\\d.]+s$", out, re.M))',
+     'r"^Ran (\\d+) tests in [\\d.]+s$", out, re.M))',
      "reads_the_SINGULAR_form"),
 
     ("ran_count: take the FIRST count rather than the sum, so a harness "
      "running several suites undercounts every time",
-     'return sum(int(n) for n in re.findall(r"^Ran (\\d+) tests?", out, re.M))',
-     'm = re.findall(r"^Ran (\\d+) tests?", out, re.M)\n'
-     '    return int(m[0]) if m else 0',
+     "    return sum(int(n) for n in\n"
+     '               re.findall(r"^Ran (\\d+) tests? in [\\d.]+s$", out, re.M))',
+     '    m = re.findall(r"^Ran (\\d+) tests? in [\\d.]+s$", out, re.M)\n'
+     "    return int(m[0]) if m else 0",
      "sums_across_several_suites"),
 
     # T-527.36. The anchor, in both the ways it can be lost. Dropping `^` is
@@ -132,15 +133,25 @@ MUTANTS = [
     # suite. Without these two mutants the anchor is only prose.
     ("ran_count: unanchor the regex, so PROSE ABOUT a summary and a pasted "
      "capture are both counted as summaries",
-     'return sum(int(n) for n in re.findall(r"^Ran (\\d+) tests?", out, re.M))',
-     'return sum(int(n) for n in re.findall(r"Ran (\\d+) tests?", out))',
+     'r"^Ran (\\d+) tests? in [\\d.]+s$", out, re.M))',
+     'r"Ran (\\d+) tests? in [\\d.]+s", out, re.M))',
      "EMBEDDED_summary_line_is_not_counted"),
 
     ("ran_count: keep the ^ but drop re.M, so only the very first line of a "
      "concatenated multi-suite output can ever match",
-     'return sum(int(n) for n in re.findall(r"^Ran (\\d+) tests?", out, re.M))',
-     'return sum(int(n) for n in re.findall(r"^Ran (\\d+) tests?", out))',
+     'r"^Ran (\\d+) tests? in [\\d.]+s$", out, re.M))',
+     'r"^Ran (\\d+) tests? in [\\d.]+s$", out))',
      "sums_across_several_suites"),
+
+    # T-527.36 round 2. The half of the rule the anchor does NOT provide.
+    # Measured: with only the anchor, a docstring beginning "Ran 99 tests"
+    # is printed at column 0 by unittest and counted as a real summary - 102
+    # for a run that collected 3. This mutant is that state exactly.
+    ("ran_count: drop the ` in <float>s` shape requirement, so a DOCSTRING "
+     "that begins with a summary is counted as one (anchor-only state)",
+     'r"^Ran (\\d+) tests? in [\\d.]+s$", out, re.M))',
+     'r"^Ran (\\d+) tests?", out, re.M))',
+     "docstring_that_FORGES_a_summary_is_not_counted"),
 
     # ---- named_failures ------------------------------------------------
     ("named_failures: match FAIL:/ERROR: anywhere in the line instead of at "
@@ -256,8 +267,10 @@ MUTANTS = [
 # place for it: it is read by score_run and by three test classes, so a
 # suite that has stopped running at all cannot produce this red.
 CONTROL_B = ("CONTROL B: ran_count always returns 0 - must score KILLED",
-             'return sum(int(n) for n in re.findall(r"^Ran (\\d+) tests?", out, re.M))',
-             "return 0")
+             "    return sum(int(n) for n in\n"
+             '               re.findall(r"^Ran (\\d+) tests? in [\\d.]+s$", '
+             "out, re.M))",
+             "    return 0")
 
 # CONTROL C. Compiles, dies at IMPORT - must score NO VERDICT rather than
 # KILLED. A missing import rather than a typo'd name, per T-527.18: a name

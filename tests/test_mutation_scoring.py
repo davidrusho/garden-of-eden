@@ -24,6 +24,7 @@ concurrent writer on the thing every other harness measures.
 Run:  python3 -m unittest tests.test_mutation_scoring
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,134 @@ _IMPORT_DEATH_SRC = """
         def test_b(self): pass
         def test_c(self): pass
 """
+
+
+# Docstrings that LOOK like unittest's own summary. unittest prints a failing
+# test's docstring first line on its own line at COLUMN 0, so these are the
+# forgery the anchor exists to defeat - and the third one is the residual it
+# cannot. Kept as a module constant so the shapes are visible beside the
+# fixtures they defeat.
+_FORGING_DOCSTRINGS_SRC = """
+    import unittest
+    class T(unittest.TestCase):
+        def test_quotes_a_summary_mid_line(self):
+            "unittest writes 'Ran 1 test', not 'Ran 1 tests' - mid-line."
+            self.assertEqual(1, 0)
+        def test_docstring_BEGINS_with_a_summary(self):
+            "Ran 99 tests is how this docstring begins."
+            self.assertEqual(1, 0)
+        def test_ok(self):
+            pass
+"""
+
+
+class RanCountIsMeasuredAgainstRealUnittestOutput(unittest.TestCase):
+    """The column-0 claim, checked against the real thing (T-527.36).
+
+    `ran_count`'s rule rests on a claim about a TEXT FORMAT - "unittest
+    prints its summary at column 0 in a fixed shape, and nothing else does".
+    A fixture written by the same author as the rule shares its blind spot by
+    construction, so these cases run real `unittest` over generated modules
+    and read what it actually printed. That is the only arrangement in which
+    the suite can contradict the rule.
+
+    It has already done so once: an ANCHOR-ONLY rule (`^Ran (\\d+) tests?`)
+    was measured returning 102 for a run that collected 3, because one
+    generated docstring began "Ran 99 tests". The anchor was necessary and
+    not sufficient, and nothing but real output would have said so.
+    """
+
+    def _real(self, src):
+        """Run `src` for real and return (ok, output, tests-actually-collected).
+
+        THE BASELINE IS DERIVED INDEPENDENTLY OF THE RULE. An earlier version
+        of this helper re-ran `mutation_scoring`'s own regex character for
+        character, which made two of the three assertions in the caller below
+        the same computation twice - a control cannot contradict a rule it is
+        a copy of. unittest prints `separator2` (70 dashes) immediately before
+        its summary and prints a failing test's docstring somewhere else
+        entirely, so the position is an independent handle on the same fact.
+        Found by review, 2026-08-14.
+        """
+        ok, out = _UnittestOutput.run(test_x=src)
+        lines = out.splitlines()
+        collected = [ln for i, ln in enumerate(lines)
+                     if i and set(lines[i - 1]) == {"-"}
+                     and ln.startswith("Ran ")]
+        self.assertEqual(
+            1, len(collected),
+            f"CONTROL FAILED - expected exactly one summary line preceded by "
+            f"unittest's separator, found {collected}. There is nothing to "
+            f"measure against:\n{_quoted(out)}")
+        return ok, out, int(collected[0].split()[1])
+
+    def test_the_genuine_summary_is_at_column_zero_in_a_fixed_shape(self):
+        """POSITIVE CONTROL for every case below. If this shape ever moves,
+        the rule is measuring something that no longer exists and every other
+        verdict here is void."""
+        _, out, collected = self._real(_GREEN_SRC)
+        self.assertEqual(3, collected)
+        self.assertEqual(3, ms.ran_count(out))
+        # This one SPELLS OUT the shape on purpose, and it is not the
+        # restatement the module docstring forbids. That rule is about
+        # copying THIS PROJECT's rule into its own test, where the copy
+        # scores itself. Here the subject is a THIRD PARTY's output format -
+        # CPython's `Ran %d test%s in %.3fs` - and pinning it is the entire
+        # job: `ran_count` requires that shape, so if CPython ever changes it
+        # the rule starts missing real summaries, and a missed summary
+        # collapses the count into NO VERDICT. This test is the tripwire for
+        # that, and it can only be one by naming the shape.
+        self.assertTrue(
+            any(re.fullmatch(r"Ran \d+ tests? in [\d.]+s", line)
+                for line in out.splitlines()),
+            f"unittest's summary is no longer `Ran N test(s) in X.XXXs` at "
+            f"column 0. `ran_count` will now MISS real summaries, which reads "
+            f"as a collapsed count and suppresses every kill:\n{_quoted(out)}")
+
+    def test_a_docstring_that_FORGES_a_summary_is_not_counted(self):
+        """Both forging shapes at once, on real output.
+
+        The mid-line quote is defeated by the anchor. The one that BEGINS
+        with "Ran 99 tests" is printed at column 0 and is defeated only by
+        requiring the full ` in <float>s` shape - which is why the rule
+        carries both halves and not just the anchor.
+        """
+        _, out, collected = self._real(_FORGING_DOCSTRINGS_SRC)
+        self.assertEqual(3, collected)
+        # ASSERT THE LINE, NOT A SUBSTRING. The whole mechanism is that
+        # unittest prints the docstring AT COLUMN 0; `assertIn` against the
+        # whole output matches it anywhere, so prefixing the fixture's
+        # docstring with one character moved the forgery off column 0 and
+        # this control kept passing - including with the anchor-only mutant
+        # applied, which is the one regression it exists to cover. Found by
+        # review, 2026-08-14.
+        self.assertIn(
+            "Ran 99 tests is how this docstring begins.", out.splitlines(),
+            "CONTROL FAILED - the forging docstring is not printed at column "
+            "0, so this fixture cannot exhibit the defect and the assertion "
+            "below measures nothing")
+        self.assertEqual(
+            3, ms.ran_count(out),
+            f"a docstring was counted as a test run. Anchor-only scored 102 "
+            f"here.\n{_quoted(out)}")
+
+    def test_KNOWN_LIMITATION_a_docstring_reproducing_the_WHOLE_shape_wins(self):
+        """Pinned, not papered over.
+
+        Requiring ` in <float>s` narrows the forgery to a docstring that
+        reproduces unittest's entire summary shape. It does not eliminate it,
+        and a rule whose residual is undocumented gets rediscovered the
+        expensive way. If this test ever fails, somebody has closed the gap -
+        delete it and say how.
+
+        Not reachable by accident: it needs a docstring whose first line is
+        exactly a well-formed summary. It IS reachable on purpose, and this
+        repo writes docstrings about unittest output more than most.
+        """
+        self.assertEqual(
+            107, ms.ran_count("Ran 99 tests in 0.5s\nRan 8 tests in 0.001s"),
+            "the whole-shape forgery no longer wins - the rule has been "
+            "tightened further, so update this test rather than deleting it")
 
 
 class RealUnittestShapes(unittest.TestCase):
