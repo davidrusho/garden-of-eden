@@ -128,13 +128,35 @@ Mechanics, each of which has bitten this repo:
 import atexit
 import hashlib
 import os
-import re
 import shutil
 import signal
 import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+# The verdict rule is IMPORTED, not restated (T-550). This harness carried its
+# own `ran_count`, its own `score_run` and its own inline compile gate, and the
+# `ran_count` copy was still the unanchored `re.findall(r"Ran (\d+) tests?")`
+# form after the shared rule was anchored in T-527.36 - so the divergence the
+# consolidation exists to prevent had actually opened here.
+#
+# `score_run` and the compile gate WERE equivalent: same verdict strings, same
+# `!=` comparison against the clean baseline, same FAIL:/ERROR: line rule, same
+# gate message, each checked individually.
+#
+# `ran_count` was NOT - it is the one that differed, and that difference is the
+# whole ticket. So the justification for calling this a consolidation rather
+# than a behaviour change is the MEASUREMENT, not equivalence: the four suites
+# this harness scores were probed by forcing every test in each to FAIL, which
+# prints every docstring first line at column 0, and the anchored and unanchored
+# rules agreed on all four (66/66, 51/51, 44/44, 51/51). Verdicts before and
+# after are identical by mutant name. An earlier draft of this comment claimed
+# equivalence across the board, which was false about the only copy that mattered.
+from tests.mutation_scoring import (  # noqa: E402
+    compile_gate, format_verdict, ran_count, score_run)
+
 MQTT = os.path.join(REPO, "mqtt.py")
 
 # tests.test_water_interlock was added in T-527.11 remediation. It asserts the
@@ -614,55 +636,14 @@ def apply_mutation(anchor, replacement):
     # Checked BEFORE the write, so invalid Python never reaches disk. A mutant
     # that does not compile makes every suite die at collection and scores as
     # KILLED while the behaviour it was written for never runs.
-    try:
-        compile(mutated, MQTT, "exec")
-    except SyntaxError as exc:
-        print(f"  MUTANT IS NOT VALID PYTHON ({exc.msg}, line {exc.lineno}) - "
-              f"no verdict; a syntax error reddens the suite for the wrong reason")
+    refusal = compile_gate(mutated, MQTT)
+    if refusal:
+        print(f"  {refusal}")
         return False
 
     with open(MQTT, "w") as fh:
         fh.write(mutated)
     return True
-
-
-def ran_count(out):
-    """How many tests actually RAN, summed across the suites in `out`."""
-    return sum(int(n) for n in re.findall(r"Ran (\d+) tests?", out))
-
-
-def score_run(ok, out, clean_ran=None):
-    """Turn one suite run into a verdict: 'survived', 'killed' or 'no-verdict'.
-
-    THE THIRD VERDICT IS THE POINT. A battery scores by colour, so anything that
-    reddens the run reads as a kill - including a mutant that never let the
-    behaviour under test execute at all. The compile() gate keeps SYNTAX errors
-    off disk; it does nothing about a mutant that compiles and then dies at
-    import (a misspelled name, a bad attribute at module scope, an exception in
-    a top-level call). Those redden every suite with ZERO named failing cases,
-    which is the documented tell - and until T-527.11 this file printed that tell
-    and then appended the mutant to `killed` anyway, so the count it was meant to
-    correct never moved.
-
-    A red run with no named case is therefore NOT a verdict. It is the same
-    class of result as a mutant that would not apply: no information about the
-    suite, and it must not be counted for or against it.
-    """
-    if ok:
-        return "survived", []
-    fails = [line for line in out.splitlines()
-             if line.startswith(("FAIL:", "ERROR:"))]
-    # THE ZERO-NAMED-CASES TELL DOES NOT COVER THE ImportError FAMILY, which is
-    # the half this rule was believed to cover and did not (T-527.18). unittest
-    # wraps an unimportable module in `unittest.loader._FailedTest` and reports
-    # it as an ordinary NAMED ERROR, so `fails` is non-empty and the mutant
-    # scored as a kill while the behaviour under test never executed. The
-    # ran-count catches it: no honest mutant changes how many tests are
-    # COLLECTED, only how many pass. Passed in rather than recomputed so the
-    # comparison is always against THIS run's own clean baseline.
-    if clean_ran is not None and ran_count(out) != clean_ran:
-        return "no-verdict", fails
-    return ("killed" if fails else "no-verdict"), fails
 
 
 def run_suites():
@@ -772,15 +753,20 @@ def _run():
         restore()
         # Read WHY it died, not just the colour - see score_run().
         verdict, fails = score_run(ok, out, clean_ran)
+        # Report through the shared `format_verdict`, as four sibling harnesses
+        # already do. The SURVIVED and killed lines are character-identical to the
+        # local ones this replaces; the NO VERDICT line is not, and that is the
+        # point. `score_run` returns NO_VERDICT for TWO reasons - zero named cases,
+        # OR a collected count that moved - and the local string asserted the first
+        # unconditionally. On the count branch `fails` is non-empty, so the sentence
+        # "with ZERO named failing cases" was simply false, and it sent the reader
+        # after an import death when the cause was a moved collection count.
+        print(format_verdict(verdict, fails))
         if verdict == "survived":
-            print("  SURVIVED - no test noticed")
             survived.append(label)
         elif verdict == "no-verdict":
-            print("  NO VERDICT - the suites went red with ZERO named failing "
-                  "cases, so the behaviour under test never ran")
             no_verdict.append(label)
         else:
-            print(f"  killed ({len(fails)} failing case(s))")
             for line in fails[:3]:
                 print(f"      {line}")
             killed.append(label)

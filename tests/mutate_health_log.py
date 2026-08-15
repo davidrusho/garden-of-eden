@@ -24,6 +24,30 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+# `ran_count` is IMPORTED, not restated (T-550) - but READ WHAT IT IS USED FOR
+# HERE BEFORE ASSUMING THIS HARNESS SCORES THE WAY THE OTHERS DO.
+#
+# T-550 catalogued this file as one of two harnesses carrying an "inline
+# `re.search`, first match wins" copy of the ran-count rule. The regex was
+# real; the SCORING ROLE was not. This battery scores a mutant purely by
+# `run_suite`'s return code - there is no `clean_ran`, no comparison, and no
+# NO-VERDICT verdict anywhere in main(). The count was only ever a label in
+# the CONTROL A announcement line, printed on a run that has just been proved
+# GREEN, and a green unittest run prints no failing-test docstrings and no
+# assertion messages - which are the only two routes by which a forged
+# `Ran N tests` string can reach the captured output at all. So the unanchored
+# copy here was never exposed to a live forgery, and this change makes the
+# printed figure honest rather than fixing a scoring defect.
+#
+# The real gap this file has is a DIFFERENT one and is deliberately left
+# alone here, because closing it would change verdicts rather than
+# consolidate a rule: with no ran-count comparison, a mutant that kills the
+# module at IMPORT reddens the suite and is scored `killed`, exactly the
+# ImportError family that `mutation_scoring.score_run` exists to catch.
+from tests.mutation_scoring import ran_count  # noqa: E402
+
 SRC = "bin/gardyn-health-log.py"
 TESTS = "tests/test_health_log.py"
 
@@ -215,8 +239,24 @@ def main() -> int:
             print("CONTROL A FAILED (baseline is RED) - no result below means "
                   "anything. Output:\n" + err)
             return 2
-        count = re.search(r"Ran (\d+) tests", err)
-        print("control A: clean tree GREEN (%s tests)" % (count.group(1) if count else "?"))
+        # 0 is printed as "no summary line matched" rather than as a bare
+        # count, because a bare 0 reads as a measurement and this one is not.
+        #
+        # It is AMBIGUOUS between two states, and the label deliberately does
+        # not pick one: the output carried no `Ran N tests in Ns` line at all
+        # (a fact about the instrument), or it carried `Ran 0 tests in 0.000s`
+        # (a fact about the SUITE - a green run that collected nothing).
+        # Measured: ran_count returns 0 for both. An earlier version of this
+        # comment asserted the first, which is wrong in the direction that
+        # matters, since a zero-collection suite passes CONTROL A here and the
+        # battery proceeds - this harness has no `clean_ran == 0` abort of the
+        # kind mutate_light_scheduler.py carries. It then fails loudly rather
+        # than silently, every mutant scoring SURVIVED, so this is a legibility
+        # gap and not a false all-clear.
+        clean_ran = ran_count(err)
+        print("control A: clean tree GREEN (%s)"
+              % (f"{clean_ran} tests" if clean_ran
+                 else "no summary line matched"))
 
         # CONTROL B: a deliberately broken assertion must score RED. Both are
         # required. A is scored by the same code path as every mutant, so on

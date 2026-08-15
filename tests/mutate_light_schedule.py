@@ -63,13 +63,19 @@ biased toward the code you were already thinking about.
 """
 import hashlib
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+# `ran_count` is IMPORTED, not restated (T-550). The copy that lived here was
+# still the unanchored `re.findall(r"Ran (\d+) tests?")` form after the shared
+# rule was anchored in T-527.36. Only the rule is shared: the no-verdict
+# decision stays in this harness's own main(), where it also reports CONTROL C.
+from tests.mutation_scoring import ran_count  # noqa: E402
 
 # Where the battery actually runs. Rebound to the sandbox by main() before any
 # mutant is applied; the REPO default exists so the module can be imported and
@@ -497,19 +503,6 @@ def apply_mutation(anchor, replacement):
     with open(path, "w") as fh:
         fh.write(mutated)
     return True
-
-
-def ran_count(out):
-    """How many tests actually RAN, summed across the suites in `out`.
-
-    THE ONLY RELIABLE SIGNAL THAT A MUTANT DIED AT COLLECTION (T-527.18). The
-    zero-named-failures rule below cannot see the ImportError family, because
-    unittest reports an unimportable module as a named ERROR through
-    `unittest.loader._FailedTest`. No honest mutant changes how many tests are
-    COLLECTED, so a count that moved means the suite that ran is not the suite
-    being scored.
-    """
-    return sum(int(n) for n in re.findall(r"Ran (\d+) tests?", out))
 
 
 def run_suites():

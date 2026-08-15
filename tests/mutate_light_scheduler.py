@@ -84,7 +84,6 @@ Exit 0 all killed, 1 survivors or unapplied or no-verdict, 2 a broken
 instrument (either control failed).
 """
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -92,6 +91,15 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+# `ran_count` is IMPORTED, not restated (T-550). The copy that lived here was
+# still the unanchored `re.findall(r"Ran (\d+) tests?")` form after the shared
+# rule was anchored in T-527.36, so this harness and the ones importing the
+# module had already diverged on the rule they both claim to apply. Only the
+# rule is shared: the no-verdict decision below is still spelled out in this
+# harness's own main(), because it also drives CONTROL C's reporting.
+from tests.mutation_scoring import ran_count  # noqa: E402
 
 SRC = "light_scheduler.py"
 TESTS = "tests/test_light_scheduler.py"
@@ -698,30 +706,6 @@ def apply_once(path: Path, old: str, new: str):
             return f"mutant is not valid Python: {exc}"
     path.write_text(mutated)
     return None
-
-
-def ran_count(out: str) -> int:
-    """How many tests actually RAN, summed across the suites in `out`.
-
-    THE ONLY RELIABLE SIGNAL THAT A MUTANT DIED AT COLLECTION (T-527.18). The
-    no-verdict rule below was written to stop "the module died at import" being
-    scored as "the behaviour was noticed", and it looks for a red run with zero
-    named FAIL:/ERROR: lines. That catches nothing in the ImportError family,
-    because unittest wraps an unimportable module in `unittest.loader.
-    _FailedTest` and reports it as a perfectly ordinary named ERROR:
-
-        ERROR: test_light_scheduler (unittest.loader._FailedTest.…)
-        Ran 1 test in 0.000s
-
-    One named line, so the old rule scored it `killed (1 failing case(s))`
-    while the behaviour under test never executed. Confirmed by planting
-    `import a_module_that_does_not_exist` and reading the output.
-
-    The ran-count cannot be fooled that way: no honest mutant changes how many
-    tests are COLLECTED, only how many pass. A count that moved means the suite
-    that ran is not the suite that was scored.
-    """
-    return sum(int(n) for n in re.findall(r"Ran (\d+) tests?", out))
 
 
 def run_suites(root: Path, suites=(SUITE,)):

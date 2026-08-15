@@ -44,6 +44,24 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+# `ran_count` and the compile gate are IMPORTED, not restated (T-550). The
+# `ran_count` copy that lived here was still the unanchored
+# `re.findall(r"Ran (\d+) tests?")` form after the shared rule was anchored in
+# T-527.36.
+#
+# `score` and `named_failures` below are NOT replaced by the shared
+# `score_run` / `named_failures`, and the reason is behavioural rather than
+# stylistic: this harness's `named_failures` returns the failing test's NAME
+# (`^(?:FAIL|ERROR): (\S+)`) because its per-mutant report prints
+# `-> test_name` and its MUTANTS table names the test that must notice, while
+# the shared helper returns whole lines. Its `score` is also deliberately
+# one-sided - `ran < clean_ran`, a DROP - where the shared rule uses `!=`.
+# Swapping either would change this battery's output format and its verdict
+# rule in one step, which is a different change from consolidating the count.
+from tests.mutation_scoring import compile_gate, ran_count  # noqa: E402
+
 TARGET_REL = os.path.join("tests", "test_connack_refusal.py")
 
 # Only the suite that holds the scanner. The sibling suites in
@@ -249,10 +267,6 @@ def run_suites(root):
     return ok, "\n".join(out)
 
 
-def ran_count(out):
-    return sum(int(n) for n in re.findall(r"Ran (\d+) tests?", out))
-
-
 def named_failures(out):
     return re.findall(r"^(?:FAIL|ERROR): (\S+)", out, re.M)
 
@@ -289,11 +303,9 @@ def apply_mutation(path, anchor, replacement):
     if mutated == src:
         print("  replacement changed nothing - not applied, no verdict")
         return False
-    try:
-        compile(mutated, path, "exec")
-    except SyntaxError as exc:
-        print(f"  MUTANT IS NOT VALID PYTHON ({exc.msg}, line {exc.lineno}) - "
-              f"no verdict")
+    refusal = compile_gate(mutated, path)
+    if refusal:
+        print(f"  {refusal}")
         return False
     with open(path, "w") as fh:
         fh.write(mutated)

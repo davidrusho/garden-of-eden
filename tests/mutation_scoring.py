@@ -17,25 +17,93 @@ half-applied fix. tests/test_mutation_scoring.py drives this file directly, on
 inputs written for it, rather than restating the rule - a rule copied into its
 own test scores itself.
 
-THE CONSOLIDATION IS NOT FINISHED, and this docstring used to claim otherwise
-("a fix applied here cannot be half-applied across the fleet"). Only THREE
-harnesses import this module - mutate_camera_quality.py, mutate_light_logging.py
-and mutate_retired_entities.py. Five still carry their own copy:
+THE CONSOLIDATION IS FINISHED FOR `ran_count` AS OF T-550, and this docstring
+twice claimed the wrong thing about it - first that a fix here could not be
+half-applied (it could, and was), then that only THREE harnesses imported this
+module (five did by 85b86d6). So: state what is true and where the remaining
+seams are, rather than restating a scope.
 
-    mutate_connack_refusal.py   ran_count + score_run + literal verdict strings
-    mutate_light_scheduler.py   ran_count
-    mutate_light_schedule.py    ran_count
-    mutate_payload_scanner.py   ran_count + named_failures
-    mutate_health_log.py        first-match `re.search`, a different rule again
-    mutate_netwatch.py          first-match `re.search`
+Every harness in this repo that computes a ran-count now imports it from here:
 
-T-527.36 made that concrete rather than theoretical: `ran_count` was anchored
-here (see below) and those copies are still unanchored, so the divergence the
-sentence promised was impossible now exists. Whether any of them is exposed to
-a live forgery was NOT established - the two `Ran 175 tests` strings in
-tests/test_connack_refusal.py sit in a docstring body and a standalone comment,
-neither of which unittest prints. Do not read the absence of a confirmed
-exploit as coverage.
+    mutate_camera_quality.py    mutate_light_logging.py    mutate_log_hygiene.py
+    mutate_retired_entities.py  mutate_mutation_scoring.py mutate_connack_refusal.py
+    mutate_light_scheduler.py   mutate_light_schedule.py   mutate_payload_scanner.py
+    mutate_health_log.py        mutate_netwatch.py
+
+WHAT IS STILL NOT SHARED, named so the next reader does not mistake the list
+above for more than it says:
+
+  * mutate_payload_scanner.py keeps its own `score` and `named_failures`. Its
+    `named_failures` returns the failing test's NAME rather than the whole
+    line, because its report prints `-> test_name`; its `score` compares
+    `ran < clean_ran` (a DROP) where `score_run` uses `!=`.
+  * mutate_health_log.py and mutate_netwatch.py have NO ran-count comparison
+    at all. They score by return code, so `ran_count` there is a display
+    label on an already-green CONTROL A run, and they remain blind to the
+    ImportError family that `score_run` exists to separate out.
+  * mutate_light_scheduler.py and mutate_light_schedule.py spell the
+    no-verdict decision inline in their own main(), where it also drives
+    CONTROL C reporting; only the count comes from here.
+
+  * THREE INLINE COMPILE GATES SURVIVE, and this list said otherwise until a
+    review of T-550 enumerated them. `compile_gate` was adopted by
+    mutate_connack_refusal.py and mutate_payload_scanner.py in that same change
+    and NOT by:
+      - mutate_light_schedule.py, whose inline gate prints a message
+        byte-identical to compile_gate's - so it is a pure duplicate, in a file
+        T-550 was already editing.
+      - mutate_light_scheduler.py, whose gate DIVERGES: it returns
+        `f"mutant is not valid Python: {exc}"` and is guarded by
+        `if path.suffix == ".py"`.
+      - mutate_ha_birth_message.py, which imports nothing from here at all.
+    Left alone deliberately: swapping a divergent gate changes output, which is
+    a behaviour change rather than a consolidation, and T-550's acceptance was
+    scoped to the ran-count rule. Named here so the next reader does not read
+    "connack and payload_scanner now use compile_gate" as "compile_gate is
+    consolidated."
+
+  * purge_pycache and sha have local copies too: purge_pycache in
+    mutate_connack_refusal.py, mutate_light_schedule.py and
+    mutate_payload_scanner.py; sha in mutate_connack_refusal.py and
+    mutate_payload_scanner.py. The shared purge_pycache takes a `repo`
+    argument and two of those locals take none, so these are not drop-in
+    swaps. Two of the three locals also still carry the old
+    `if ".git" in root: continue` form that the shared version's comment
+    documents as going inert for any checkout whose ancestor path contains
+    `.git`.
+
+  BLAST RADIUS OF THE IMPORT ITSELF. Eleven harnesses now die at import if this
+  module is broken or `tests/__init__.py` disappears, where five did before
+  T-550, and tests/test_suite_isolation.py exec_module()s every harness in its
+  interrupt-restore probe. That is the intended trade of one shared rule
+  against a wider single point of failure, and it is the reason this module's
+  own battery (mutate_mutation_scoring.py) matters more than its size suggests.
+
+WAS ANY OF THEM EXPOSED TO A LIVE FORGERY? No, and this was measured rather
+than assumed (T-550), by a probe that forced EVERY test in each scored suite
+to FAIL - which makes unittest print every test's first docstring line at
+column 0, a far wider forgery surface than any single mutant produces - and
+compared the two rules over that output. Anchored equalled unanchored
+equalled the collected count in all nine suites the six harnesses score
+(test_connack_refusal, test_ha_birth_message, test_retired_entities,
+test_water_interlock, test_light_scheduler, test_light_schedule,
+test_health_log, test_netwatch, test_setup_units), against a positive
+control that DID report the `Ran 175 tests ... OK` shape when one was
+planted. The two `Ran 175 tests` strings in tests/test_connack_refusal.py
+are unprintable for a stronger reason than "a docstring": one is in the
+docstring BODY of the module-level helper `_payload_sinks`, which is not a
+test at all, and the other is a `#` comment.
+
+EXACTLY ONE SUITE IN THIS REPO CARRIES A LIVE FORGERY, and it is this rule's
+own: tests/test_mutation_scoring.py, whose `test_it_reads_the_SINGULAR_form`
+opens its docstring `unittest writes 'Ran 1 test', not 'Ran 1 tests' - ...`.
+Forced red, that suite reads 38 unanchored against 36 anchored. It is scored
+only by tests/mutate_mutation_scoring.py, which already imports from here -
+so the anchoring that T-527.36 added is load-bearing today, and the six
+harnesses converted in T-550 were hygiene rather than a bug fix. Verdicts
+were byte-identical across all eleven batteries before and after the
+conversion, and the nine batteries that can report NO VERDICT reported none
+on either side.
 
 WHAT THE RULE IS, and why each half exists:
 

@@ -42,6 +42,26 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+# `ran_count` is IMPORTED, not restated (T-550) - with the same caveat as
+# tests/mutate_health_log.py, and for the same reason.
+#
+# T-550 catalogued this file as carrying an "inline `re.search`, first match
+# wins" copy of the ran-count rule. The regex was real; it was not a scoring
+# input. This battery scores a mutant purely by `run_suite`'s return code -
+# no `clean_ran`, no comparison, no NO-VERDICT verdict in main(). The count
+# was a label in the CONTROL A announcement, printed on a run already proved
+# GREEN, and a green unittest run emits neither a failing test's docstring nor
+# an assertion message, which are the only two routes a forged `Ran N tests`
+# string has into captured output. The unanchored copy here was therefore
+# never exposed; this makes the printed figure honest.
+#
+# Left alone deliberately, because it changes verdicts rather than
+# consolidating a rule: with no ran-count comparison this harness scores a
+# mutant that dies at IMPORT as `killed`, which is the family
+# `mutation_scoring.score_run` exists to separate out.
+from tests.mutation_scoring import ran_count  # noqa: E402
 
 # The save-before-reboot ordering, spelled out in both directions. `outcome =
 # reboot()` is the line the write has to precede: the process may not run
@@ -321,8 +341,20 @@ def main() -> int:
             print("CONTROL A FAILED - the clean tree is already red, so no "
                   "mutant verdict below could mean anything.\n" + out[-4000:])
             return 2
-        total = re.search(r"Ran (\d+) tests", out)
-        print(f"CONTROL A ok: clean tree GREEN ({total.group(1) if total else '?'} tests)")
+        # 0 prints as "no summary line matched" rather than as a bare count,
+        # because a bare 0 reads as a measurement and this one is not. It is
+        # AMBIGUOUS between "no `Ran N tests in Ns` line at all" (the
+        # instrument) and "`Ran 0 tests in 0.000s`" (the suite collected
+        # nothing) - measured, ran_count returns 0 for both, and the label
+        # deliberately does not pick one. See the fuller note in
+        # mutate_health_log.py, which has the same gap.
+        #
+        # Note this figure covers BOTH suites this harness runs in one unittest
+        # invocation (tests.test_netwatch + tests.test_setup_units), so it is
+        # their sum and not either one's per-suite count.
+        total = ran_count(out)
+        print("CONTROL A ok: clean tree GREEN (%s)"
+              % (f"{total} tests" if total else "no summary line matched"))
 
         # --- CONTROL B: a broken assertion must score RED -----------------
         # Control A alone is worthless: it is scored by the same code path,
