@@ -49,8 +49,10 @@ Run:  python3 -m unittest tests.test_suite_isolation
 """
 import json
 import os
+import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -316,17 +318,12 @@ class DiscoveryOrderTests(unittest.TestCase):
 
 
 _RESTORE_PROBE = r"""
-import hashlib, importlib.util, json, os, stat, sys
+import atexit, hashlib, importlib.util, json, os, stat, sys, tempfile
 
 repo, harness, targets, mode, shape = (sys.argv[1], sys.argv[2],
                                        json.loads(sys.argv[3]), sys.argv[4],
                                        sys.argv[5])
 sys.path.insert(0, repo)
-
-spec = importlib.util.spec_from_file_location(
-    "_harness_under_test", os.path.join(repo, "tests", harness))
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
 
 # Content AND mode. A harness that recreates a deleted file with
 # write()/copyfile() gives it whatever the umask allows, and a content-only
@@ -338,6 +335,128 @@ def fingerprint(p):
     except OSError:
         return "<missing>"
     return f"{digest}:{oct(stat.S_IMODE(os.stat(p).st_mode))}"
+
+
+# ---------------------------------------------------------------- T-554.1 ---
+# THE REPAIR. This probe exists to stop a harness with a mutant on disk, so
+# whenever the restore under test FAILS - exactly when these tests do their job
+# - the mutant was being left in a shipping file with nothing saying so.
+#
+# `_state` is filled in after the harness module is imported. It is declared
+# here, and the atexit handler is registered here, because BOTH have to exist
+# before `exec_module` runs. See the ordering note on atexit below.
+_state = {"ready": False, "targets": [], "before": {}, "original": {},
+          "touched": set(), "reached_mutant": False}
+
+
+# ATOMIC, because the subject of this whole file is interruption. A plain
+# open(p, "wb") + write() leaves a window in which a real ^C or SIGTERM strands
+# a ZERO-BYTE shipping file - mqtt.py, bin/setup.sh, a systemd unit. Writing a
+# sibling temp file and os.replace()ing it means the target is either the old
+# bytes or the new ones and never nothing.
+#
+# NOTE FOR ANYONE EDITING THIS BLOCK: no function in here may carry a
+# docstring. This whole program is a triple-quoted string in the enclosing
+# file, so a nested triple quote terminates it and the outer file stops
+# parsing. Comments only.
+def _write_back(p, content, mode):
+    d = os.path.dirname(p) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".t554-repair-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        os.chmod(tmp, mode)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# Put back what the probe SAW THIS HARNESS CHANGE. Returns three lists:
+# repaired, failed, skipped.
+#
+# SCOPED ON PURPOSE, and the scoping is the safety property rather than an
+# optimisation. Peer sessions on this machine share ONE worktree (the repo's
+# CLAUDE.md says so), so a blanket "rewrite anything that differs from the
+# snapshot" would silently revert a concurrent writer's save to mqtt.py with no
+# error, no prompt and no git trace - a new harm this probe never had before it
+# started writing at all. So a path is only rewritten when the probe observed
+# it change under this harness, or when the harness was demonstrably
+# mid-mutation (past its own controls) at the time.
+#
+# Anything else that differs is REPORTED and left alone. A file that moved
+# without the harness touching it is far more likely to be somebody's work than
+# a stranded mutant, and the honest response to an ambiguous dirty file is to
+# name it, not to overwrite it.
+def _repair():
+    put_back, failed, skipped = [], [], []
+    if not _state["ready"]:
+        return put_back, failed, skipped
+    for p in _state["targets"]:
+        rel = os.path.relpath(p, repo)
+        if fingerprint(p) == _state["before"][p]:
+            continue
+        if p not in _state["touched"] and not _state["reached_mutant"]:
+            skipped.append(rel)
+            continue
+        content, mode = _state["original"][p]
+        try:
+            if content is None:
+                os.unlink(p)
+            else:
+                _write_back(p, content, mode)
+        except OSError as exc:
+            failed.append(f"{rel} (REPAIR FAILED: {exc})")
+            continue
+        # VERIFY, rather than treating "did not raise" as success. This is the
+        # only claim in the verdict that anybody acts on by NOT looking at the
+        # tree, so it has to be measured after the write like everything else
+        # in this file.
+        #
+        # DECLARED UNCOVERED (T-554.1): no test reddens if this check is
+        # deleted, and a mutant removing it survives the module. Reaching it
+        # needs a filesystem where os.replace() reports success and the bytes
+        # still differ, which the tests cannot simulate. It is kept as cheap
+        # defence rather than as something the suite is asserting - do not read
+        # the green suite as evidence this branch works.
+        if fingerprint(p) == _state["before"][p]:
+            put_back.append(rel)
+        else:
+            failed.append(f"{rel} (REPAIR FAILED: still differs after rewrite)")
+    return put_back, failed, skipped
+
+
+# Registered BEFORE the harness is imported so that it runs LAST.
+#
+# atexit is LIFO. Five of the seven IN_PLACE harnesses - camera_quality,
+# ha_birth_message, connack_refusal, light_logging, retired_entities - register
+# their own restore() with atexit while they are being imported. A repair that
+# ran only in the `finally` below would therefore be OVERWRITTEN at shutdown by
+# the very restore path under test, and a harness whose saved original is wrong
+# would undo the repair silently while the verdict still said "repaired".
+# Registering here, before exec_module, puts this handler at the bottom of the
+# LIFO stack and gives it the last word.
+#
+# It normally finds nothing: the `finally` repair has already run and every
+# fingerprint matches. It prints only when it had to act, and the driver merges
+# that into the verdict so the reported state is the FINAL one.
+def _final_repair():
+    put_back, failed, skipped = _repair()
+    if put_back or failed:
+        print("FINALREPAIR " + json.dumps(
+            {"repaired": put_back, "repair_failed": failed,
+             "repair_skipped": skipped}))
+
+
+atexit.register(_final_repair)
+
+spec = importlib.util.spec_from_file_location(
+    "_harness_under_test", os.path.join(repo, "tests", harness))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
 
 runner = "run_suites" if hasattr(mod, "run_suites") else "run_suite"
 # ASSERT THE NAME EXISTS. `setattr` below happily creates a new attribute on a
@@ -353,8 +472,43 @@ if not hasattr(mod, runner):
                  f"created one and let the harness run its real battery"}))
     raise SystemExit(0)
 before = {p: fingerprint(p) for p in targets}
+
+
+# T-554.1. THE FINGERPRINT ABOVE CAN DETECT A STRANDED MUTANT BUT CANNOT UNDO
+# ONE, and this probe's whole job is to stop a harness mid-mutation. Whenever
+# the restore under test FAILS - which is precisely when these tests fire - the
+# mutant is left sitting in the working tree, in a shipping file, with the
+# failure message saying nothing about it. So keep the BYTES and the MODE, not
+# just a digest of them, and repair from these in the `finally` below.
+#
+# Mode is captured deliberately: a repair that writes content and lets the
+# umask pick the bits silently demotes 100755 to 100644, which is a known trap
+# in this project and leaves a clean-looking `git status` behind a script that
+# no longer runs.
+def snapshot(p):
+    try:
+        with open(p, "rb") as fh:
+            content = fh.read()
+    except FileNotFoundError:
+        # Absent BEFORE the harness ran. Repair means REMOVING whatever the
+        # harness put here, not writing an empty file.
+        #
+        # FileNotFoundError specifically, never a bare OSError. Under OSError a
+        # target that is merely UNREADABLE at this moment (EACCES, a transient
+        # FS error) records as absent, and the repair for absent is os.unlink -
+        # so a blanket except would let a hiccup here DELETE a shipping file
+        # later. Anything other than "not there" propagates and kills the probe
+        # now, before it has mutated anything, which is the safe direction.
+        return None, None
+    return content, stat.S_IMODE(os.stat(p).st_mode)
+
+
+original = {p: snapshot(p) for p in targets}
 state = {"n": 0, "at_interrupt": None, "sandbox_before": None,
          "sandbox_at_interrupt": None}
+
+_state.update({"targets": targets, "before": before, "original": original,
+               "ready": True})
 
 # THE SANDBOX SIDE OF THE MEASUREMENT (T-527.31 review).
 #
@@ -472,6 +626,15 @@ def fake(*a, **k):
             return _RED_OK, _RED
         return _RED_OK, _IMPORT_DEATH
     now = {p: fingerprint(p) for p in targets}
+    # T-554.1. WHAT THE REPAIR IS ALLOWED TO TOUCH. Past the controls the
+    # harness is mid-battery, so anything seen differing from `before` here is
+    # attributable to it - which is what lets the repair put those back without
+    # gambling that no peer session is writing the same shared worktree.
+    # Accumulated across calls because delete mode polls until a file vanishes.
+    _state["reached_mutant"] = True
+    for p in targets:
+        if now[p] != before[p]:
+            _state["touched"].add(p)
     if mode == "delete":
         # Wait for the DELETE mutant, whose restore is a different code path
         # (move to a stash, copy back) from the text mutants' write().
@@ -483,31 +646,121 @@ def fake(*a, **k):
 
 setattr(mod, runner, fake)
 
+
+# ORDER IS LOAD-BEARING, and `_repair` is defined far above precisely so this
+# stays visible: `restored` is computed from the PRE-REPAIR measurement, inside
+# the `except` below, and only then does the repair run in the `finally`.
+# Repair first and every verdict in this file becomes `restored: true` by
+# construction - the probe would be marking its own homework, and the tests
+# that exist to catch a broken restore could never fail again. Nothing enforces
+# that ordering except this comment and one assertion,
+# ProbeRepairTests.test_the_probe_repairs_content_and_mode_a_harness_did_not_
+# restore's assertFalse(verdict["restored"]).
+verdict = None
 try:
-    mod.main()
-    verdict = {"error": "main() returned without the injected interrupt"}
-except KeyboardInterrupt:
-    if state["at_interrupt"] is None:
-        verdict = {"error": "never reached a mutant"}
-    else:
-        verdict = {
-            "applied": any(state["at_interrupt"][p] != before[p]
-                           for p in targets),
-            "deleted": any(v == "<missing>"
-                           for v in state["at_interrupt"].values()),
-            "restored": all(fingerprint(p) == before[p] for p in targets),
-            # True only when a mutation was demonstrably on disk INSIDE the
-            # copy at the moment of the interrupt. That is the sandbox
-            # property measured from the other side, and it is what stops
-            # `applied: false` being satisfied by a probe that mutated nothing
-            # anywhere.
-            "sandbox_mutated": bool(
-                state["sandbox_before"] and state["sandbox_at_interrupt"]
-                and state["sandbox_before"] != state["sandbox_at_interrupt"]),
-            "sandbox_found": state["sandbox_at_interrupt"] is not None,
-        }
-print("VERDICT " + json.dumps(verdict))
+    try:
+        mod.main()
+        verdict = {"error": "main() returned without the injected interrupt"}
+    except KeyboardInterrupt:
+        if state["at_interrupt"] is None:
+            verdict = {"error": "never reached a mutant"}
+        else:
+            verdict = {
+                "applied": any(state["at_interrupt"][p] != before[p]
+                               for p in targets),
+                "deleted": any(v == "<missing>"
+                               for v in state["at_interrupt"].values()),
+                "restored": all(fingerprint(p) == before[p] for p in targets),
+                # True only when a mutation was demonstrably on disk INSIDE the
+                # copy at the moment of the interrupt. That is the sandbox
+                # property measured from the other side, and it is what stops
+                # `applied: false` being satisfied by a probe that mutated nothing
+                # anywhere.
+                "sandbox_mutated": bool(
+                    state["sandbox_before"] and state["sandbox_at_interrupt"]
+                    and state["sandbox_before"] != state["sandbox_at_interrupt"]),
+                "sandbox_found": state["sandbox_at_interrupt"] is not None,
+            }
+finally:
+    # EVERY exit path, including one this probe does not model. An unexpected
+    # exception out of mod.main() prints no verdict at all, which the driver
+    # reports as "probe produced no verdict" - and that is exactly the run
+    # most likely to have left a mutant on disk, because nothing got as far as
+    # measuring. `repaired` rides on the verdict when there is one; when there
+    # is not, the repair still happens and that is the part that matters.
+    _put_back, _failed, _skipped = _repair()
+    if verdict is not None:
+        verdict["repaired"] = _put_back
+        verdict["repair_failed"] = _failed
+        verdict["repair_skipped"] = _skipped
+if verdict is not None:
+    print("VERDICT " + json.dumps(verdict))
 """
+
+
+def _merge_final_repair(verdict, stdout):
+    """Fold the probe's atexit-time repair into the verdict it already printed.
+
+    The verdict is printed before interpreter shutdown, and five of the seven
+    IN_PLACE harnesses restore from an `atexit` handler that runs after it. The
+    probe's own final repair is registered before those (so it runs last, atexit
+    being LIFO) and prints a FINALREPAIR line when it had to act. Without this
+    merge, `repaired` would describe a state that no longer existed by the time
+    the process exited - which is exactly the kind of stale claim the failure
+    messages below are being careful not to make.
+    """
+    for line in stdout.splitlines():
+        if not line.startswith("FINALREPAIR "):
+            continue
+        final = json.loads(line[len("FINALREPAIR "):])
+        for key in ("repaired", "repair_failed", "repair_skipped"):
+            merged = list(verdict.get(key) or [])
+            # DEDUPE ON THE PATH, not the whole entry. A failed repair is
+            # retried at exit and fails again, and the two messages differ
+            # (each names its own temp file), so a plain `not in` check would
+            # report one path twice and read as two damaged files.
+            seen = {item.split(" (", 1)[0] for item in merged}
+            for item in final.get(key) or []:
+                if item.split(" (", 1)[0] not in seen:
+                    merged.append(item)
+                    seen.add(item.split(" (", 1)[0])
+            verdict[key] = merged
+    return verdict
+
+
+def _tree_note(verdict):
+    """One sentence about what the probe did to the working tree.
+
+    Shared by every failure message that follows, because getting this wrong
+    RE-CREATES THE DEFECT THE TICKET WAS FILED TO REMOVE. The first version of
+    this change hardcoded "the probe has since put it back, so `git status` is
+    clean" into each message - true in the common case, and flatly false when
+    the repair itself failed, which is precisely when a maintainer most needs
+    to be told the tree is still dirty. A review caught it. So the sentence is
+    DERIVED from the verdict rather than asserted, and the bad news sorts
+    first.
+    """
+    failed = verdict.get("repair_failed") or []
+    skipped = verdict.get("repair_skipped") or []
+    repaired = verdict.get("repaired") or []
+    if failed:
+        return (f"*** THE WORKING TREE IS STILL DIRTY *** the probe could NOT "
+                f"put these back: {failed}. Deal with the tree before anything "
+                f"else - a shipping file is holding a mutant.")
+    parts = []
+    if repaired:
+        parts.append(f"the probe has since put back {repaired}, so a clean "
+                     f"`git status` is NOT evidence the harness restored "
+                     f"anything - this assertion is")
+    if skipped:
+        parts.append(f"the probe deliberately left {skipped} alone: they "
+                     f"differ from the pre-run snapshot but it never saw this "
+                     f"harness touch them, so a concurrent session writing the "
+                     f"shared worktree is the likelier explanation. Check "
+                     f"before reverting anything")
+    if not parts:
+        parts.append("the probe found nothing to put back")
+    return "; ".join(parts) + "."
 
 
 class MutationHarnessRestoreTests(unittest.TestCase):
@@ -548,10 +801,30 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                  # confirmed forgery escapes under a green control.
                  "mutate_payload_scanner.py",
                  # T-527.36. Sandboxed from the start, and not as a default:
-                 # its target is tests/mutation_scoring.py, which three other
-                 # harnesses import at their own module scope. Mutating it in
-                 # the working tree would hand a concurrent session verdicts
+                 # its target is tests/mutation_scoring.py, which TEN other
+                 # harnesses import at their own module scope (eleven
+                 # importers, one of which is this harness itself). Mutating it
+                 # in the working tree would hand a concurrent session verdicts
                  # from a deliberately broken scorer, with nothing to say so.
+                 #
+                 # The count was "three" until T-554.1 and was already stale at
+                 # four when it was written; T-550 moved six more harnesses
+                 # onto the shared rule. Re-derive rather than trusting it:
+                 #
+                 #   grep -rl "^from tests.mutation_scoring import" \
+                 #       tests/mutate_*.py | wc -l        # -> 11
+                 #
+                 # SCOPED TO tests/mutate_*.py AND ANCHORED ON PURPOSE. A
+                 # recipe reading `grep -rl ... tests/` returns 12, because
+                 # THIS FILE matches on the strength of this very comment - so
+                 # a maintainer following it would get 12, conclude the figure
+                 # was stale again, and "fix" a correct number. (Also note
+                 # `-lc` is not two flags doing two jobs: BSD grep lets -l win
+                 # and prints no counts at all.)
+                 #
+                 # The CONCLUSION has never depended on the number - it only
+                 # gets stronger - but a wrong figure in a comment arguing for
+                 # a sandbox is the kind of thing a reader checks once.
                  "mutate_mutation_scoring.py",
                  # T-527.28. log_hygiene.py is imported by mqtt.py at module
                  # scope, so mutating it in the working tree would hand a
@@ -578,9 +851,30 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                                  "tests/test_health_log.py"],
         # NOT tests/fixtures/gardyn-upgrade-policy.json, though the harness
         # names it: CONFIG_MUTANTS mutate a deepcopy of the PARSED fixture in
-        # memory, and the file itself is only ever read. Listing a path the
-        # harness never intends to write makes `applied: false` true for a
-        # reason that has nothing to do with sandboxing.
+        # memory, and the file itself is only ever read.
+        #
+        # T-554.1 CORRECTED THE REASON, which was backwards and is worth
+        # stating because two comments in this table argued from it. It said
+        # listing a never-written path "makes `applied: false` true for a
+        # reason that has nothing to do with sandboxing". It cannot: `applied`
+        # is an any() over the declared paths, so an unchanged extra
+        # contributes False and cannot move the verdict in either direction.
+        # Verified by re-adding the exact path 5d37b51 removed and re-running -
+        # OK, no verdict changed.
+        #
+        # So the pruning is HARMLESS rather than necessary, and the real blind
+        # spot runs the OTHER WAY: a harness that regresses to writing a file
+        # NOT on this list is invisible to `applied`, `restored` and
+        # `sandbox_mutated` alike. Shortening the list is what creates that
+        # gap. Keep an entry off only when the harness demonstrably never
+        # writes it, as here - never merely to tidy the table.
+        #
+        # ONE THING AN EXTRA PATH *CAN* MOVE, so this is not a licence to pad
+        # the table either: sandbox_paths() is all-or-nothing (it returns None
+        # unless EVERY target maps to a counterpart inside the copy), so a path
+        # with no counterpart there flips `sandbox_found` to False. That does
+        # not fire for a harness that copies the whole repo, which is all of
+        # them today.
         "mutate_upgrade_policy.py": ["bin/gardyn-check-upgrade-policy.py",
                                      "tests/test_upgrade_policy.py"],
         "mutate_netwatch.py": ["bin/gardyn-netwatch.py",
@@ -596,9 +890,10 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         "mutate_payload_scanner.py": ["tests/test_connack_refusal.py"],
         # Only the module, not tests/test_mutation_scoring.py: the battery
         # mutates the RULE and leaves the suite that drives it alone. Listing
-        # the suite too would make `applied: false` true for a file the
-        # harness never intended to write, which is the failure the note on
-        # mutate_upgrade_policy.py above describes.
+        # the suite too would be harmless rather than wrong - see the corrected
+        # note on mutate_upgrade_policy.py above for why an unchanged extra
+        # path cannot move any verdict. It is left off because the harness
+        # demonstrably does not write it, not to keep the list short.
         "mutate_mutation_scoring.py": ["tests/mutation_scoring.py"],
         # Only the module. The suite that drives it is not mutated.
         "mutate_log_hygiene.py": ["log_hygiene.py"],
@@ -671,7 +966,8 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                              for ln in proc.stdout[-3000:].splitlines())
         self.assertEqual(1, len(lines),
                          f"probe produced no verdict:\n{indented}")
-        return json.loads(lines[0][len("VERDICT "):])
+        return _merge_final_repair(json.loads(lines[0][len("VERDICT "):]),
+                                   proc.stdout)
 
     def _assert_a_mutation_was_actually_on_disk(self, harness, verdict):
         """The positive control for a SANDBOXED harness's verdict.
@@ -716,14 +1012,19 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         for harness, targets in sorted(self.IN_PLACE.items()):
             with self.subTest(harness=harness):
                 verdict = self._drive(harness, targets)
-                self.assertNotIn("error", verdict, verdict.get("error"))
+                self.assertNotIn(
+                    "error", verdict,
+                    f"{verdict.get('error')} {_tree_note(verdict)}")
                 # The positive control: if no mutant was ever on disk, a
                 # "restored" verdict means nothing.
                 self.assertTrue(verdict["applied"],
                                 "the probe never caught a mutant on disk, so "
                                 "the restore was not exercised")
-                self.assertTrue(verdict["restored"],
-                                f"{harness} left a mutant in the working tree")
+                self.assertTrue(
+                    verdict["restored"],
+                    f"{harness} left a mutant in the working tree. "
+                    f"{_tree_note(verdict)} Fix the harness's own restore "
+                    f"path.")
 
     def test_an_interrupted_DELETE_mutant_restores_content_and_mode(self):
         """The deletion restore is a separate path, and it recreates the file -
@@ -736,13 +1037,20 @@ class MutationHarnessRestoreTests(unittest.TestCase):
             with self.subTest(harness=harness):
                 verdict = self._drive(harness, self.IN_PLACE[harness],
                                       mode="delete")
-                self.assertNotIn("error", verdict, verdict.get("error"))
+                self.assertNotIn(
+                    "error", verdict,
+                    f"{verdict.get('error')} {_tree_note(verdict)}")
                 self.assertTrue(verdict["deleted"],
                                 "the probe never caught a deleted file, so the "
                                 "deletion restore was not exercised")
-                self.assertTrue(verdict["restored"],
-                                f"{harness} did not restore a deleted file's "
-                                f"content and mode")
+                self.assertTrue(
+                    verdict["restored"],
+                    f"{harness} did not restore a deleted file's content and "
+                    f"mode. {_tree_note(verdict)} That matters here more than "
+                    f"anywhere else in this file: this harness's delete mutant "
+                    f"moves gardyn-netwatch.timer out of the tree entirely, "
+                    f"and DEPLOY.md calls netwatch the one component whose bad "
+                    f"version can take the host away permanently.")
 
     def test_a_sandboxed_harness_leaves_the_working_tree_untouched(self):
         """The sandbox property MEASURED, not parsed (T-527.31).
@@ -784,7 +1092,8 @@ class MutationHarnessRestoreTests(unittest.TestCase):
         checked and why it is not done by reading the harness's stdout.
         """
         control = self._drive("mutate_ha_birth_message.py", ["mqtt.py"])
-        self.assertNotIn("error", control, control.get("error"))
+        self.assertNotIn("error", control,
+                         f"{control.get('error')} {_tree_note(control)}")
         self.assertTrue(
             control["applied"],
             "CONTROL FAILED - an IN_PLACE harness driven through this probe "
@@ -813,16 +1122,26 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                     f"(declared {self.RUNNER_SHAPE[harness]!r}) before "
                     f"suspecting the harness - a bool handed to an rc-shaped "
                     f"runner aborts it at its own control A.")
+                # THE TREE NOTE BELONGS ON THIS ASSERTION, not only on the
+                # `restored` one below it (T-554.1). The order above is
+                # load-bearing and deliberately not changed - but it means that
+                # in the scenario this message exists for, a SANDBOXED harness
+                # regressing to writing the live tree, THIS is the message the
+                # maintainer reads and the `restored` one is unreachable. Left
+                # bare, it says "a mutant was on disk IN THE WORKING TREE", the
+                # maintainer runs `git status`, finds it clean because the
+                # probe repaired it, and concludes the probe is broken.
                 self.assertFalse(
                     verdict["applied"],
                     f"{harness} is listed SANDBOXED, but a mutant was on disk "
                     f"IN THE WORKING TREE when the battery was interrupted. It "
                     f"is writing the originals, so its exemption from the "
-                    f"interrupted-battery restore check is unearned.")
+                    f"interrupted-battery restore check is unearned. "
+                    f"{_tree_note(verdict)}")
                 self.assertTrue(
                     verdict["restored"],
                     f"{harness} left the working tree changed after an "
-                    f"interrupt")
+                    f"interrupt. {_tree_note(verdict)}")
                 # Last, because it is the weakest claim of the three: it says
                 # the measurement was taken on something real, not that the
                 # harness behaved.
@@ -1116,6 +1435,642 @@ class MutationHarnessRestoreTests(unittest.TestCase):
                          "a mutation harness is in neither IN_PLACE nor "
                          "SANDBOXED, so nothing here checks it")
         self.assertEqual(set(), set(self.IN_PLACE) & self.SANDBOXED)
+
+
+class ProbeRepairTests(unittest.TestCase):
+    """The probe must put the tree back when the restore under test FAILS.
+
+    T-554.1. Every test in MutationHarnessRestoreTests drives a real harness to
+    the moment a mutant is on disk and then raises. When the harness restores,
+    the tree is clean and nobody notices this question. When it does NOT - the
+    case those tests exist to catch - the mutant was left sitting in a shipping
+    file, and the failure message never said so. Three things made that worse
+    than a dirty file: `assertFalse(applied)` fires before `assertTrue
+    (restored)` in the sandboxed test, so the one message that would mention
+    the tree is unreachable exactly when it is true; mutate_setup_units.py's
+    delete mutant moves gardyn-netwatch.timer out of the tree entirely, and
+    DEPLOY.md calls netwatch the one component whose bad version can take the
+    host away permanently; and it cascades, because every later test then
+    measures against a mutated baseline.
+
+    THESE FIXTURES ARE HERMETIC ON PURPOSE. A test for "the probe repairs a
+    working tree" that used the real working tree would have to break the real
+    working tree first, in a repo concurrent sessions share. So each builds a
+    throwaway directory that is shaped like a repo - `tests/<harness>.py` plus
+    the files it mutates - and points the probe at that. REPO is never passed.
+    """
+
+    # A harness that applies a mutant and never puts it back. `run_suites` is
+    # what the probe replaces; `main` is what it calls. The first two calls are
+    # the probe's controls A and B, so the mutation has to land after them and
+    # be followed by a third call for the interrupt to catch it mid-mutant.
+    _NO_RESTORE = '''\
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEXT_TARGET = os.path.join(ROOT, "victim.py")
+EXEC_TARGET = os.path.join(ROOT, "victim.sh")
+
+
+def run_suites(*a, **k):
+    return True, "Ran 40 tests in 0.100s\\n\\nOK\\n"
+
+
+def main():
+    run_suites()
+    run_suites()
+    with open(TEXT_TARGET, "w") as fh:
+        fh.write("MUTATED\\n")
+    # Mode-only damage on the second target. A content-only repair calls this
+    # restored and silently ships a script that no longer runs.
+    os.chmod(EXEC_TARGET, 0o644)
+    run_suites()
+    raise AssertionError("unreachable - the probe should have interrupted")
+'''
+
+    # Mutates, lets the probe SEE the mutation, and then dies in a way the
+    # probe does not model at all. No KeyboardInterrupt, so no verdict is ever
+    # printed - which is the exact run the `finally` exists for, and the one
+    # most likely to strand a mutant, because nothing got as far as measuring.
+    #
+    # Driven in "delete" mode on purpose. That is the one mode where the probe
+    # keeps handing control back (it polls until a file VANISHES) instead of
+    # raising at the first mutant, which is what lets this harness both be
+    # observed mutating and then reach its own RuntimeError.
+    _NO_RESTORE_RAISES = '''\
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEXT_TARGET = os.path.join(ROOT, "victim.py")
+
+
+def run_suites(*a, **k):
+    return True, "Ran 40 tests in 0.100s\\n\\nOK\\n"
+
+
+def main():
+    run_suites()
+    run_suites()
+    with open(TEXT_TARGET, "w") as fh:
+        fh.write("MUTANT LEFT BEHIND\\n")
+    run_suites()
+    raise RuntimeError("a failure mode the probe does not model")
+'''
+
+    # Registers its restore with atexit - the shape five of the seven IN_PLACE
+    # harnesses really use - and restores the WRONG bytes, which is the defect
+    # class these tests exist to catch. atexit runs after the probe's `finally`,
+    # so without the probe's own atexit handler being registered FIRST (and
+    # therefore running LAST) this harness gets the last word and undoes the
+    # repair silently.
+    _ATEXIT_WRONG_RESTORE = '''\
+import atexit, os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEXT_TARGET = os.path.join(ROOT, "victim.py")
+
+
+def restore():
+    with open(TEXT_TARGET, "w") as fh:
+        fh.write("HARNESS RESTORED THE WRONG BYTES\\n")
+
+
+atexit.register(restore)
+
+
+def run_suites(*a, **k):
+    return True, "Ran 40 tests in 0.100s\\n\\nOK\\n"
+
+
+def main():
+    run_suites()
+    run_suites()
+    with open(TEXT_TARGET, "w") as fh:
+        fh.write("MUTATED\\n")
+    run_suites()
+    raise AssertionError("unreachable - the probe should have interrupted")
+'''
+
+    # Restores CORRECTLY on the way out, then damages the file again from an
+    # atexit handler. The probe's `finally` repair therefore finds nothing to
+    # do, and the only record of the later damage is the FINALREPAIR line the
+    # driver merges back into the verdict.
+    _CORRECT_RESTORE_THEN_ATEXIT_DAMAGE = '''\
+import atexit, os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEXT_TARGET = os.path.join(ROOT, "victim.py")
+ORIGINAL = open(TEXT_TARGET, "rb").read()
+
+
+def wreck():
+    with open(TEXT_TARGET, "wb") as fh:
+        fh.write(b"atexit wrote this AFTER the verdict\\n")
+
+
+atexit.register(wreck)
+
+
+def run_suites(*a, **k):
+    return True, "Ran 40 tests in 0.100s\\n\\nOK\\n"
+
+
+def main():
+    run_suites()
+    run_suites()
+    try:
+        with open(TEXT_TARGET, "wb") as fh:
+            fh.write(b"MUTATED\\n")
+        run_suites()
+    finally:
+        with open(TEXT_TARGET, "wb") as fh:
+            fh.write(ORIGINAL)
+'''
+
+    # Its target is unreadable when the probe snapshots it. The harness would
+    # make it readable and mutate it - but must never get the chance, because
+    # a probe that cannot read a target has no original to repair from.
+    _MAKES_UNREADABLE_TARGET_READABLE = '''\
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEXT_TARGET = os.path.join(ROOT, "victim.py")
+
+
+def run_suites(*a, **k):
+    return True, "Ran 40 tests in 0.100s\\n\\nOK\\n"
+
+
+def main():
+    run_suites()
+    run_suites()
+    os.chmod(TEXT_TARGET, 0o644)
+    with open(TEXT_TARGET, "wb") as fh:
+        fh.write(b"MUTATED\\n")
+    run_suites()
+'''
+
+    _NO_RESTORE_DELETE = '''\
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXEC_TARGET = os.path.join(ROOT, "victim.sh")
+
+
+def run_suites(*a, **k):
+    return True, "Ran 40 tests in 0.100s\\n\\nOK\\n"
+
+
+def main():
+    run_suites()
+    run_suites()
+    os.unlink(EXEC_TARGET)
+    run_suites()
+    raise AssertionError("unreachable - the probe should have interrupted")
+'''
+
+    TEXT_BODY = b"original text target\n"
+    EXEC_BODY = b"#!/bin/sh\necho original\n"
+
+    def _fixture(self, harness_source):
+        """A throwaway directory shaped like a repo, with two victim files."""
+        tmp = tempfile.mkdtemp(prefix="t554-probe-repair-")
+        self.addCleanup(_rmtree, tmp)
+        os.mkdir(os.path.join(tmp, "tests"))
+        with open(os.path.join(tmp, "tests", "mutate_fixture.py"), "w") as fh:
+            fh.write(harness_source)
+        text = os.path.join(tmp, "victim.py")
+        with open(text, "wb") as fh:
+            fh.write(self.TEXT_BODY)
+        os.chmod(text, 0o644)
+        ex = os.path.join(tmp, "victim.sh")
+        with open(ex, "wb") as fh:
+            fh.write(self.EXEC_BODY)
+        os.chmod(ex, 0o755)
+        return tmp, text, ex
+
+    def _drive_fixture(self, tmp, targets, mode="text", before_probe=None):
+        if before_probe is not None:
+            before_probe()
+        proc = subprocess.run(
+            [sys.executable, "-c", _RESTORE_PROBE, tmp, "mutate_fixture.py",
+             json.dumps(targets), mode, "bool"],
+            cwd=tmp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+        )
+        lines = [ln for ln in proc.stdout.splitlines()
+                 if ln.startswith("VERDICT ")]
+        indented = "\n".join("    " + ln
+                             for ln in proc.stdout[-3000:].splitlines())
+        self.assertEqual(1, len(lines),
+                         f"fixture probe produced no verdict:\n{indented}")
+        return _merge_final_repair(json.loads(lines[0][len("VERDICT "):]),
+                                   proc.stdout)
+
+    @staticmethod
+    def _mode(path):
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+    def test_the_probe_repairs_content_and_mode_a_harness_did_not_restore(self):
+        tmp, text, ex = self._fixture(self._NO_RESTORE)
+        verdict = self._drive_fixture(tmp, [text, ex])
+
+        self.assertNotIn("error", verdict, verdict.get("error"))
+        # The positive control. Without this, every assertion below is
+        # satisfied by a probe that never reached the mutation at all - the
+        # files would be untouched because nothing touched them.
+        self.assertTrue(
+            verdict["applied"],
+            "CONTROL FAILED - the fixture harness's mutation was not on disk "
+            "when the probe interrupted, so this test proves nothing about "
+            "repair. Suspect the control count (the probe treats the first two "
+            "runner calls as controls A and B).")
+
+        # HONESTY OF THE VERDICT, and the reason repair runs in a `finally`
+        # AFTER this is computed. The fixture harness restores nothing, so the
+        # only truthful answer is False. If a future edit repairs before
+        # measuring, this flips to True and every restore test in this file
+        # becomes incapable of failing - which is why it is asserted here
+        # rather than left implicit.
+        self.assertFalse(
+            verdict["restored"],
+            "the probe reported the tree restored by a harness that restores "
+            "nothing - the repair is running BEFORE the measurement, so "
+            "`restored` is now true by construction for every harness.")
+
+        self.assertEqual(
+            sorted(["victim.py", "victim.sh"]), sorted(verdict["repaired"]),
+            "the probe did not report repairing both damaged targets")
+
+        # THE POINT OF THE TICKET: the tree is actually back.
+        with open(text, "rb") as fh:
+            self.assertEqual(self.TEXT_BODY, fh.read(),
+                             "the probe left a text mutant on disk")
+        with open(ex, "rb") as fh:
+            self.assertEqual(self.EXEC_BODY, fh.read(),
+                             "the probe corrupted a target it only needed to "
+                             "chmod back")
+        self.assertEqual(
+            0o755, self._mode(ex),
+            "the probe restored content but not MODE - a reconstruction that "
+            "demotes 100755 to 100644 leaves a clean `git status` behind a "
+            "script that no longer runs.")
+        self.assertEqual(0o644, self._mode(text))
+
+    def test_the_probe_recreates_a_file_the_harness_deleted(self):
+        """The deletion path is different code and has to come back with both
+        halves. A repair that writes bytes and lets the umask choose the mode
+        is the exact trap this project has hit before."""
+        tmp, _text, ex = self._fixture(self._NO_RESTORE_DELETE)
+        verdict = self._drive_fixture(tmp, [ex], mode="delete")
+
+        self.assertNotIn("error", verdict, verdict.get("error"))
+        self.assertTrue(
+            verdict["deleted"],
+            "CONTROL FAILED - the probe never caught the file missing, so the "
+            "deletion repair was not exercised.")
+        self.assertFalse(verdict["restored"])
+        self.assertEqual(["victim.sh"], verdict["repaired"])
+
+        self.assertTrue(os.path.exists(ex),
+                        "the probe did not recreate a deleted target")
+        with open(ex, "rb") as fh:
+            self.assertEqual(self.EXEC_BODY, fh.read())
+        self.assertEqual(
+            0o755, self._mode(ex),
+            "the deleted file came back with the wrong permissions")
+
+    def test_the_probe_removes_a_file_that_did_not_exist_before(self):
+        """The mirror case, and the one a content-only repair gets wrong in the
+        other direction: a target absent at snapshot time must be REMOVED, not
+        rewritten as an empty file. `<missing>` is a fingerprint value, so
+        without this the repair would write b"" and call it restored."""
+        tmp, _text, ex = self._fixture(self._NO_RESTORE)
+        absent = os.path.join(tmp, "victim.py")
+        os.unlink(absent)
+        # The fixture harness CREATES victim.py, which is the mutation here.
+        verdict = self._drive_fixture(tmp, [absent, ex])
+
+        self.assertNotIn("error", verdict, verdict.get("error"))
+        self.assertTrue(verdict["applied"])
+        self.assertIn("victim.py", verdict["repaired"])
+        self.assertFalse(
+            os.path.exists(absent),
+            "the probe left behind a file that did not exist before the "
+            "harness ran, or recreated it empty instead of removing it")
+
+
+    def test_the_probe_repairs_even_when_it_prints_no_verdict(self):
+        """The `finally` path, which is the change's centrepiece and the run
+        most likely to strand a mutant - nothing got as far as measuring.
+
+        Every other test here reaches the probe through
+        `except KeyboardInterrupt`, where a verdict exists. A review found that
+        a mutant collapsing the `finally` into the verdict branch survived the
+        whole module, so this is the test that was missing.
+        """
+        tmp, text, _ex = self._fixture(self._NO_RESTORE_RAISES)
+        proc = subprocess.run(
+            [sys.executable, "-c", _RESTORE_PROBE, tmp, "mutate_fixture.py",
+             json.dumps([text]), "delete", "bool"],
+            cwd=tmp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+        )
+        # The CONTROL for this test: the probe must really have died the way
+        # the fixture intended. Without this, a probe that failed to import the
+        # harness at all would leave the file untouched and pass below.
+        self.assertIn("RuntimeError", proc.stdout,
+                      "CONTROL FAILED - the fixture harness did not reach its "
+                      "un-modelled failure, so the `finally` path was never "
+                      "exercised")
+        self.assertNotIn("VERDICT ", proc.stdout,
+                         "the probe printed a verdict for a run it cannot "
+                         "measure, so this no longer tests the no-verdict path")
+
+        with open(text, "rb") as fh:
+            self.assertEqual(
+                self.TEXT_BODY, fh.read(),
+                "the probe stranded a mutant on a path it prints no verdict "
+                "for - the repair is not running in a `finally`, so it is "
+                "skipped by exactly the failure mode it matters most for.")
+
+    def test_the_probe_gets_the_last_word_over_an_atexit_restore(self):
+        """Five of the seven IN_PLACE harnesses restore from `atexit`, which
+        runs AFTER the probe's `finally`. The probe's own repair is registered
+        before the harness is imported so that LIFO puts it last; if that
+        ordering is lost, the harness's restore overwrites the repair and a
+        harness that restores the WRONG bytes does so silently while the
+        verdict still reports the paths as repaired."""
+        tmp, text, _ex = self._fixture(self._ATEXIT_WRONG_RESTORE)
+        verdict = self._drive_fixture(tmp, [text])
+
+        self.assertNotIn("error", verdict, verdict.get("error"))
+        self.assertTrue(verdict["applied"],
+                        "CONTROL FAILED - no mutation was on disk, so nothing "
+                        "was there for either restore to fight over")
+        self.assertFalse(verdict["restored"])
+
+        with open(text, "rb") as fh:
+            self.assertEqual(
+                self.TEXT_BODY, fh.read(),
+                "the harness's atexit restore got the last word and wrote its "
+                "own wrong bytes over the probe's repair. The probe's repair "
+                "must be registered with atexit BEFORE the harness module is "
+                "imported (atexit is LIFO, so first registered runs last).")
+        self.assertIn(
+            "victim.py", verdict.get("repaired") or [],
+            "the verdict does not report the final on-disk state - a "
+            "FINALREPAIR line was printed after the verdict and not merged "
+            "into it, so `repaired` describes a state that no longer exists.")
+
+    def test_a_concurrent_writers_edit_is_reported_and_not_reverted(self):
+        """The repair must not silently revert somebody else's work.
+
+        Peer sessions on this machine share ONE worktree, so a blanket "rewrite
+        anything that differs from the snapshot" would revert a concurrent
+        save to a shipping file with no error and no git trace. The repair is
+        therefore scoped to paths the probe SAW this harness change; anything
+        else that differs is reported under `repair_skipped` and left alone.
+        """
+        tmp, text, ex = self._fixture(self._NO_RESTORE)
+        # `ex` is declared as a target and this harness does change it (a
+        # chmod), so it is repairable. Stand in for the peer with a THIRD file
+        # the harness never touches.
+        peer = os.path.join(tmp, "peer.py")
+        with open(peer, "wb") as fh:
+            fh.write(b"peer original\n")
+        os.chmod(peer, 0o644)
+        peer_edit = b"peer was here, mid-run\n"
+
+        verdict = self._drive_fixture(tmp, [text, ex, peer])
+        self.assertNotIn("error", verdict, verdict.get("error"))
+        self.assertTrue(verdict["applied"])
+
+        # It repaired what it saw the harness do...
+        self.assertEqual(sorted(["victim.py", "victim.sh"]),
+                         sorted(verdict["repaired"]))
+        # ...and left the untouched third file alone, with nothing to skip
+        # because it never diverged.
+        self.assertEqual([], verdict["repair_skipped"])
+        with open(peer, "rb") as fh:
+            self.assertEqual(b"peer original\n", fh.read())
+
+        # THE LIVE CASE. A declared target diverges in a run where the probe
+        # never got past the controls, so it has no grounds to attribute the
+        # change to the harness. It must REPORT the file and leave the bytes
+        # alone - reverting here is what would silently eat a peer session's
+        # save to a shipping file.
+        tmp2, text2, _ex2 = self._fixture(self._NO_RESTORE_CONTROLS_ONLY)
+        peer2 = os.path.join(tmp2, "peer.py")
+        with open(peer2, "wb") as fh:
+            fh.write(b"peer original\n")
+        verdict2 = self._drive_fixture(tmp2, [text2, peer2])
+
+        self.assertEqual("main() returned without the injected interrupt",
+                         verdict2.get("error"),
+                         "CONTROL FAILED - this fixture is supposed to return "
+                         "without ever reaching a mutant; if it did reach one, "
+                         "the attribution question below never arises")
+        self.assertEqual(
+            [], verdict2["repaired"],
+            "the probe WROTE to a file in a run where it never observed the "
+            "harness mutate anything. On a shared worktree that is how a peer "
+            "session's save gets reverted with no error and no git trace.")
+        self.assertEqual(
+            ["peer.py"], verdict2["repair_skipped"],
+            "the probe left the divergent file alone but did not SAY so - an "
+            "unreported skip is indistinguishable from having not noticed")
+        with open(peer2, "rb") as fh:
+            self.assertEqual(peer_edit, fh.read(),
+                             "the probe reverted an edit it could not "
+                             "attribute to the harness")
+
+    # Returns after its two controls without ever reaching a mutant, having
+    # changed a declared target on the way out. Stands in for any writer the
+    # probe cannot attribute - a peer session, an editor, a stranded mutant
+    # from an earlier run.
+    _NO_RESTORE_CONTROLS_ONLY = '''\
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PEER = os.path.join(ROOT, "peer.py")
+
+
+def run_suites(*a, **k):
+    return True, "Ran 40 tests in 0.100s\\n\\nOK\\n"
+
+
+def main():
+    run_suites()
+    run_suites()
+    with open(PEER, "wb") as fh:
+        fh.write(b"peer was here, mid-run\\n")
+'''
+
+
+    def test_a_repair_that_fails_says_so_instead_of_claiming_success(self):
+        """The F3 case, and the one that re-created the ticket's own defect.
+
+        The first version of this change hardcoded "the probe has since put it
+        back, so `git status` is clean" into every failure message. When the
+        repair itself fails, that sentence is false in the one situation where
+        a maintainer most needs the truth - and it appeared in the same message
+        as the `REPAIR FAILED` entry proving it false.
+        """
+        tmp, text, _ex = self._fixture(self._NO_RESTORE)
+        # Make the write fail: the repair creates a sibling temp file, so
+        # removing write permission on the DIRECTORY defeats it while leaving
+        # the mutated file perfectly readable for fingerprinting.
+        self.addCleanup(os.chmod, tmp, 0o755)
+        verdict = self._drive_fixture(tmp, [text], mode="text",
+                                      before_probe=lambda: os.chmod(tmp, 0o555))
+
+        self.assertNotIn("error", verdict, verdict.get("error"))
+        self.assertEqual([], verdict["repaired"],
+                         "a repair that could not write reported success")
+        # ONE entry, not two. The repair is attempted again at exit and fails
+        # again with a different message, so an un-deduped merge would name the
+        # same file twice and read as two damaged files.
+        self.assertEqual(1, len(verdict["repair_failed"]),
+                         f"the failure was not reported once: {verdict}")
+        self.assertTrue(verdict["repair_failed"][0].startswith("victim.py "),
+                        verdict["repair_failed"][0])
+        self.assertIn("REPAIR FAILED", verdict["repair_failed"][0])
+
+        note = _tree_note(verdict)
+        self.assertIn("STILL DIRTY", note,
+                      "the failure message tells the maintainer the tree was "
+                      "put back while its own data says the repair failed - "
+                      "which is exactly the misreading this ticket exists to "
+                      "remove, re-created one layer down.")
+        self.assertNotIn("put back", note)
+
+
+    def test_damage_done_after_the_verdict_still_reaches_the_verdict(self):
+        """The FINALREPAIR merge, which nothing else covers.
+
+        In the other atexit test the `finally` repair already had work to do,
+        so `repaired` was populated whether or not the merge happened. Here the
+        harness restores correctly and only damages the file from atexit -
+        AFTER the verdict has been printed. The probe's own atexit handler
+        fixes it and prints FINALREPAIR, and the driver folding that back in is
+        the only way the verdict can describe the real final state.
+        """
+        tmp, text, _ex = self._fixture(
+            self._CORRECT_RESTORE_THEN_ATEXIT_DAMAGE)
+        verdict = self._drive_fixture(tmp, [text])
+
+        self.assertNotIn("error", verdict, verdict.get("error"))
+        self.assertTrue(verdict["applied"])
+        # The harness's in-band restore really is correct, which is what makes
+        # the `finally` repair a no-op and isolates the merge.
+        self.assertTrue(
+            verdict["restored"],
+            "CONTROL FAILED - this fixture is supposed to restore correctly "
+            "in-band; if it does not, the `finally` repair has work to do and "
+            "this test no longer isolates the atexit path")
+
+        with open(text, "rb") as fh:
+            self.assertEqual(self.TEXT_BODY, fh.read(),
+                             "atexit damage after the verdict was not undone")
+        self.assertEqual(
+            ["victim.py"], verdict["repaired"],
+            "the verdict does not mention a repair that happened after it was "
+            "printed - the driver is not merging the FINALREPAIR line, so "
+            "`repaired` describes a state that was already out of date.")
+
+    def test_an_unreadable_target_stops_the_probe_rather_than_being_deleted(self):
+        """snapshot() must treat 'unreadable' and 'absent' as different things.
+
+        The repair for 'absent before' is os.unlink. So a snapshot that
+        recorded any OSError as absent would let a momentary permission problem
+        turn into the DELETION of a shipping file later in the same run. Dying
+        at snapshot time is the safe direction: nothing has been mutated yet.
+        """
+        tmp, text, _ex = self._fixture(self._MAKES_UNREADABLE_TARGET_READABLE)
+        self.addCleanup(os.chmod, text, 0o644)
+        os.chmod(text, 0o000)
+
+        proc = subprocess.run(
+            [sys.executable, "-c", _RESTORE_PROBE, tmp, "mutate_fixture.py",
+             json.dumps([text]), "text", "bool"],
+            cwd=tmp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+        )
+        self.assertIn("PermissionError", proc.stdout,
+                      f"CONTROL FAILED - the probe did not hit the unreadable "
+                      f"target at all, so nothing here is about snapshot(): "
+                      f"{proc.stdout[-800:]}")
+        self.assertTrue(
+            os.path.exists(text),
+            "the probe DELETED a target it merely could not read - snapshot() "
+            "is catching OSError where it must catch FileNotFoundError, so "
+            "'unreadable' was recorded as 'absent' and the repair for absent "
+            "is os.unlink.")
+
+
+class TreeNoteTests(unittest.TestCase):
+    """_tree_note renders the sentence every failure message above depends on.
+
+    Tested directly because it is pure, because getting it wrong is the F3
+    blocker, and because reaching all three branches through a real probe run
+    needs three separate fixtures.
+    """
+
+    def test_a_failed_repair_leads_and_never_claims_the_tree_is_clean(self):
+        note = _tree_note({"repaired": ["a.py"],
+                           "repair_failed": ["b.py (REPAIR FAILED: nope)"],
+                           "repair_skipped": ["c.py"]})
+        self.assertTrue(note.startswith("*** THE WORKING TREE IS STILL DIRTY"),
+                        f"the bad news does not sort first: {note}")
+        self.assertIn("b.py", note)
+        self.assertNotIn("put back", note)
+
+    def test_a_successful_repair_says_git_status_is_not_the_evidence(self):
+        note = _tree_note({"repaired": ["a.py"], "repair_failed": [],
+                           "repair_skipped": []})
+        self.assertIn("a.py", note)
+        self.assertIn("`git status`", note)
+        self.assertNotIn("STILL DIRTY", note)
+
+    def test_a_skipped_path_is_named_and_attributed_to_a_concurrent_writer(self):
+        note = _tree_note({"repaired": [], "repair_failed": [],
+                           "repair_skipped": ["mqtt.py"]})
+        self.assertIn("mqtt.py", note)
+        self.assertIn("concurrent", note)
+
+    def test_nothing_to_report_is_still_a_sentence(self):
+        self.assertIn("nothing to put back", _tree_note({}))
+
+
+class ProbeSourceTests(unittest.TestCase):
+    """_RESTORE_PROBE is a program embedded as a triple-quoted string.
+
+    That makes one editing mistake both easy and quiet: a nested triple quote -
+    a docstring on one of the probe's own functions is the natural way to write
+    it - terminates the enclosing literal. It happened once while writing
+    T-554.1. The outer file then fails to parse, which is loud; but a nested
+    quote that happens to BALANCE would silently truncate the probe into
+    something that still parses and no longer does what it says.
+    """
+
+    def test_the_embedded_probe_is_valid_python(self):
+        import ast
+        ast.parse(_RESTORE_PROBE)
+
+    def test_the_probe_carries_no_triple_quote(self):
+        self.assertNotIn(
+            '"""', _RESTORE_PROBE,
+            "a triple quote inside _RESTORE_PROBE terminates the string that "
+            "contains it - use # comments for every note in the probe, "
+            "including function docstrings.")
+        # POSITIVE CONTROL: the scan can find a triple quote when one is there.
+        self.assertIn('"""', _RESTORE_PROBE + '"""')
+
+
+def _rmtree(path):
+    import shutil
+    shutil.rmtree(path, ignore_errors=True)
 
 
 if __name__ == "__main__":
