@@ -378,19 +378,29 @@ def _write_back(p, content, mode):
 # Put back what the probe SAW THIS HARNESS CHANGE. Returns three lists:
 # repaired, failed, skipped.
 #
-# SCOPED ON PURPOSE, and the scoping is the safety property rather than an
-# optimisation. Peer sessions on this machine share ONE worktree (the repo's
-# CLAUDE.md says so), so a blanket "rewrite anything that differs from the
-# snapshot" would silently revert a concurrent writer's save to mqtt.py with no
-# error, no prompt and no git trace - a new harm this probe never had before it
-# started writing at all. So a path is only rewritten when the probe observed
-# it change under this harness, or when the harness was demonstrably
-# mid-mutation (past its own controls) at the time.
+# SCOPED ON PURPOSE. Peer sessions on this machine share ONE worktree (the
+# repo's CLAUDE.md says so), so a blanket "rewrite anything that differs from
+# the snapshot" would silently revert a concurrent writer's save to mqtt.py
+# with no error, no prompt and no git trace - a new harm this probe never had
+# before it started writing at all. A path is rewritten only when the probe
+# OBSERVED it change under this harness; anything else that differs is
+# reported under `skipped` and left alone.
 #
-# Anything else that differs is REPORTED and left alone. A file that moved
-# without the harness touching it is far more likely to be somebody's work than
-# a stranded mutant, and the honest response to an ambiguous dirty file is to
-# name it, not to overwrite it.
+# BE PRECISE ABOUT WHAT THAT BUYS, because the first version of this comment
+# was not and a review said so. Attribution is not achievable from filesystem
+# observation alone, and this does NOT claim it. What it guarantees is narrow:
+#
+#   - A file the harness never touched is never written. That is the common
+#     concurrent-writer case and it is fully closed.
+#   - A file the harness DID touch is still rewritten to the pre-run snapshot.
+#     If a peer saved that same file inside the window, their save is lost, and
+#     nothing here can tell the two apart - the bytes look identical either way.
+#
+# The window is ~100ms per probe, a few seconds for the class. That residual is
+# accepted deliberately: it is strictly smaller than the stranded-mutant class
+# it replaces, and unlike that one it needs a collision on the same file.
+# Do not read `skipped` as "these are a peer's" - read it as "the probe has no
+# grounds to touch these", which is the only thing it knows.
 def _repair():
     put_back, failed, skipped = [], [], []
     if not _state["ready"]:
@@ -399,7 +409,15 @@ def _repair():
         rel = os.path.relpath(p, repo)
         if fingerprint(p) == _state["before"][p]:
             continue
-        if p not in _state["touched"] and not _state["reached_mutant"]:
+        # PER PATH, and the `and not reached_mutant` that used to be here was
+        # DEAD CODE that undid the whole point. `touched` is populated three
+        # lines after `reached_mutant` is set, in the same block, so
+        # `touched` non-empty implied `reached_mutant` and the clause collapsed
+        # to one global boolean: once ANY mutant was reached, EVERY divergent
+        # target was rewritten, including files this harness never went near.
+        # Found by review; a mutant deleting `p not in _state["touched"]` left
+        # the whole module green, which is how it hid.
+        if p not in _state["touched"]:
             skipped.append(rel)
             continue
         content, mode = _state["original"][p]
@@ -444,11 +462,34 @@ def _repair():
 # fingerprint matches. It prints only when it had to act, and the driver merges
 # that into the verdict so the reported state is the FINAL one.
 def _final_repair():
-    put_back, failed, skipped = _repair()
-    if put_back or failed:
+    # UNCONDITIONAL, and it reports `still_dirty` as well as what it did.
+    # Printing only when it acted left a stale `repair_failed` standing: a path
+    # that failed in the `finally` and was then fixed by the harness's own
+    # restore stayed on the failed list, and _tree_note led with THE WORKING
+    # TREE IS STILL DIRTY over a clean tree. That is the mirror of the defect
+    # this change exists to fix, so the final word has to be a measurement of
+    # the final state, not a log of attempts.
+    #
+    # Wrapped, because an exception escaping an atexit callback is printed as
+    # "Exception ignored" and leaves the exit code at 0 - a stale claim with no
+    # signal anywhere.
+    #
+    # DECLARED UNCOVERED (T-554.1): a mutant narrowing this `except` survives
+    # the module. Reaching it means making _repair raise something other than
+    # the OSError it already catches, from inside an atexit callback, which the
+    # fixtures cannot arrange. Cheap defence, not an asserted property - do not
+    # read the green suite as evidence this branch works.
+    try:
+        put_back, failed, skipped = _repair()
+        dirty = [os.path.relpath(p, repo) for p in _state["targets"]
+                 if _state["ready"] and fingerprint(p) != _state["before"][p]]
         print("FINALREPAIR " + json.dumps(
             {"repaired": put_back, "repair_failed": failed,
-             "repair_skipped": skipped}))
+             "repair_skipped": skipped, "still_dirty": dirty}))
+    except BaseException as exc:
+        print("FINALREPAIR " + json.dumps(
+            {"repaired": [], "repair_skipped": [], "still_dirty": [],
+             "repair_failed": [f"<final repair raised> (REPAIR FAILED: {exc})"]}))
 
 
 atexit.register(_final_repair)
@@ -725,6 +766,17 @@ def _merge_final_repair(verdict, stdout):
                     merged.append(item)
                     seen.add(item.split(" (", 1)[0])
             verdict[key] = merged
+        # AND DROP A FAILURE THE TREE NO LONGER SHOWS. The final handler
+        # measures what is STILL dirty at exit, which is the only authority on
+        # the final state: a path that failed in the `finally` and was then put
+        # back by the harness's own restore is clean, and leaving it on the
+        # failed list makes _tree_note announce a dirty tree over a clean one.
+        if "still_dirty" in final:
+            dirty = set(final["still_dirty"])
+            verdict["repair_failed"] = [
+                item for item in verdict["repair_failed"]
+                if item.split(" (", 1)[0] in dirty
+                or item.startswith("<final repair raised>")]
     return verdict
 
 
@@ -1587,6 +1639,42 @@ def main():
             fh.write(ORIGINAL)
 '''
 
+    # Makes the probe's `finally` repair FAIL (by locking the directory it
+    # needs to write a temp file into), then fixes the file itself from an
+    # atexit handler that also unlocks the directory. So the repair genuinely
+    # failed, and by the time the process exits the tree is genuinely clean -
+    # which is the state that used to leave a stale `repair_failed` standing.
+    _FAILS_THEN_RESTORES_FROM_ATEXIT = '''\
+import atexit, os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEXT_TARGET = os.path.join(ROOT, "victim.py")
+ORIGINAL = open(TEXT_TARGET, "rb").read()
+
+
+def restore():
+    os.chmod(ROOT, 0o755)
+    with open(TEXT_TARGET, "wb") as fh:
+        fh.write(ORIGINAL)
+
+
+atexit.register(restore)
+
+
+def run_suites(*a, **k):
+    return True, "Ran 40 tests in 0.100s\\n\\nOK\\n"
+
+
+def main():
+    run_suites()
+    run_suites()
+    with open(TEXT_TARGET, "w") as fh:
+        fh.write("MUTATED\\n")
+    os.chmod(ROOT, 0o555)
+    run_suites()
+    raise AssertionError("unreachable - the probe should have interrupted")
+'''
+
     # Its target is unreadable when the probe snapshots it. The harness would
     # make it readable and mutate it - but must never get the chance, because
     # a probe that cannot read a target has no original to repair from.
@@ -1855,11 +1943,43 @@ def main():
         with open(peer, "rb") as fh:
             self.assertEqual(b"peer original\n", fh.read())
 
-        # THE LIVE CASE. A declared target diverges in a run where the probe
-        # never got past the controls, so it has no grounds to attribute the
-        # change to the harness. It must REPORT the file and leave the bytes
-        # alone - reverting here is what would silently eat a peer session's
-        # save to a shipping file.
+        # THE LIVE CASE, and the one the first version of this test could not
+        # reach. A declared target diverges WHILE the harness is mid-battery -
+        # so the probe has reached a mutant, and the only thing separating this
+        # file from the mutant is that the probe never saw the harness touch
+        # THIS one. A review found the gate here was dead code (it also
+        # required `not reached_mutant`, which is false by then), so every
+        # divergent target was being rewritten and a peer's save really was
+        # being eaten. This arm is what would have caught it.
+        tmp3, text3, _ex3 = self._fixture(self._MUTATES_ONE_THEN_A_PEER_WRITES)
+        peer3 = os.path.join(tmp3, "peer.py")
+        with open(peer3, "wb") as fh:
+            fh.write(b"peer original\n")
+        verdict3 = self._drive_fixture(tmp3, [text3, peer3], mode="delete")
+
+        # CONTROL: the probe really did get deep into the battery. Without this
+        # the assertions below are satisfied by a run that never reached a
+        # mutant, which is the WEAK case and is covered separately.
+        self.assertEqual(
+            "main() returned without the injected interrupt",
+            verdict3.get("error"),
+            "CONTROL FAILED - this fixture must run to completion in delete "
+            "mode so the peer write lands after the probe's last look")
+        self.assertIn(
+            "victim.py", verdict3["repaired"],
+            "the probe did not put back the mutant it watched the harness "
+            "apply, so the per-path gate has gone too far the other way")
+        self.assertEqual(
+            ["peer.py"], verdict3["repair_skipped"],
+            "the probe rewrote a file it never saw this harness touch. On the "
+            "real repo that is a peer session's save to mqtt.py disappearing "
+            "with no error and no git trace.")
+        with open(peer3, "rb") as fh:
+            self.assertEqual(b"peer edited me mid-battery\n", fh.read(),
+                             "the peer's edit was reverted")
+
+        # And the run that never reaches a mutant at all, which is the weaker
+        # case the gate also has to cover.
         tmp2, text2, _ex2 = self._fixture(self._NO_RESTORE_CONTROLS_ONLY)
         peer2 = os.path.join(tmp2, "peer.py")
         with open(peer2, "wb") as fh:
@@ -1884,6 +2004,42 @@ def main():
             self.assertEqual(peer_edit, fh.read(),
                              "the probe reverted an edit it could not "
                              "attribute to the harness")
+
+    # Reaches a mutant on victim.py - so `reached_mutant` is true and the probe
+    # is deep in the battery - and only THEN does peer.py diverge, after the
+    # probe's last observation. Driven in delete mode so the probe keeps
+    # handing control back instead of raising at the first mutant.
+    #
+    # THE TIMING IS THE WHOLE POINT AND IT IS NOT ARBITRARY. The probe learns
+    # what the harness touched by fingerprinting at each runner call, so a peer
+    # write that lands BETWEEN two observations is attributable and one that
+    # lands in the same interval as a mutant is not - both files simply read as
+    # divergent at the same instant. This fixture models the separable case,
+    # which is the one the gate can actually close; the inseparable case is
+    # documented as an accepted residual in _repair's comment rather than
+    # pretended away here.
+    _MUTATES_ONE_THEN_A_PEER_WRITES = '''\
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEXT_TARGET = os.path.join(ROOT, "victim.py")
+PEER = os.path.join(ROOT, "peer.py")
+
+
+def run_suites(*a, **k):
+    return True, "Ran 40 tests in 0.100s\\n\\nOK\\n"
+
+
+def main():
+    run_suites()
+    run_suites()
+    with open(TEXT_TARGET, "w") as fh:
+        fh.write("MUTATED\\n")
+    run_suites()
+    # The concurrent session, landing after the probe's last look.
+    with open(PEER, "wb") as fh:
+        fh.write(b"peer edited me mid-battery\\n")
+'''
 
     # Returns after its two controls without ever reaching a mutant, having
     # changed a declared target on the way out. Stands in for any writer the
@@ -2007,6 +2163,59 @@ def main():
             "is catching OSError where it must catch FileNotFoundError, so "
             "'unreadable' was recorded as 'absent' and the repair for absent "
             "is os.unlink.")
+
+
+    def test_a_failure_the_tree_no_longer_shows_is_dropped_from_the_verdict(self):
+        """A repair can fail and the tree still end up clean, and then the
+        verdict must not keep saying it is dirty.
+
+        Found by review, as the mirror of the defect this whole change fixes.
+        The `finally` repair records a failure; the harness's own atexit
+        restore then puts the file back; the probe's final handler measures
+        what is STILL dirty at exit and the driver drops any recorded failure
+        the tree no longer shows. Without that, `_tree_note` leads with
+        *** THE WORKING TREE IS STILL DIRTY *** over a clean tree - which is
+        exactly the kind of false statement about the tree the ticket was
+        filed to remove, pointing the other way.
+        """
+        tmp, text, _ex = self._fixture(self._FAILS_THEN_RESTORES_FROM_ATEXIT)
+        self.addCleanup(os.chmod, tmp, 0o755)
+        proc = subprocess.run(
+            [sys.executable, "-c", _RESTORE_PROBE, tmp, "mutate_fixture.py",
+             json.dumps([text]), "text", "bool"],
+            cwd=tmp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+        )
+        raw = [json.loads(ln[len("VERDICT "):]) for ln in proc.stdout.splitlines()
+               if ln.startswith("VERDICT ")]
+        self.assertEqual(1, len(raw), proc.stdout[-2000:])
+
+        # CONTROL, on the RAW verdict rather than the merged one: the `finally`
+        # repair really did fail. If the directory lock did not take, the
+        # assertions below are satisfied by there being nothing to drop, which
+        # is true for entirely the wrong reason.
+        self.assertEqual(
+            1, len(raw[0]["repair_failed"]),
+            f"CONTROL FAILED - the in-band repair did not fail, so there is no "
+            f"stale failure for the merge to drop:\n{proc.stdout[-2000:]}")
+        with open(text, "rb") as fh:
+            self.assertEqual(
+                self.TEXT_BODY, fh.read(),
+                "CONTROL FAILED - the harness's atexit restore did not put the "
+                "file back, so the tree is genuinely dirty and the failure "
+                "SHOULD stand")
+
+        verdict = _merge_final_repair(raw[0], proc.stdout)
+        self.assertNotIn("error", verdict, verdict.get("error"))
+        self.assertEqual(
+            [], verdict["repair_failed"],
+            f"a repair failure was reported for a file the tree no longer "
+            f"shows as dirty: {verdict['repair_failed']}")
+        self.assertNotIn(
+            "STILL DIRTY", _tree_note(verdict),
+            "the failure message announces a dirty working tree over a clean "
+            "one, which is the same class of false claim about the tree that "
+            "this change exists to remove")
 
 
 class TreeNoteTests(unittest.TestCase):

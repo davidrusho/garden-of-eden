@@ -360,10 +360,20 @@ def _battery():
             print(out[-2500:])
             return 1
         # THE ZERO ABORT (T-554). A green run that collected NOTHING is NO
-        # DATA, not a pass, and the omission is SILENT rather than loud:
-        # `score_run` arms its ran-count tell with `ran < clean_ran`, which
-        # at clean_ran == 0 can never fire, so the tell is inert while the
-        # line below still prints a measurement-shaped "0 tests ran".
+        # DATA, not a pass, so there is nothing below worth reading.
+        #
+        # THE FAILURE HERE IS LOUD, NOT SILENT, and the first version of
+        # this comment had it backwards - a review caught it. `score_run`
+        # compares `ran_count(out) != clean_ran`, so a zero baseline makes
+        # the tell fire for EVERY mutant and the whole battery reports NO
+        # VERDICT. (`<` is mutate_payload_scanner.py's LOCAL score(), where
+        # the omission really is silent. Same abort, different reason -
+        # do not copy that harness's note here.) Measured:
+        # score_run(False, <red, Ran 12>, 0) -> no-verdict; with 12 -> killed.
+        #
+        # A battery that reports no information about every mutant is not
+        # obviously broken to a reader skimming it, which is why it still
+        # earns an abort that says NO DATA in as many words.
         if clean_ran == 0:
             print("  *** CONTROL A FAILED - a GREEN run that collected NO "
                   "tests. This is NO DATA, not a score. ***")

@@ -867,8 +867,6 @@ class HarnessesUseTheVerdictCONSTANTS(unittest.TestCase):
     """
 
     VERDICT_SPELLINGS = ("survived", "killed", "no-verdict")
-    COMPARISON = re.compile(
-        r"""(?:==|!=)\s*(['"])(survived|killed|no-verdict)\1""")
 
     @staticmethod
     def _repo():
@@ -890,19 +888,15 @@ class HarnessesUseTheVerdictCONSTANTS(unittest.TestCase):
                     break
         return found
 
-    def test_the_comparison_pattern_can_actually_match(self):
-        """POSITIVE CONTROL, first, because the check below reports an ABSENCE
-        and a dead regex is indistinguishable from a clean corpus."""
-        for spelling in self.VERDICT_SPELLINGS:
-            with self.subTest(spelling=spelling):
-                self.assertRegex(f'if verdict == "{spelling}":',
-                                 self.COMPARISON)
-                self.assertRegex(f"if verdict != '{spelling}':",
-                                 self.COMPARISON)
-        self.assertNotRegex('SURVIVED = "survived"', self.COMPARISON,
-                            "the pattern matches the definition as well as a "
-                            "comparison, so mutation_scoring.py itself would "
-                            "be reported")
+    def test_every_verdict_spelling_is_one_the_module_actually_defines(self):
+        """VERDICT_SPELLINGS is a hand list, so it decays in the silent
+        direction: a constant renamed here and not there makes the detector
+        blind to the new spelling while every test stays green."""
+        self.assertEqual(
+            sorted(self.VERDICT_SPELLINGS),
+            sorted([ms.SURVIVED, ms.KILLED, ms.NO_VERDICT]),
+            "the spellings this check looks for are not the ones the module "
+            "defines, so it is scanning for strings nobody uses")
 
     def test_the_corpus_scan_finds_the_harnesses_it_is_scanning(self):
         """The other half of the control: prove the AST scope is not empty.
@@ -930,17 +924,24 @@ class HarnessesUseTheVerdictCONSTANTS(unittest.TestCase):
         the missing list. A scanner that reads prose as code reports a defect
         in the file that documents why there isn't one.
         """
+        def is_baseline(node):
+            return isinstance(node, ast.Name) and node.id == "clean_ran"
+
         tree = ast.parse(src)
         armed = guarded = False
         for node in ast.walk(tree):
             if isinstance(node, ast.Compare):
-                if not any(isinstance(x, ast.Name) and x.id == "clean_ran"
-                           for x in [node.left] + list(node.comparators)):
+                operands = [node.left] + list(node.comparators)
+                if not any(is_baseline(x) for x in operands):
                     continue
+                # EITHER ORDER. `if 0 == clean_ran:` is the same guard, and
+                # reading only comparators[0] classified it as ARMING - a loud
+                # false positive that would have reported a correctly-guarded
+                # harness as missing its guard.
                 zero = (len(node.ops) == 1
                         and isinstance(node.ops[0], ast.Eq)
-                        and isinstance(node.comparators[0], ast.Constant)
-                        and node.comparators[0].value == 0)
+                        and any(isinstance(x, ast.Constant) and x.value == 0
+                                for x in operands))
                 if zero:
                     guarded = True
                 else:
@@ -948,9 +949,15 @@ class HarnessesUseTheVerdictCONSTANTS(unittest.TestCase):
             elif isinstance(node, ast.Call):
                 fn = node.func
                 name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
-                if name in ("score", "score_run") and any(
-                        isinstance(a, ast.Name) and a.id == "clean_ran"
-                        for a in node.args):
+                if name not in ("score", "score_run"):
+                    continue
+                # KEYWORDS TOO. `score_run(ok, out, clean_ran=clean_ran)` is
+                # the documented spelling of this parameter, and reading only
+                # `node.args` skipped such a harness ENTIRELY - a silent false
+                # negative, which is the direction that loses coverage rather
+                # than manufacturing a finding.
+                passed = list(node.args) + [kw.value for kw in node.keywords]
+                if any(is_baseline(x) for x in passed):
                     armed = True
         return armed, guarded
 
@@ -1034,21 +1041,102 @@ class HarnessesUseTheVerdictCONSTANTS(unittest.TestCase):
             "a COMMENT mentioning the guard was read as the guard - this is "
             "the exact regex defect the AST version replaced")
 
+        # The two shapes a review found misclassified. Both were silent in the
+        # expensive direction: the keyword form skipped a harness entirely, and
+        # the reversed guard reported a guarded harness as arming-and-unguarded.
+        armed, _ = self._baseline_use(
+            "def f():\n    v = score_run(ok, out, clean_ran=clean_ran)\n")
+        self.assertTrue(
+            armed,
+            "the baseline passed as a KEYWORD was not seen, so a harness using "
+            "the documented spelling of this parameter is skipped entirely")
+
+        armed, guarded = self._baseline_use(
+            "def f():\n    if 0 == clean_ran:\n        return 1\n")
+        self.assertTrue(guarded, "`0 == clean_ran` is the same guard")
+        self.assertFalse(
+            armed,
+            "a guard written with its operands the other way round was "
+            "classified as ARMING the tell, which reports a correctly-guarded "
+            "harness as missing its guard")
+
+    @classmethod
+    def _literal_verdict_comparisons(cls, src):
+        """Line numbers where a Compare tests against a verdict SPELLING.
+
+        BY AST, and this one had to be corrected too. The first version
+        detected with a regex over raw lines, so it reported a COMMENT saying
+        `if verdict == "survived":` - written to tell maintainers not to do
+        that - as an offender, and it silently missed the forms that matter
+        most: a comparison split across two lines, `verdict in ("survived",
+        "killed")`, and an f-string spelling. The `in` tuple is the worst of
+        those to miss, since it carries exactly the fragility the check exists
+        to catch. Walking Compare nodes gets all of them and cannot see prose.
+        """
+        found = []
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Compare):
+                continue
+            operands = [node.left] + list(node.comparators)
+            # Unwrap the tuple/list/set of an `in` test so each element counts.
+            flat = []
+            for operand in operands:
+                if isinstance(operand, (ast.Tuple, ast.List, ast.Set)):
+                    flat.extend(operand.elts)
+                else:
+                    flat.append(operand)
+            for operand in flat:
+                if (isinstance(operand, ast.Constant)
+                        and operand.value in cls.VERDICT_SPELLINGS):
+                    found.append((node.lineno, operand.value))
+                    break
+        return found
+
     def test_no_score_run_importer_compares_a_verdict_to_a_literal(self):
         offenders = []
         for path in self._importers_of("score_run"):
             with open(path, encoding="utf-8") as fh:
                 src = fh.read()
-            for i, line in enumerate(src.splitlines(), 1):
-                if self.COMPARISON.search(line):
-                    offenders.append(
-                        f"{os.path.basename(path)}:{i}: {line.strip()}")
+            for lineno, spelling in self._literal_verdict_comparisons(src):
+                offenders.append(
+                    f"{os.path.basename(path)}:{lineno}: compares against "
+                    f"{spelling!r}")
         self.assertEqual(
             [], offenders,
             "these harnesses take their verdicts from mutation_scoring but "
             "compare against the bare spelling, so renaming a constant here "
             "makes every comparison silently false and the battery reports "
             "ALL KILLED:\n  " + "\n  ".join(offenders))
+
+    def test_the_verdict_detector_sees_the_forms_a_regex_missed(self):
+        """CONTROLS for the detector above, in both directions.
+
+        Each positive arm is a form the previous regex version let through; the
+        negative arms are the two things that must never be flagged - prose,
+        and the module's own constant definitions."""
+        for label, src in [
+            ("simple", 'def f():\n    if verdict == "survived":\n        pass\n'),
+            ("split over two lines",
+             'def f():\n    if (verdict ==\n            "survived"):\n        pass\n'),
+            ("in a tuple",
+             'def f():\n    if verdict in ("survived", "killed"):\n        pass\n'),
+            ("not-equal", 'def f():\n    if verdict != "no-verdict":\n        pass\n'),
+        ]:
+            with self.subTest(form=label):
+                self.assertTrue(self._literal_verdict_comparisons(src),
+                                f"the detector missed the {label} form")
+
+        self.assertEqual(
+            [], self._literal_verdict_comparisons(
+                'def f():\n'
+                '    # never write `if verdict == "survived":` - use the constant\n'
+                '    if verdict == SURVIVED:\n        pass\n'),
+            "a COMMENT was read as a comparison - this is the regex defect the "
+            "AST version replaced, and it fires on the very note telling "
+            "maintainers to do the right thing")
+        self.assertEqual(
+            [], self._literal_verdict_comparisons('SURVIVED = "survived"\n'),
+            "the constant's own definition was flagged")
 
 
 if __name__ == "__main__":
