@@ -215,16 +215,34 @@ def ran_count(out):
     suites per verdict and concatenate their output.
 
     ANCHORED AT THE START OF A LINE, for the same reason `named_failures` is
-    (T-527.36). unittest prints its summary at column 0 and nothing else does,
-    so an unanchored match counts TEXT ABOUT a summary as a summary: a
-    docstring quoting "Ran 1 test", or - the shape this repo produces
-    routinely - a subprocess's captured output pasted into an assertion
-    message. Both only appear when a run goes RED, so the inflation lands
+    (T-527.36). An unanchored match counts TEXT ABOUT a summary as a summary -
+    a docstring quoting "Ran 1 test" mid-sentence is the case the anchor
+    closes. That text only appears when a run goes RED, so the inflation lands
     exclusively on the runs a battery is trying to score, and `score_run` then
     reads the moved count as an import death and returns NO VERDICT for a
     genuine kill. A battery over this very module hit it: at HEAD it aborts at
     its own CONTROL B, scoring a deliberately-broken scorer NO VERDICT (28 ran
     against a 26 clean baseline) instead of KILLED.
+
+    "AND NOTHING ELSE PRINTS AT COLUMN 0" IS FALSE, and this paragraph asserted
+    it until T-554. A MULTI-LINE ASSERTION MESSAGE puts its continuation lines
+    at column 0 verbatim, so captured subprocess output pasted into one is
+    counted by the anchored rule exactly as a real summary is. Measured, not
+    reasoned: a two-test module whose failure message pastes a captured
+    "Ran 99 tests in 0.001s" reports 101 from BOTH the anchored and the
+    unanchored rule, against 2 collected. The anchor does not touch this shape.
+
+    That matters because the sentence used to offer that paste as an example of
+    what anchoring FIXES - naming, as the rule's justification, the one shape
+    it cannot see. The repo's actual defence against it is at the paste site:
+    tests/test_suite_isolation.py indents captured output before interpolating
+    it (see the note in `_drive` there), which is the right fix and the reason
+    no live instance exists today. Nothing in the nine scored suites runs
+    unittest as a subprocess, so this is a decayed comment rather than a live
+    miss - but do not migrate another harness onto this rule believing the
+    anchor covers the paste, and if you add a suite that captures a subprocess,
+    indent at the paste site. Do not try to solve it here: from inside
+    `ran_count` a pasted line and a real one are byte-identical.
 
     BE PRECISE ABOUT THE SCALE, because the first version of this paragraph
     was not. unittest prints the docstring of each test that FAILED, so the

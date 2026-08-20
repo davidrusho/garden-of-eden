@@ -345,6 +345,18 @@ def main():
                   f"Fix the suite before reading any score. ***")
             print("\n".join(named_failures(out)))
             return 1
+        # THE ZERO ABORT, which three sibling harnesses have and this one
+        # did not (T-554). A green run that collected NOTHING is NO DATA,
+        # not a pass - and the omission is silent rather than loud here,
+        # because score() guards with `ran < clean_ran`: at clean_ran == 0
+        # that can never fire, so the ran-count tell is simply inert while
+        # the line below still prints a measurement-shaped "0 tests ran".
+        # T-550 moved this harness onto the shared anchored rule, which has
+        # strictly MORE ways to return 0 than the local one it replaced.
+        if clean_ran == 0:
+            print("  *** CONTROL A FAILED - a GREEN run that collected NO "
+                  "tests. This is NO DATA, not a score. ***")
+            return 1
         print(f"  clean: GREEN, {clean_ran} tests ran\n")
 
         for label, anchor, replacement in (CONTROL_B, CONTROL_C):

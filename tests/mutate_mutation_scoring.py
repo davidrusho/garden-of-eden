@@ -359,6 +359,15 @@ def _battery():
                   f"Fix the suite before reading any score. ***")
             print(out[-2500:])
             return 1
+        # THE ZERO ABORT (T-554). A green run that collected NOTHING is NO
+        # DATA, not a pass, and the omission is SILENT rather than loud:
+        # `score_run` arms its ran-count tell with `ran < clean_ran`, which
+        # at clean_ran == 0 can never fire, so the tell is inert while the
+        # line below still prints a measurement-shaped "0 tests ran".
+        if clean_ran == 0:
+            print("  *** CONTROL A FAILED - a GREEN run that collected NO "
+                  "tests. This is NO DATA, not a score. ***")
+            return 1
         print(f"  clean: GREEN, {clean_ran} tests ran\n")
 
         for label, anchor, replacement in (CONTROL_B, CONTROL_C):

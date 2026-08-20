@@ -155,7 +155,8 @@ sys.path.insert(0, REPO)
 # after are identical by mutant name. An earlier draft of this comment claimed
 # equivalence across the board, which was false about the only copy that mattered.
 from tests.mutation_scoring import (  # noqa: E402
-    compile_gate, format_verdict, ran_count, score_run)
+    NO_VERDICT, SURVIVED, compile_gate, format_verdict, ran_count,
+    score_run)
 
 MQTT = os.path.join(REPO, "mqtt.py")
 
@@ -730,9 +731,9 @@ def _run():
     ok, out = run_suites()
     restore()
     verdict, fails = score_run(ok, out, clean_ran)
-    if verdict != "no-verdict":
+    if verdict != NO_VERDICT:
         print(f"  scored '{verdict}' with {len(fails)} named failing case(s), "
-              f"but it MUST score 'no-verdict'.")
+              f"but it MUST score '{NO_VERDICT}'.")
         print("\nCONTROL C FAILED - either the scoring rule is not doing its job,")
         print("or this mutant no longer reproduces the shape it was written for.")
         print("Either way the no-verdict path is unproven. NO DATA.")
@@ -762,9 +763,16 @@ def _run():
         # "with ZERO named failing cases" was simply false, and it sent the reader
         # after an import death when the cause was a moved collection count.
         print(format_verdict(verdict, fails))
-        if verdict == "survived":
+        # THE CONSTANTS, not their current spellings (T-554). This harness
+        # was the only constant-consuming importer still comparing bare
+        # literals, and mutation_scoring.py:143 says why that matters:
+        # "Verdicts, named so a harness cannot typo one into a silent
+        # miss." Rename SURVIVED and both branches below go false, every
+        # mutant falls through to the else, and the battery reports
+        # ALL KILLED with nothing raising - the false all-clear.
+        if verdict == SURVIVED:
             survived.append(label)
-        elif verdict == "no-verdict":
+        elif verdict == NO_VERDICT:
             no_verdict.append(label)
         else:
             for line in fails[:3]:

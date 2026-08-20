@@ -23,6 +23,7 @@ concurrent writer on the thing every other harness measures.
 
 Run:  python3 -m unittest tests.test_mutation_scoring
 """
+import ast
 import os
 import re
 import subprocess
@@ -174,6 +175,65 @@ class RanCountIsMeasuredAgainstRealUnittestOutput(unittest.TestCase):
             f"unittest's separator, found {collected}. There is nothing to "
             f"measure against:\n{_quoted(out)}")
         return ok, out, int(collected[0].split()[1])
+
+    # A failing test whose assertion message pastes captured output. The
+    # continuation lines of a multi-line message are printed at COLUMN 0
+    # verbatim, so a captured summary inside one is indistinguishable from a
+    # real one to any rule reading this stream.
+    _PASTED_CAPTURE_SRC = """
+        import unittest
+        class T(unittest.TestCase):
+            def test_pastes_captured_output(self):
+                captured = "some preamble\\nRan 99 tests in 0.001s\\n\\nOK\\n"
+                self.assertEqual(1, 2, "subprocess said:\\n" + captured)
+            def test_ok(self):
+                pass
+    """
+
+    def test_KNOWN_LIMITATION_a_pasted_capture_defeats_the_anchor(self):
+        """The residual the anchor does NOT close, pinned so it stays measured.
+
+        T-554. `ran_count`'s docstring used to claim that unittest's summary is
+        the only thing printed at column 0, and offered "a subprocess's
+        captured output pasted into an assertion message" as an example of what
+        anchoring FIXES. It is the opposite: a multi-line assertion message
+        puts its continuation lines at column 0 verbatim, so the anchored rule
+        counts a pasted summary exactly as it counts a real one.
+
+        This is not fixable inside `ran_count` - from in there the two lines
+        are byte-identical. The repo's real defence is at the paste site, where
+        tests/test_suite_isolation.py indents captured output before
+        interpolating it. So this test pins the LIMITATION rather than the fix,
+        and it should go RED if anyone ever closes the gap - at which point
+        delete it and say so in the docstring.
+        """
+        ok, out, collected = self._real(self._PASTED_CAPTURE_SRC)
+        self.assertFalse(ok)
+        self.assertEqual(2, collected,
+                         "CONTROL FAILED - the module did not collect the two "
+                         f"tests it defines:\n{_quoted(out)}")
+
+        # The pasted line really is flush left, which is the whole mechanism.
+        self.assertIn("\nRan 99 tests in 0.001s\n", out,
+                      "CONTROL FAILED - the captured summary was not printed "
+                      f"at column 0, so this tests nothing:\n{_quoted(out)}")
+
+        self.assertEqual(
+            101, ms.ran_count(out),
+            "the anchored rule no longer counts a pasted capture. If that is "
+            "deliberate, this KNOWN_LIMITATION test has served its purpose - "
+            "delete it and correct ran_count's docstring, which currently says "
+            "the anchor does not touch this shape.")
+
+        # And the anchor buys nothing HERE, which is the part the old docstring
+        # got backwards. Unanchored gives the same wrong answer.
+        unanchored = sum(int(m) for m in
+                         re.findall(r"Ran (\d+) tests? in", out))
+        self.assertEqual(
+            ms.ran_count(out), unanchored,
+            "anchored and unanchored disagree on a pasted capture, so the "
+            "anchor DOES help with this shape after all - the docstring's "
+            "correction is wrong")
 
     def test_the_genuine_summary_is_at_column_zero_in_a_fixed_shape(self):
         """POSITIVE CONTROL for every case below. If this shape ever moves,
@@ -780,6 +840,215 @@ class QuotedHelper(unittest.TestCase):
         quoted = _quoted(raw)
         self.assertEqual(["    alpha", "    beta", "    ", "    gamma"],
                          quoted.splitlines())
+
+
+class HarnessesUseTheVerdictCONSTANTS(unittest.TestCase):
+    """A harness that borrows this module's verdicts must borrow its NAMES.
+
+    T-554. mutation_scoring.py:143 says why the constants exist: "Verdicts,
+    named so a harness cannot typo one into a silent miss." A harness comparing
+    against the bare spelling instead has taken the vocabulary without the
+    guarantee, and the failure direction is the worst one available - rename
+    SURVIVED here and every `verdict == "survived"` out there goes quietly
+    false, so every mutant falls through to the else branch and the battery
+    reports ALL KILLED with nothing raising.
+
+    A review of 703a497 found one such harness. Grepping the corpus for it
+    found a second site in the same file that the review had not named, which
+    is the argument for a standing check rather than three fixed lines.
+
+    SCOPED BY THE IMPORT, deliberately, and this is the part that is easy to
+    get wrong. mutate_payload_scanner.py MENTIONS `score_run` in a comment
+    while importing only `compile_gate` and `ran_count`; it computes its own
+    verdicts with its own local `score()`, so its `verdict == "killed"` is a
+    comparison against its OWN vocabulary and is none of this check's business.
+    A substring scan for "score_run" flags it and is simply wrong. The import
+    list is the only honest test of whose vocabulary is in use.
+    """
+
+    VERDICT_SPELLINGS = ("survived", "killed", "no-verdict")
+    COMPARISON = re.compile(
+        r"""(?:==|!=)\s*(['"])(survived|killed|no-verdict)\1""")
+
+    @staticmethod
+    def _repo():
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _importers_of(self, name):
+        """Harnesses that import `name` from tests.mutation_scoring, by AST."""
+        import glob
+        found = []
+        for path in sorted(glob.glob(os.path.join(self._repo(),
+                                                  "tests", "mutate_*.py"))):
+            with open(path, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.ImportFrom)
+                        and node.module == "tests.mutation_scoring"
+                        and any(a.name == name for a in node.names)):
+                    found.append(path)
+                    break
+        return found
+
+    def test_the_comparison_pattern_can_actually_match(self):
+        """POSITIVE CONTROL, first, because the check below reports an ABSENCE
+        and a dead regex is indistinguishable from a clean corpus."""
+        for spelling in self.VERDICT_SPELLINGS:
+            with self.subTest(spelling=spelling):
+                self.assertRegex(f'if verdict == "{spelling}":',
+                                 self.COMPARISON)
+                self.assertRegex(f"if verdict != '{spelling}':",
+                                 self.COMPARISON)
+        self.assertNotRegex('SURVIVED = "survived"', self.COMPARISON,
+                            "the pattern matches the definition as well as a "
+                            "comparison, so mutation_scoring.py itself would "
+                            "be reported")
+
+    def test_the_corpus_scan_finds_the_harnesses_it_is_scanning(self):
+        """The other half of the control: prove the AST scope is not empty.
+
+        An import-scoped check that resolves to zero files reports a clean
+        corpus for exactly the same reason a real one does."""
+        importers = self._importers_of("score_run")
+        self.assertGreaterEqual(
+            len(importers), 5,
+            f"the scan found only {len(importers)} score_run importers, which "
+            f"is too few to be right - suspect the AST walk, not the corpus")
+        self.assertNotIn(
+            "mutate_payload_scanner.py", [os.path.basename(p) for p in importers],
+            "payload_scanner only MENTIONS score_run in a comment; if it is "
+            "in this list the scope has fallen back to a substring scan")
+
+    @staticmethod
+    def _baseline_use(src):
+        """(arms_the_tell, has_zero_guard) for one harness, by AST.
+
+        BY AST AND NOT BY REGEX, and that is not fastidiousness. A regex for
+        `clean_ran ==` matched mutate_health_log.py on the strength of its own
+        COMMENT - a line explaining that the harness deliberately has no
+        `clean_ran == 0` abort - and put the one correctly-exempt harness on
+        the missing list. A scanner that reads prose as code reports a defect
+        in the file that documents why there isn't one.
+        """
+        tree = ast.parse(src)
+        armed = guarded = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                if not any(isinstance(x, ast.Name) and x.id == "clean_ran"
+                           for x in [node.left] + list(node.comparators)):
+                    continue
+                zero = (len(node.ops) == 1
+                        and isinstance(node.ops[0], ast.Eq)
+                        and isinstance(node.comparators[0], ast.Constant)
+                        and node.comparators[0].value == 0)
+                if zero:
+                    guarded = True
+                else:
+                    armed = True
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+                if name in ("score", "score_run") and any(
+                        isinstance(a, ast.Name) and a.id == "clean_ran"
+                        for a in node.args):
+                    armed = True
+        return armed, guarded
+
+    def test_a_harness_that_ARMS_the_ran_count_tell_guards_a_zero_baseline(self):
+        """The ran-count tell is INERT at clean_ran == 0, silently.
+
+        T-554. The tell is `ran < clean_ran`, so a zero baseline can never fire
+        it - the harness degrades to the older zero-named-cases rule while
+        still printing a measurement-shaped "0 tests ran". A review found one
+        harness in that state; this scan found two more.
+
+        SCOPED BY WHETHER THE BASELINE IS EVER COMPARED, not by which scorer is
+        used, because the tell is implemented three different ways here: inside
+        `score_run`, inside a harness's own local `score()`
+        (mutate_payload_scanner.py, which imports no `score_run` at all), and
+        inline as `mutant_ran != clean_ran` (both light harnesses). Scoping on
+        `score_run` importers missed the first two of those and let a mutant
+        survive; that miss is the reason this predicate is what it is.
+
+        mutate_health_log.py and mutate_netwatch.py score on the suite's RETURN
+        CODE and never compare the baseline at all - it is a display label on a
+        run already proved green - so a zero there is cosmetic. They are out of
+        scope rather than exempt from it, which is why nothing here has to
+        name them.
+        """
+        checked, missing = [], []
+        for path in self._importers_of("ran_count"):
+            with open(path, encoding="utf-8") as fh:
+                armed, guarded = self._baseline_use(fh.read())
+            if not armed:
+                continue
+            checked.append(os.path.basename(path))
+            if not guarded:
+                missing.append(os.path.basename(path))
+
+        # CONTROL: an empty scope reports a clean corpus for the same reason a
+        # healthy one does.
+        self.assertGreaterEqual(
+            len(checked), 8,
+            f"only {len(checked)} harness(es) matched as arming the tell, "
+            f"which is too few to be right - suspect _baseline_use, not the "
+            f"corpus")
+        self.assertEqual(
+            [], missing,
+            "these harnesses arm the ran-count tell with a baseline they never "
+            "check for zero, so on a suite that collects nothing the tell is "
+            "inert and the run still prints a number:\n  "
+            + "\n  ".join(missing))
+
+    def test_the_baseline_predicate_separates_the_three_shapes(self):
+        """POSITIVE AND NEGATIVE CONTROLS for the predicate above, which
+        otherwise reports an absence and cannot be told from a dead scan.
+
+        Each arm is a real shape from the corpus, including the comment that
+        defeated the regex version."""
+        armed, guarded = self._baseline_use(
+            "def f():\n    verdict = score_run(ok, out, clean_ran)\n")
+        self.assertTrue(armed, "a scorer call passing the baseline")
+        self.assertFalse(guarded)
+
+        armed, _ = self._baseline_use(
+            "def f():\n    if mutant_ran != clean_ran:\n        pass\n")
+        self.assertTrue(armed, "the inline comparison both light harnesses use")
+
+        armed, _ = self._baseline_use(
+            "def f():\n    verdict = score(ok, out, clean_ran)\n")
+        self.assertTrue(armed, "a harness's own local score()")
+
+        armed, guarded = self._baseline_use(
+            "def f():\n    if clean_ran == 0:\n        return 1\n")
+        self.assertTrue(guarded, "the zero guard")
+        self.assertFalse(armed, "the zero guard must not count as arming")
+
+        armed, guarded = self._baseline_use(
+            "def f():\n"
+            "    # this harness has no `clean_ran == 0` abort of the usual kind\n"
+            "    print(f'{clean_ran} tests' if clean_ran else 'none')\n")
+        self.assertFalse(armed, "prose is not code")
+        self.assertFalse(
+            guarded,
+            "a COMMENT mentioning the guard was read as the guard - this is "
+            "the exact regex defect the AST version replaced")
+
+    def test_no_score_run_importer_compares_a_verdict_to_a_literal(self):
+        offenders = []
+        for path in self._importers_of("score_run"):
+            with open(path, encoding="utf-8") as fh:
+                src = fh.read()
+            for i, line in enumerate(src.splitlines(), 1):
+                if self.COMPARISON.search(line):
+                    offenders.append(
+                        f"{os.path.basename(path)}:{i}: {line.strip()}")
+        self.assertEqual(
+            [], offenders,
+            "these harnesses take their verdicts from mutation_scoring but "
+            "compare against the bare spelling, so renaming a constant here "
+            "makes every comparison silently false and the battery reports "
+            "ALL KILLED:\n  " + "\n  ".join(offenders))
 
 
 if __name__ == "__main__":
